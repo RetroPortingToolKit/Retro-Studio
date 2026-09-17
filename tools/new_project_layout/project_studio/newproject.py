@@ -85,6 +85,11 @@ class NewProjectOptions:
     # scaffolder derive it", which is what a terminal run would have offered.
     n64_slug: str = ""  # target prefix; lowercase [a-z0-9_]
     n64_exe: str = ""   # executable name; defaults to the slug
+    # The framework revision to cut the port against. Blank = the scaffolder's
+    # own default, which is branch `main` pinned at the HEAD of the n64lle
+    # checkout it was run from. Sent only when the script on disk declares the
+    # flag; see build_n64_command.
+    n64lle_ref: str = ""
     # The execution-derived discovery window. n64lle harvests what actually ran
     # rather than following seeds, so these two ARE the coverage decision, and
     # the scaffolder writes them into game.toml [recompiler] and mirrors them
@@ -131,6 +136,29 @@ def is_snes(opts: "NewProjectOptions") -> bool:
 
 def is_n64(opts: "NewProjectOptions") -> bool:
     return opts_platform(opts) == "n64"
+
+
+def script_supports(script: Path, flag: str) -> bool:
+    """Does this wizard's argument parser have an arm for ``flag``?
+
+    Studio drives whichever copy of a scaffolder it found on disk, and that
+    copy can be OLDER than Studio — a port's pinned submodule, a sibling
+    checkout, or the vendored fallback. setup_project.sh answers an unknown
+    option with `exit 2` before it probes anything, so a flag sent hopefully is
+    a dead scaffold rather than a degraded one.
+
+    The parsing is snes_paths.regen_options', not a second copy of it: both
+    wizards dispatch through the same `case "$1" in --flag) …` shape, and a
+    reimplementation here could not inherit a fix to it. Reading the case arms
+    rather than the usage text is deliberate for the same reason it is there —
+    a script whose help still lists a flag its parser has dropped must read as
+    not supporting it.
+    """
+    try:
+        text = Path(script).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return flag in snes_paths.regen_options(text)
 
 
 def _pascal(text: str) -> str:
@@ -334,14 +362,8 @@ def build_snes_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, st
 
     env = os.environ.copy()
     env["SNESRECOMP_SETUP_YES"] = "1"
-    # The wizard's own --build runs a plain `cmake -S . -B build` with the
-    # toolchain compiler on PATH but nothing pointing find_package() at the
-    # toolchain's SDL3 -- so it found the host's /usr/lib/cmake/SDL3, whose
-    # headers the hermetic clang cannot see, and every fresh scaffold failed
-    # with "SDL3/SDL.h file not found" while Studio's own configure step (which
-    # applies this overlay) built the same tree fine.
-    from .buildops import toolchain_env
-    env.update(toolchain_env())
+    # The toolchain overlay that this scaffold needs (SDL3) is applied for
+    # every console in build_command(); it used to be here, alone.
 
     cmd: list[str] = [
         "sh",
@@ -422,11 +444,13 @@ def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str
     needs (project / slug / exe) and the harvest window, none of which the
     other two consoles have a concept of.
 
-    THERE IS NO --n64lle-ref. The script pins the new project's submodule at
-    the HEAD of the checkout it was run from — "the SHA this scaffold was cut
-    against" — rather than at a ref the caller names. Passing one would be
-    silently ignored, so `opts` carries none and the log says where the pin
-    came from instead.
+    --n64lle-ref / --recomp-ui-ref are sent only when the script ON DISK
+    declares them. Studio drives whichever copy it found — `$N64LLE_ROOT`, the
+    port's own submodule, a sibling checkout, or the vendored fallback — and an
+    unknown option is `exit 2` there, so an older wizard would die on the flag
+    instead of scaffolding. Without them the script does what it always did:
+    branch `main`, pinned at the HEAD of the checkout it was run from, "the SHA
+    this scaffold was cut against".
     """
     script = n64_paths.setup_script(None)
     if not script.is_file():
@@ -462,6 +486,15 @@ def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str
         cmd.extend(["--step-cap", str(int(opts.harvest_step_cap_m))])
     if opts.github_owner:
         cmd.extend(["--gh-owner", opts.github_owner.strip()])
+    # The submodule revisions, when the wizard on disk can take them.
+    n64lle_ref = (opts.n64lle_ref or "").strip()
+    if n64lle_ref and script_supports(script, "--n64lle-ref"):
+        cmd.extend(["--n64lle-ref", n64lle_ref])
+    ui_ref = (opts.recomp_ui_ref or "").strip()
+    # "master" is recomp-ui's own default in the script; sending it back would
+    # be a second copy of the default to drift.
+    if ui_ref and ui_ref != "master" and script_supports(script, "--recomp-ui-ref"):
+        cmd.extend(["--recomp-ui-ref", ui_ref])
 
     # Stage image => --copy-rom. The scaffolder symlinks the dump into roms/ by
     # default, which is the better answer on this machine; --copy-rom is for a
@@ -544,7 +577,32 @@ def build_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
     """Build argv + env for the OS-appropriate setup script.
 
     Always passes ``--yes`` / ``-Yes`` so the GUI/CLI supply every choice.
+
+    THE TOOLCHAIN OVERLAY IS APPLIED HERE, ONCE, FOR EVERY CONSOLE. A wizard's
+    own --generate/--build step runs a plain `cmake -S . -B build`: the
+    toolchain's compiler is on PATH, but nothing points find_package() at the
+    toolchain's own SDL3. The retcomm clang is hermetic and does not search
+    /usr/include, so a configure that resolves the HOST's SDL3 succeeds and
+    then every launcher TU fails with "SDL3/SDL.h file not found" -- while
+    Studio's own `build configure`, which applies this overlay, builds the same
+    tree fine.
+
+    That was found and fixed on SNES, in build_snes_command, and nowhere else.
+    N64 and PSX kept the bug for as long as they have existed; PokemonStadiumRecomp
+    hit it on 2026-09-12 after the harvest and n64emit had already succeeded.
+    Applying it at this seam rather than in each builder is the actual fix: the
+    next console inherits it instead of re-discovering it.
     """
+    cmd, env = _build_command_for_platform(opts)
+    from .buildops import toolchain_env
+
+    env.update(toolchain_env())
+    return cmd, env
+
+
+def _build_command_for_platform(
+    opts: NewProjectOptions,
+) -> tuple[list[str], dict[str, str]]:
     if is_snes(opts):
         return build_snes_command(opts)
     if is_n64(opts):
@@ -718,11 +776,28 @@ def run_new_project(
         if on_line:
             src = n64_paths.wizard_source(None)
             on_line(f"Using n64lle wizard: {src}")
-            if src == "vendored":
+            script = n64_paths.setup_script(None)
+            can_ref = script_supports(script, "--n64lle-ref")
+            if src == "vendored" and not (opts.n64lle_ref or "").strip():
                 on_line(
                     "note: no n64lle checkout to read a pin from — the new "
                     "project's n64lle submodule is left at the branch tip. "
-                    "Pin it by hand (see tools/new_project_layout/n64/VENDOR.md)."
+                    + (
+                        "Name a revision with --n64lle-ref, or pin it by hand"
+                        if can_ref
+                        else "Pin it by hand"
+                    )
+                    + " (see tools/new_project_layout/n64/VENDOR.md)."
+                )
+            if (opts.n64lle_ref or "").strip() and not can_ref:
+                # Said here rather than swallowed in build_n64_command: the ref
+                # is on screen, and a scaffold that ignored it without a word
+                # would look like it honoured it.
+                on_line(
+                    f"note: this wizard has no --n64lle-ref, so "
+                    f"'{opts.n64lle_ref.strip()}' is NOT being used — the "
+                    "project will be pinned the way that copy pins. Update the "
+                    "n64lle checkout Studio is reading, or re-vendor."
                 )
             ignored = n64_ignored_fields(opts)
             if ignored:

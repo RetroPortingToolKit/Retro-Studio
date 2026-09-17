@@ -55,7 +55,7 @@ repository.
 ├── CLAUDE.md               repo rules; delegates, never restates
 ├── README.md
 ├── docs/STATUS.md          the honesty ledger — empty of measurements on purpose
-├── tools/build_framework.sh
+├── tools/build_framework.sh   # shim onto n64lle/tools/build_framework.sh
 ├── roms/README.md          the identity to check a dump against
 ├── generated/README.md     ROM-derived, gitignored, never hand-edited
 ├── n64lle/                 framework submodule

@@ -86,6 +86,11 @@ class MigrateOptions:
     github_owner: str | None = None
     github_repo: str | None = None
     window_title: str | None = None
+    # The id a mod package's [[target]] matches against, recorded in
+    # rom_identity.txt. Read from the repo when it is already there; this is
+    # the human override for a port where nothing records it yet, because a
+    # derived one that matches no manifest is worse than a refusal.
+    game_id: str | None = None
     enable_recomp_ui: bool = True
     enable_wizard: bool = True
     enable_netplay: bool = False

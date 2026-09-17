@@ -90,10 +90,16 @@ add_custom_command(OUTPUT "${_img}"
   COMMENT "@SLUG@: harvesting boot (execution-derived, ${@SLUG_UPPER@_HARVEST_FRAMES}-frame window, RSP live)"
   VERBATIM)
 
+# DEPENDS names the EMITTER as well as the image, for the same reason the
+# harvest step above names the harvester: without it a rebuilt n64emit silently
+# reuses C that the OLD one produced, and nothing says so. Caught 2026-09-15 --
+# an emitter fix was made, the build reported success, and the generated file on
+# disk was still the previous emitter's output. rspemit's step already declared
+# its tool; this one was the odd one out.
 add_custom_command(OUTPUT "${_gen}"
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/generated"
   COMMAND "${N64LLE_EMIT}" --image "${_img}" "${_gen}"
-  DEPENDS "${_img}"
+  DEPENDS "${_img}" "${N64LLE_EMIT}"
   COMMENT "@SLUG@: emitting recompiled C (n64emit --image)"
   VERBATIM)
 

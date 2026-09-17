@@ -67,6 +67,7 @@ OP_ORDER: tuple[str, ...] = (
     "n64_untrack_roms",
     "n64_emit_version",
     "n64_emit_build_framework",
+    "n64_emit_cmakelists",
     "n64_emit_roms_readme",
     "n64_emit_generated_readme",
     "n64_emit_claude_md",
@@ -82,6 +83,7 @@ OP_TITLES: dict[str, str] = {
     "n64_untrack_roms": "Untrack committed ROM bytes",
     "n64_emit_version": "Emit VERSION",
     "n64_emit_build_framework": "Emit tools/build_framework.sh",
+    "n64_emit_cmakelists": "Re-emit CMakeLists.txt from the pinned template",
     "n64_emit_roms_readme": "Emit roms/README.md",
     "n64_emit_generated_readme": "Emit generated/README.md",
     "n64_emit_claude_md": "Emit CLAUDE.md",
@@ -338,9 +340,30 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
     script = root / n64_paths.FRAMEWORK_BUILD_SCRIPT
     if script.is_file():
         detail = str(n64_paths.FRAMEWORK_BUILD_SCRIPT)
+        drift = build_framework_option_drift(root, options)
         if not script.stat().st_mode & 0o111:
             add("build_framework", "tools/build_framework.sh", CheckStatus.WARN,
                 Severity.RECOMMENDED, detail + " is not executable.",
+                "n64_emit_build_framework")
+        elif drift:
+            # The script is rendered ONCE, at scaffold time, and then owned by
+            # the port — so a port cut last month builds this month's framework
+            # with last month's switches, silently. That is not hypothetical:
+            # -DN64LLE_RINGS_PROFILE=prod arrived after the first ports were
+            # cut, and without it a player's build uses the framework's "dev"
+            # ring capacities (an 8,388,608-record fntrace window, ~320 MiB
+            # resident) instead of the ~2.5 MiB a port is supposed to ship.
+            #
+            # Reported as drift in the OPTIONS, not as "the file differs": a
+            # port is allowed to own this script, and several legitimately add
+            # flags of their own. What it may not do is silently LOSE one the
+            # framework it is pinned to now expects.
+            add("build_framework", "tools/build_framework.sh", CheckStatus.WARN,
+                Severity.RECOMMENDED,
+                detail + " predates the pinned framework's template: it never "
+                "passes " + ", ".join(drift) + ". Re-emitting overwrites the "
+                "port's copy, so read it first if this port customised it "
+                "(--force / tick the op to apply).",
                 "n64_emit_build_framework")
         else:
             add("build_framework", "tools/build_framework.sh", CheckStatus.PASS,
@@ -352,6 +375,23 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
             "the framework from build-n64lle/, so it cannot configure until "
             "something builds n64lle out of tree.",
             "n64_emit_build_framework")
+
+    # --- scaffold vs the framework it is pinned to ---------------------------
+    gone = missing_framework_sources(root)
+    if gone:
+        add("cmake_framework_sources", "CMakeLists.txt framework sources",
+            CheckStatus.FAIL, Severity.REQUIRED,
+            "Names " + ", ".join(f"n64lle/{g}" for g in gone) + ", which the "
+            "pinned n64lle does not have. add_executable() on a missing source "
+            "is a CMake generate error, so this port cannot configure at all. "
+            "The scaffolder's current template already handles it; this copy "
+            "was rendered before that. Re-emit it (--force) rather than "
+            "editing the game repo — a hand edit cannot inherit the next "
+            "template fix.",
+            "n64_emit_cmakelists")
+    else:
+        add("cmake_framework_sources", "CMakeLists.txt framework sources",
+            CheckStatus.PASS, Severity.REQUIRED, "")
 
     # --- the contract -------------------------------------------------------
     ident = contract_identity(root)
@@ -762,6 +802,116 @@ def _op_merge_gitignore(root: Path, opts: MigrateOptions) -> ApplyResult:
 _TOKEN_RE = re.compile(r"@([A-Z0-9_]+)@")
 
 
+# Longest extension first, and a boundary after it. Ordered c|cpp|cmake, the
+# alternation matches "c" inside "runtime.cmake" and reports a file called
+# runtime.c that no one ever named.
+_FRAMEWORK_SRC_RE = re.compile(
+    r"\$\{N64LLE_ROOT\}/([A-Za-z0-9_./-]+\.(?:cmake|cpp|hpp|cc|c|h))(?![A-Za-z0-9_])"
+)
+
+
+def missing_framework_sources(root: Path) -> list[str]:
+    """Framework files the port's CMakeLists names that the pinned n64lle lacks.
+
+    This is a CONFIGURE-BLOCKING class, not a warning: add_executable() on a
+    source that does not exist is a CMake *generate* error, so the port never
+    reaches a compiler. It happens because a port's CMakeLists is rendered once
+    from the template and then frozen while the framework moves under it — the
+    worked example is bench/frame_probe.c, removed from n64lle after the first
+    ports were cut, with the template growing an if(EXISTS) guard that only new
+    ports got.
+
+    Only ${N64LLE_ROOT}-relative source paths are checked, because those are
+    the ones the port has no control over. A path that resolves through a
+    variable this reader cannot expand is skipped rather than guessed at.
+    """
+    fw = root / "n64lle"
+    if not (fw / n64_paths.MARKER).is_file():
+        return []  # no checkout to check against; the submodule check says so.
+    text = _cmake_text(root)
+    out: list[str] = []
+    for rel in _FRAMEWORK_SRC_RE.findall(text):
+        if (fw / rel).is_file() or rel in out:
+            continue
+        # A port that already tests for the file handles its absence itself --
+        # that IS the template's fix, and flagging it would report every
+        # up-to-date port as broken. Only an unguarded reference blocks
+        # configure.
+        if f'if(EXISTS "${{N64LLE_ROOT}}/{rel}")' in text:
+            continue
+        out.append(rel)
+    return out
+
+
+_CMAKE_DEFINE_RE = re.compile(r"-D([A-Za-z_][A-Za-z0-9_]*)\s*=")
+
+
+def build_framework_option_drift(root: Path, opts: MigrateOptions) -> list[str]:
+    """cmake -D options the pinned framework's template has and the port lacks.
+
+    The port owns tools/build_framework.sh — it is rendered once at scaffold
+    time and then never touched again, which means a port cut before a switch
+    existed keeps building without it forever and nothing says so.
+
+    Compared by OPTION rather than by file content on purpose. A port is
+    allowed to add its own flags (GloverRecomp adds -lm and documents why it
+    belongs upstream), and a whole-file diff would report every such port as
+    broken. The direction that actually costs something is the other one: an
+    option the framework now expects that the script never passes.
+
+    Returns the option NAMES, in template order. Empty when there is nothing to
+    compare against — no template on disk, or a template whose tokens this repo
+    cannot resolve. "I could not tell" is never reported as drift.
+    """
+    script = root / n64_paths.FRAMEWORK_BUILD_SCRIPT
+    if not script.is_file():
+        return []
+
+    # A shim delegates to the framework's shared script, so it passes no -D
+    # options of its own and has nothing to drift. That is the GOOD state, not
+    # an empty one -- report it as no drift rather than as every option missing.
+    if n64_paths.port_script_is_shim(root):
+        return []
+
+    # Compare against the FRAMEWORK'S script when the pinned n64lle has one,
+    # and only fall back to the scaffold template otherwise. The template is a
+    # snapshot of what a NEW port gets; the framework's copy is what the build
+    # actually requires today, and the gap between those two is precisely how
+    # -DN64LLE_RSP_CENSUS=1 went missing from seven ports without this check
+    # ever having anything to compare against.
+    canon = n64_paths.framework_owned_build_script(root)
+    src = canon if canon is not None else (
+        n64_paths.templates_dir(root) / "build_framework.sh.in")
+    if src is None or not Path(src).is_file():
+        return []
+    try:
+        have_text = script.read_text(encoding="utf-8", errors="replace")
+        raw = Path(src).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    if canon is not None:
+        # The framework's copy is already concrete -- it has no @TOKEN@s to
+        # render, so compare it directly.
+        have = set(_CMAKE_DEFINE_RE.findall(have_text))
+        out: list[str] = []
+        for name in _CMAKE_DEFINE_RE.findall(raw):
+            if name not in have and name not in out:
+                out.append(name)
+        return out
+    # Rendered, not raw: a token could in principle appear inside an option
+    # name, and comparing a rendered file against a rendered file is the only
+    # comparison that cannot produce a phantom.
+    rendered, missing = _render(raw, _template_values(root, opts))
+    if missing:
+        return []
+    have = set(_CMAKE_DEFINE_RE.findall(have_text))
+    out: list[str] = []
+    for name in _CMAKE_DEFINE_RE.findall(rendered):
+        if name not in have and name not in out:
+            out.append(name)
+    return out
+
+
 def _render(text: str, values: dict[str, str]) -> tuple[str, list[str]]:
     """@TOKEN@ substitution, matching the wizard's fill_tokens.py contract.
 
@@ -781,6 +931,18 @@ def _render(text: str, values: dict[str, str]) -> tuple[str, list[str]]:
         return values[key]
 
     return _TOKEN_RE.sub(replace, text), missing
+
+
+def _default_build_dir() -> str:
+    """Studio's build tree name, imported lazily.
+
+    buildops imports n64_paths and snes_paths at module scope; importing it at
+    the top of this one would close a cycle through models. Read at call time
+    instead, so the two layers cannot drift apart by a stale copy.
+    """
+    from .buildops import DEFAULT_BUILD_DIR
+
+    return DEFAULT_BUILD_DIR
 
 
 def _human_size(n: int) -> str:
@@ -816,6 +978,12 @@ def _template_values(root: Path, opts: MigrateOptions) -> dict[str, str]:
         "EXE": opts.boot_exe or executable_name(root),
         "DATE": date.today().isoformat(),
         "DEFAULT_BRANCH": default_branch(root),
+        # The port's build tree. n64lle's wizard writes this token into
+        # build_framework.sh, README.md and STATUS.md so a scaffold's docs
+        # cannot drift from where it actually builds; Studio has to answer it
+        # too, and the authority on this side is the one value every build
+        # subcommand already defaults to.
+        "BUILD_DIR": _default_build_dir(),
     }
     if game.get("name"):
         values["NAME"] = str(game["name"])
@@ -920,6 +1088,28 @@ def _op_emit_build_framework(root: Path, opts: MigrateOptions) -> ApplyResult:
                           str(n64_paths.FRAMEWORK_BUILD_SCRIPT))
 
 
+def _op_emit_cmakelists(root: Path, opts: MigrateOptions) -> ApplyResult:
+    """Re-render CMakeLists.txt from the PINNED framework's template.
+
+    Overwriting a port's build file is not something to do casually, and this
+    op requires --force for exactly that reason. It exists because a port's
+    CMakeLists is scaffold-owned rather than hand-written — n64lle's contract
+    is that a port makes ONE n64lle_add_runtime_target() call and carries no
+    host source (docs/05 §10) — so when the framework moves, the correct fix
+    flows from the template, not from editing the game repo.
+
+    The failure that made it necessary: the template used to declare
+    <slug>-frame-probe from ${N64LLE_ROOT}/bench/frame_probe.c unguarded.
+    n64lle later removed that file ("bench: do not carry frame_probe onto the
+    rewrite") and the template grew an if(EXISTS) around it — but every port
+    already cut kept the unguarded copy, and add_executable on a missing source
+    is a CMake GENERATE error. Those ports cannot configure at all, and nothing
+    in the game repo is the right place to fix it.
+    """
+    return _fill_template(root, opts, "n64_emit_cmakelists",
+                          "CMakeLists.txt.in", "CMakeLists.txt")
+
+
 def _op_emit_roms_readme(root: Path, opts: MigrateOptions) -> ApplyResult:
     return _fill_template(root, opts, "n64_emit_roms_readme",
                           "roms_README.md.in", "roms/README.md")
@@ -959,6 +1149,7 @@ _OPS = {
     "n64_untrack_roms": _op_untrack_roms,
     "n64_emit_version": _op_emit_version,
     "n64_emit_build_framework": _op_emit_build_framework,
+    "n64_emit_cmakelists": _op_emit_cmakelists,
     "n64_emit_roms_readme": _op_emit_roms_readme,
     "n64_emit_generated_readme": _op_emit_generated_readme,
     "n64_emit_claude_md": _op_emit_claude_md,

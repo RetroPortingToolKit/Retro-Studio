@@ -499,6 +499,10 @@ def default_target(root: Path) -> str:
       is ``GloverRecomp`` and the executable is ``glover``, but the target is
       ``glover-runtime``. It is read from the ``n64lle_add_runtime_target()``
       call that defines it, which is the only place it is written down.
+
+    This is the PRODUCT's target: what the executable is called, and what
+    n64_project_slug() strips to recover the port's target prefix. It is NOT
+    necessarily what a Build should build — see default_build_target().
     """
     profile = platforms.current()
     if profile.default_target:
@@ -515,8 +519,8 @@ def default_target(root: Path) -> str:
         if m:
             return m.group(1)
         # No runtime target: either <SLUG>_BUILD_UI is off or this is not a
-        # scaffolded port. `all` still builds the gates and the frame probe,
-        # which is the useful answer rather than a guessed target name.
+        # scaffolded port. `all` still builds the gates, which is the useful
+        # answer rather than a guessed target name.
         return "all"
     if text:
         m = _PROJECT_RE.search(text)
@@ -524,6 +528,30 @@ def default_target(root: Path) -> str:
             return m.group(1)
     # `all` builds everything the project defines — correct, if not minimal.
     return "all"
+
+
+def default_build_target(root: Path) -> str:
+    """What an unqualified Build should build — not always the product.
+
+    On N64 it is ``all``. The product target is ``<slug>-runtime``, but a port
+    also declares ``<slug>-cosim`` and ``<slug>-bench``, and those are the
+    executables its gates run. MEASURED 2026-09-12 on PokemonStadiumRecomp:
+    Studio built the runtime target, ctest then reported "6 tests failed out
+    of 7" — five ***Not Run for a missing ``pokemonstadium-cosim`` and the
+    sixth a contract check needing the full build's staging. Nothing was wrong
+    with the port. On a console whose doctrine is gates-first, a Build that
+    cannot then be tested is the wrong default.
+
+    Cheap, too: the runtime links ``<slug>_gen``, which already depends on
+    ``<slug>-generate``, so the harvest is pulled in either way. ``all`` adds
+    two small drivers.
+
+    PSX and SNES keep their product target: their gates are built by it, or
+    are not executables of their own.
+    """
+    if platforms.current().key == "n64":
+        return "all"
+    return default_target(root)
 
 
 def n64_project_slug(root: Path) -> str:
@@ -569,7 +597,13 @@ def framework_gap_message(cli: Path, missing: list[str], have: set[str]) -> str:
     )
 
 
-def preflight_snes_generate(root: Path, *, verify: bool = True) -> CmdResult | None:
+def preflight_snes_generate(
+    root: Path,
+    *,
+    verify: bool = True,
+    rom: str = "",
+    cfg_roots: bool = False,
+) -> CmdResult | None:
     """Reasons regen.sh cannot succeed, found before it is run.
 
     Every one of these otherwise surfaces as somebody else's error text — an
@@ -594,6 +628,42 @@ def preflight_snes_generate(root: Path, *, verify: bool = True) -> CmdResult | N
             f"{cli} is missing — the snesrecomp checkout regen.sh needs is not "
             "there. Run: git submodule update --init --recursive snesrecomp",
         )
+
+    # tools/regen.sh belongs to the PORT, and not every port owns the wizard's
+    # copy. MegaManXSNESRecomp hand-wrote a multi-variant driver that selects a
+    # region positionally and stages each variant's ROM at a fixed path, so the
+    # `--rom <path>` Studio adds is `unknown argument: --rom` to it — relayed
+    # as a Generate failure, which is precisely what this preflight exists to
+    # stop. Ask the script what it accepts before handing it a flag.
+    want: list[str] = []
+    if rom:
+        want.append("--rom")
+    if not verify:
+        want.append("--no-verify")
+    if cfg_roots:
+        want.append("--cfg-roots")
+    if want and regen_text:
+        accepts = _snes_paths.regen_options(regen_text)
+        unknown = [flag for flag in want if flag not in accepts]
+        if unknown:
+            listed = ", ".join(sorted(accepts)) or "no options at all"
+            # What to do next depends on whether this port CAN adopt the
+            # framework's script. Naming a Migrate step unconditionally sent
+            # people looking for a checkbox the audit had deliberately not
+            # offered, so the advice comes from the same report the Migrate
+            # tab renders.
+            try:
+                from .snesops import regen_ownership_guidance
+
+                advice = regen_ownership_guidance(root)
+            except ImportError:  # pragma: no cover
+                advice = ""
+            return CmdResult(
+                False,
+                f"{script} does not accept {', '.join(unknown)} — this port "
+                f"owns its regen.sh, and it accepts: {listed}."
+                + (f" {advice}" if advice else ""),
+            )
 
     # The skew that produced "invalid choice: 'verify-rom'": a regen.sh emitted
     # from a newer wizard than the framework the port is pinned to. Read out of
@@ -676,7 +746,8 @@ def generate_snes_c(
         )
     # Preflight before the ROM path is even resolved: a framework that cannot
     # run this regen.sh will not start running it correctly once a ROM is named.
-    pre = preflight_snes_generate(root, verify=verify)
+    pre = preflight_snes_generate(
+        root, verify=verify, rom=rom, cfg_roots=cfg_roots)
     if pre is not None:
         if log:
             log(pre.message)
@@ -732,6 +803,183 @@ def generate_snes_c(
 # the step that was actually skipped.
 
 
+SNES_RUNNER_PATH_TOOL = "tools/check_runner_paths.py"
+
+
+def _tool_accepts(tool: Path, flag: str) -> bool:
+    """Does this copy of `tool` accept `flag`?
+
+    Asked of the tool's own --help rather than grepped out of its source, and
+    for the same reason snes_paths.cli_commands() does it: the question is what
+    argparse will accept, and argparse is the only thing that knows. A port is
+    pinned to a framework revision, so Studio is routinely newer than the tool
+    it drives — sending a flag the pinned copy has never heard of turns a clean
+    audit into "unrecognized arguments".
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(tool), "--help"],
+            capture_output=True, text=True, timeout=60, cwd=str(tool.parent),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return flag in ((proc.stdout or "") + (proc.stderr or ""))
+
+
+def snes_runner_path_tool(root: Path) -> Path:
+    """The framework's runner/src path auditor, in the pinned snesrecomp.
+
+    Deliberately read out of the framework rather than vendored into Studio:
+    the tool's whole premise is that the layout on disk is the ground truth,
+    and the layout that matters is the one the port is pinned to. A vendored
+    copy would audit against whatever snesrecomp Studio shipped with.
+    """
+    return snes_framework_root(root) / SNES_RUNNER_PATH_TOOL
+
+
+def check_snes_runner_paths(
+    root: Path,
+    *,
+    fix: bool = False,
+    include_docs: bool = False,
+    log: LogFn | None = None,
+) -> CmdResult:
+    """Audit (``--fix``: repair) runner/src references in framework and port.
+
+    snesrecomp's runner/src is organised into layer folders, and moving a file
+    between them is a rename with no content change: nothing objects until a
+    port configures and cmake reports "Cannot find source file" -- one file per
+    target, in the GAME's repo, for a defect that lives in the framework. That
+    is how one reorganisation reached three ports separately.
+
+    Both halves are checked, in the order that makes the log readable:
+
+    1. The framework itself. This is where the defect almost always is, and a
+       stale framework breaks every port pinned to it, not just this one.
+    2. The port. A game that names a runner source directly -- a test target
+       compiling snes_overlay_draw.c, a script quoting a path -- carries its
+       own copy of the same breakage.
+
+    A pin older than the tool is reported as a pin problem, not as a pass: the
+    question could not be put, and a caller may not read its own inability to
+    ask as a clean bill of health.
+    """
+    root = Path(root).expanduser().resolve()
+    framework = snes_framework_root(root)
+    tool = framework / SNES_RUNNER_PATH_TOOL
+    if not tool.is_file():
+        if not framework.is_dir():
+            return CmdResult(
+                False,
+                f"No snesrecomp checkout at {framework} — the submodule is not "
+                "initialised, so there is no runner/src to audit against.",
+            )
+        return CmdResult(
+            False,
+            f"The snesrecomp this port is pinned to has no {SNES_RUNNER_PATH_TOOL}. "
+            "It landed with the runner/src layer-folder guard; a pin older than "
+            "that cannot be audited from here. Update the snesrecomp submodule, "
+            "or run the check from a checkout that has the tool with "
+            "--runner-src pointed at this one.",
+        )
+
+    def _run(label: str, target: Path, aim: bool) -> CmdResult:
+        cmd = [sys.executable, str(tool), "--repo", str(target)]
+        if aim:
+            cmd += ["--runner-src", str(framework)]
+        if fix:
+            cmd.append("--fix")
+        if include_docs:
+            cmd.append("--include-docs")
+        if log:
+            log(f"--- {label}: {target}")
+        return _run_stream(cmd, framework, log=log)
+
+    # The framework audits itself: --repo <framework> finds <framework>/runner/src
+    # natively, so this half never needs the flag and never meets the skew below.
+    fw_res = _run("framework", framework, aim=False)
+
+    # The port half only needs aiming when the framework is NOT at
+    # <root>/snesrecomp — a port built against SNESRECOMP_ROOT, or a worktree.
+    # Everywhere else the tool's own rule resolves to the same directory, so
+    # the flag would be a requirement bought for nothing.
+    needs_aim = framework != (root / "snesrecomp")
+    if needs_aim and not _tool_accepts(tool, "--runner-src"):
+        # Same shape as framework_gap_message(): the port is pinned to a
+        # framework older than the flag this needs. Say which half could not be
+        # asked rather than passing the port silently.
+        port_res = CmdResult(
+            False,
+            f"This port builds against {framework}, not ./snesrecomp, and the "
+            f"pinned {SNES_RUNNER_PATH_TOOL} has no --runner-src to aim it "
+            "there. Update the snesrecomp submodule to a revision that has the "
+            "flag; the framework half above was still checked.",
+        )
+        if log:
+            log("--- port: SKIPPED — " + port_res.message)
+    else:
+        # Checked even when the framework half failed: the two are independent,
+        # and stopping at the first finding means a second run to see the rest.
+        port_res = _run("port", root, aim=needs_aim)
+
+    verb = "repaired" if fix else "checked"
+    if fw_res.ok and port_res.ok:
+        return CmdResult(True, f"runner/src references {verb}: framework and port OK")
+
+    # A half that could not be ASKED is reported as that, not folded into
+    # "broken": Repair cannot help with a pin that has no flag, and offering it
+    # would send the user round a loop that changes nothing.
+    skipped = port_res if (not port_res.ok and not port_res.detail) else None
+    if skipped is not None and fw_res.ok:
+        return CmdResult(False, skipped.message)
+
+    bad = []
+    parts = []
+    if not fw_res.ok:
+        bad.append(f"framework ({framework.name})")
+        parts.append(fw_res.detail or fw_res.message)
+    if not port_res.ok and skipped is None:
+        bad.append("port")
+        parts.append(port_res.detail or port_res.message)
+    # The tool's own output carries the distinction: a repairable finding is
+    # printed as "old -> new", one that is not says why (no such file under
+    # runner/src, or ambiguous between two layer folders). Offering Repair for
+    # a finding it cannot touch sends the user round a loop that changes
+    # nothing and then reports the same thing.
+    blob = "\n".join(parts)
+    repairable = any(" -> " in line for line in blob.splitlines())
+    if fix:
+        hint = ""
+    elif repairable:
+        hint = " — press Repair to rewrite the repairable ones"
+    else:
+        hint = (" — none are auto-repairable (the files are gone, not moved); "
+                "these need a human")
+    msg = f"runner/src references still broken in {' and '.join(bad)}{hint}"
+    if skipped is not None:
+        # Both things are true and the user needs both: the framework has real
+        # findings AND the port half never ran.
+        msg += f"; port half skipped — {skipped.message}"
+        parts.append(skipped.message)
+    return CmdResult(False, msg, "\n".join(p for p in parts if p))
+
+
+def _missing_summary(root: Path) -> str:
+    """What resolve_framework() would name first, plus how much else is gone.
+
+    Naming the SAME artifact cmake would is the point: a preflight that says
+    "no n64emit" while cmake dies on libn64lle-runtime-devices.a reads as two
+    different problems.
+    """
+    missing = _n64_paths.framework_missing_artifacts(root)
+    if not missing:
+        return "framework artifacts"
+    head = f"{_n64_paths.FRAMEWORK_BUILD_DIR}/{missing[0]}"
+    if len(missing) == 1:
+        return head
+    return f"{head} (and {len(missing) - 1} more required artifact(s))"
+
+
 def preflight_n64_framework(root: Path) -> CmdResult | None:
     """Reasons an n64lle port cannot configure, found before cmake runs."""
     root = Path(root).expanduser().resolve()
@@ -758,9 +1006,9 @@ def preflight_n64_framework(root: Path) -> CmdResult | None:
         )
     return CmdResult(
         False,
-        f"n64lle is not built yet — {_n64_paths.FRAMEWORK_BUILD_DIR}/ carries "
-        "no n64emit, so n64lle_runtime_resolve_framework() would fail inside "
-        f"cmake. Run: {script.relative_to(root)} Release",
+        f"n64lle is not built yet — missing {_missing_summary(root)}, so "
+        "n64lle_runtime_resolve_framework() would fail inside cmake. "
+        f"Run: {script.relative_to(root)} Release",
     )
 
 
@@ -771,23 +1019,45 @@ def build_n64_framework(
     dry_run: bool = False,
     log: LogFn | None = None,
 ) -> CmdResult:
-    """Run the port's own ``tools/build_framework.sh``.
+    """Run the framework's ``n64lle/tools/build_framework.sh``, or the port's.
 
-    The port's copy, never a Studio reimplementation, for the same reason
-    Studio runs SNES's regen.sh rather than calling snesrecomp_cli: that script
-    carries the workarounds the framework revision THIS port is pinned to needs
-    (GloverRecomp's, for one, adds -frounding-math and -lm and documents why
-    each belongs upstream). Rebuilding the framework without them produces a
-    silently mis-rounding FPU.
+    A SCRIPT, never a Studio reimplementation, for the same reason Studio runs
+    SNES's regen.sh rather than calling snesrecomp_cli.
+
+    WHICH script changed on 2026-09-15. It used to be the port's own copy, on
+    the reasoning that the copy carries the workarounds the framework revision
+    THIS port is pinned to needs (GloverRecomp adds -frounding-math and -lm and
+    documents why each belongs upstream). That reasoning holds for what a port
+    ADDS and fails completely for what the framework later REQUIRES: a private
+    copy cannot inherit a fix. -DN64LLE_RSP_CENSUS=1 reached one port's copy and
+    no other, so seven of nine N64 ports harvested no RSP microcode and ran the
+    RSP fully interpreted, with every build reporting success.
+
+    So: prefer the framework's shared copy when the pinned n64lle has one, and
+    fall back to the port's when it does not. The port's scaffolded copy is now
+    a shim onto the same file, so on a current port the two are the same build
+    either way -- the preference matters for a port whose private copy has
+    drifted, which is exactly the case that went wrong.
     """
     root = Path(root).expanduser().resolve()
-    script = _n64_paths.framework_build_script(root)
+    script = _n64_paths.framework_owned_build_script(root)
+    used_framework = script is not None
+    if script is None:
+        script = _n64_paths.framework_build_script(root)
     if script is None:
         return CmdResult(
             False,
-            f"No tools/build_framework.sh in {root} — it is scaffolded into "
-            "every n64lle port; this tree is missing it.",
+            f"No build_framework.sh in {root} — neither n64lle/tools/ (the "
+            "shared one) nor tools/ (the port's shim). This tree is missing it.",
         )
+    if used_framework and _n64_paths.port_script_is_shim(root) is False:
+        if log:
+            log(
+                "note: this port's tools/build_framework.sh is not a shim, so it "
+                "carries build logic no other port can inherit. Running the "
+                "shared n64lle/tools/build_framework.sh instead; fold anything "
+                "that copy still needs upstream."
+            )
     fw = root / "n64lle"
     if not (fw / _n64_paths.MARKER).is_file():
         return CmdResult(
@@ -796,23 +1066,26 @@ def build_n64_framework(
             "git submodule update --init --recursive n64lle",
         )
     cmd = ["sh", str(script), config]
+    # The shared script writes build-n64lle/ under the PORT, not under n64lle.
+    env = dict(os.environ)
+    env["N64LLE_PORT_ROOT"] = str(root)
     if dry_run:
         msg = "dry-run: " + " ".join(cmd)
         if log:
             log(msg)
         return CmdResult(True, msg)
-    r = _run_stream(cmd, root, log=log)
+    r = _run_stream(cmd, root, log=log, env=env)
     if not r.ok:
         return r
     if not _n64_paths.framework_is_built(root):
-        # Exit 0 without the artifact is the case worth naming: it is what an
+        # Exit 0 without the artifacts is the case worth naming: it is what an
         # SDL3-absent or option-disabled configure looks like, and treating it
         # as success moves the failure to the next step.
         return CmdResult(
             False,
             f"tools/build_framework.sh reported success but "
-            f"{_n64_paths.FRAMEWORK_BUILD_DIR}/ still has no n64emit — read "
-            "its output before building the port.",
+            f"{_missing_summary(root)} is still missing — read its output "
+            "before building the port.",
             r.detail,
         )
     return CmdResult(True, f"Built n64lle into {_n64_paths.FRAMEWORK_BUILD_DIR}/", r.detail)
@@ -960,6 +1233,47 @@ def preflight_max_players(root: Path) -> CmdResult | None:
     )
 
 
+def preflight_snes_mod_catalog(root: Path) -> CmdResult | None:
+    """The mod-catalog guard, asked before a configure is spent discovering it.
+
+    snesrecomp aborts configure with a FATAL_ERROR when a repo ships
+    mods/preloaded/packages that no target declared, and Studio's own audit
+    already knows: it is a REQUIRED failure carrying the fix op's id. Letting
+    cmake find it first means the user reads a 25-line CMake recipe, and
+    ``diagnose_configure_failure`` only gets to translate it afterwards —
+    after a configure that could never have succeeded.
+
+    The grading is not re-derived here. The audit weighs four different
+    conditions (nothing declared, two staging blocks disagreeing, a host
+    reading the wrong directory, the loader compiled out) and a second copy of
+    that judgement in this file would drift from the row the Migrate tab
+    shows. This asks the audit and relays its answer.
+    """
+    try:
+        from .models import CheckStatus
+        from .snesops import audit_project
+    except ImportError:  # pragma: no cover - non-SNES toolkit build
+        return None
+    try:
+        report = audit_project(root)
+    except Exception:
+        # An audit that cannot run is not grounds for refusing a build; the
+        # post-hoc diagnosis still catches the guard if cmake trips it.
+        return None
+    row = next((c for c in report.checks if c.id == "mod_catalog"), None)
+    if row is None or row.status is not CheckStatus.FAIL:
+        return None
+    fix = row.fix_op or "snes_declare_mod_catalog"
+    fw = platforms.current().framework
+    return CmdResult(
+        False,
+        f"Configure would abort on {fw}'s mod-catalog guard, so it was not "
+        f"started. {row.detail}. Studio has the fix: Migrate → Audit + Plan, "
+        f"tick \"{fix}\", Apply — or "
+        f"`apply --root {root} --only {fix}` (add --dry-run first).",
+    )
+
+
 def diagnose_configure_failure(detail: str, root: Path) -> str | None:
     """Extra hint appended to a failed cmake configure message."""
     blob = detail or ""
@@ -978,6 +1292,21 @@ def diagnose_configure_failure(detail: str, root: Path) -> str | None:
         return (
             "Game generated C may be missing — run Generate (disc→C) before "
             "Configure, or ensure generated/<boot>_dispatch.c exists."
+        )
+    # snesrecomp's mod-catalog guard. The message it prints is a hand-edit
+    # recipe, and hand-editing is what left four SNES ports each spelling the
+    # staging differently. Point at the migration instead, which also moves
+    # the host's mod_runtime root -- the half the guard cannot see.
+    if "snesrecomp_target_mod_catalog" in blob and (
+            "no target declared it" in blob or "would never be staged" in blob):
+        return (
+            "This repo predates the framework's mod catalog contract. Run the "
+            "SNES migration to fix it: `migrate_project.py --platform snes "
+            "apply --root <repo> --only snes_declare_mod_catalog` (add "
+            "--dry-run first). It declares snesrecomp_target_mod_catalog() on "
+            "the target, deletes the per-title staging block, and repoints "
+            "the host's snes_mod_runtime_initialize_c() root at the layout "
+            "the framework stages."
         )
     if "Does not match the generator used previously" in blob:
         return (
@@ -1319,6 +1648,17 @@ def configure(
             log(pre.message)
         return pre
 
+    # A SNES port whose mod catalog no target declares cannot configure —
+    # snesrecomp's guard is a FATAL_ERROR. The audit already grades that state
+    # and names the op that fixes it, so say so instead of spending a configure
+    # to be handed the framework's hand-edit recipe.
+    if profile.key == "snes":
+        pre = preflight_snes_mod_catalog(root)
+        if pre is not None:
+            if log:
+                log(pre.message)
+            return pre
+
     # n64lle is resolved as a PRE-BUILT tree, not add_subdirectory()'d, so a
     # port cannot configure until the framework has been built out of tree.
     if profile.key == "n64":
@@ -1368,6 +1708,60 @@ def configure(
     return r
 
 
+# A header a *found* package failed to provide. The pattern matters more than
+# the library: it is what a dependency resolved outside the compiler's sysroot
+# always looks like.
+_MISSING_DEP_HEADER_RE = re.compile(
+    r"fatal error: '((?:SDL[23]|zlib|png|freetype)[^']*)' file not found"
+)
+
+
+def diagnose_build_failure(detail: str, build_dir: Path) -> str | None:
+    """Why a compile failed on a header its CMake package claimed to provide.
+
+    The case this exists for: configure succeeds, links SDL3::SDL3, prints
+    "SDL3 desktop backend" — and every translation unit then fails on
+    ``'SDL3/SDL.h' file not found``. The toolchain pack's clang runs against
+    its OWN sysroot and never searches /usr/include, while CMake omits an
+    include directory it believes is implicit. So a build tree whose
+    ``SDL3_DIR`` resolved to the host's /usr/lib/cmake/SDL3 configures cleanly
+    and cannot compile a line.
+
+    Stated from the cache rather than guessed: the message names the entry that
+    is actually wrong and where it actually points.
+    """
+    m = _MISSING_DEP_HEADER_RE.search(detail or "")
+    if m is None:
+        return None
+    header = m.group(1)
+    pack = toolchain_root()
+    lines = [
+        f"'{header}' went missing even though CMake found the package that "
+        "provides it — the dependency resolved outside the compiler's sysroot."
+    ]
+    if pack is None:
+        lines.append(
+            "No retcomm toolchain pack is driving this build, so Studio cannot "
+            "re-point it. If you meant to build with the pack, run Studio under "
+            "its python (the GUI does) and Configure again."
+        )
+        return " ".join(lines)
+    for name, want in toolchain_env().items():
+        if name == "CMAKE_PREFIX_PATH":
+            continue
+        have = cache_entry(build_dir, name)
+        if have and Path(have) != Path(want):
+            lines.append(
+                f"{build_dir.name} has {name}={have}, outside the pack; the "
+                f"pack ships its own at {want}."
+            )
+    lines.append(
+        "Configure again — Studio re-points a stale entry automatically — or "
+        "delete CMakeCache.txt and configure fresh."
+    )
+    return " ".join(lines)
+
+
 def build(
     root: Path,
     *,
@@ -1397,15 +1791,31 @@ def build(
 
     r = _run_stream(cmd, root, log=log)
     if r.ok:
-        exe = find_runtime_exe(bdir)
+        exe = find_runtime_exe(bdir, preferred=target)
         hint = f" → {exe.name}" if exe else ""
-        r = CmdResult(True, f"Built {target} in {bdir.name}{hint}", r.detail)
+        return CmdResult(True, f"Built {target} in {bdir.name}{hint}", r.detail)
+    hint = diagnose_build_failure(r.detail or "", bdir)
+    if hint:
+        if log:
+            log(hint)
+        return CmdResult(False, f"{r.message} — {hint}", r.detail)
     return r
 
 
-def find_runtime_exe(build_dir: Path) -> Path | None:
-    """Locate the game product binary under a CMake build tree."""
+def find_runtime_exe(build_dir: Path, preferred: str = "") -> Path | None:
+    """Locate the game product binary under a CMake build tree.
+
+    ``preferred`` is the product's CMake target name (``default_target``); an
+    executable with exactly that stem wins outright.  Without it the finder
+    falls back to name heuristics, and those must not be a coin toss: a full
+    ``cmake --build`` drops the project's ctest binaries next to the product,
+    and a tie broken alphabetically launched ``ppu_window_test`` instead of
+    ``SuperMetroidSNESRecomp`` (2026-09-11).
+    """
     build_dir = build_dir.expanduser().resolve()
+    preferred = (preferred or "").strip()
+    if preferred.lower().endswith(".exe"):
+        preferred = preferred[:-4]
     if not build_dir.is_dir():
         return None
 
@@ -1448,10 +1858,15 @@ def find_runtime_exe(build_dir: Path) -> Path | None:
         if stem.lower() in ("cmake", "ninja", "cpack", "ctest"):
             return
         score = 0
-        if "recompil" in lower:
+        if preferred and stem == preferred:
+            score += 1000
+        if "recomp" in lower:  # *Recomp, *-recompiled, *SNESRecomp
             score += 100
         if stem in ("psx-runtime", "psx-runtime.exe") or stem == "psx-runtime":
             score += 50
+        # Test / tooling binaries a full build leaves beside the product.
+        if re.search(r"(^|_)test(s|_|$)|_capture$|_smoke$|_bench$", lower):
+            score -= 200
         if p.parent == build_dir:
             score += 20
         if host.label != "windows" and not os.access(p, os.X_OK):
@@ -1515,8 +1930,13 @@ def launch(
     dry_run: bool = False,
     log: LogFn | None = None,
     wait: bool = True,
+    target: str = "",
 ) -> CmdResult:
     """Start the local product build.
+
+    ``target`` names the product executable (CMake target); when empty it is
+    resolved the same way Compile resolves it, so Launch and Compile always
+    agree on which binary is the game.
 
     By default ``wait=True``: stream stdout/stderr into ``log`` until the
     process exits (Studio Launch → activity log). Pass ``wait=False`` to
@@ -1525,7 +1945,10 @@ def launch(
     global _active_launch
     root = root.expanduser().resolve()
     bdir = resolve_build_dir(root, build_dir)
-    exe_path = Path(exe) if exe else find_runtime_exe(bdir)
+    if exe:
+        exe_path: Path | None = Path(exe)
+    else:
+        exe_path = find_runtime_exe(bdir, preferred=target or default_target(root))
     if exe_path is None:
         return CmdResult(False, f"No runtime executable found under {bdir}")
     if not exe_path.is_file():

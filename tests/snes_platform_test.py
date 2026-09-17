@@ -639,8 +639,23 @@ def _fake_framework(base: Path, commands: tuple[str, ...]) -> Path:
     return base
 
 
+# Stands for a regen.sh emitted by a current wizard, so it has to carry the
+# interface one really has: the option arms as well as the $CLI call sites.
+# Studio now refuses to hand a flag to a script whose parser does not accept
+# it (MegaManXSNESRecomp's hand-written driver answers --rom with "unknown
+# argument"), and a fixture that modelled only the call sites would exercise
+# that gate against a script no wizard ever emitted.
 _REGEN_SH_MODERN = """#!/usr/bin/env bash
 IDENTITY="$ROOT/rom_identity.txt"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --rom) ROM=$2; shift 2 ;;
+    --no-verify) VERIFY=0; shift ;;
+    --cfg-roots) CFG_ROOTS=1; shift ;;
+    -h|--help) exit 0 ;;
+    *) echo "unknown: $1" >&2; exit 2 ;;
+  esac
+done
 "$PYTHON" "$CLI" verify-rom --rom "$ROM"
 "$PYTHON" "$CLI" generate --rom "$ROM"
 """
@@ -718,6 +733,137 @@ def test_generate_preflight() -> None:
     finally:
         if prev is not None:
             os.environ["SNESRECOMP_ROOT"] = prev
+
+# Stands in for snesrecomp's tools/check_runner_paths.py. Deliberately a
+# stand-in and not the real thing: the real tool is owned by the framework and
+# has its own gate there (tests/v2/test_runner_paths.py). What THIS repo owns
+# is the wiring — which halves get audited, how a pin too old to answer is
+# reported, and whether a flag is sent to a copy that has never heard of it —
+# and a fixture is the only way to exercise the last of those, because the
+# whole point is a tool older than the flag.
+_FAKE_PATH_TOOL = """#!/usr/bin/env python3
+import argparse, pathlib, sys
+ap = argparse.ArgumentParser()
+ap.add_argument("--repo", default=None)
+ap.add_argument("--fix", action="store_true")
+ap.add_argument("--include-docs", action="store_true")
+ap.add_argument("--quiet", action="store_true")
+%s
+args = ap.parse_args()
+repo = pathlib.Path(args.repo or ".").resolve()
+# One rule, enough to be a real audit: a line naming runner/src/<name>.c is
+# broken unless runner/src/moved/<name>.c exists, and --fix rewrites it.
+broken = 0
+for p in sorted(repo.rglob("*.txt")) + sorted(repo.rglob("*.cmake")):
+    if ".git" in p.parts:
+        continue
+    text = p.read_text(encoding="utf-8", errors="replace")
+    if "runner/src/stale.c" not in text:
+        continue
+    if args.fix:
+        p.write_text(text.replace("runner/src/stale.c", "runner/src/moved/stale.c"),
+                     encoding="utf-8")
+        print("  fixed  %%s" %% p.name)
+    else:
+        broken += 1
+        print("  BROKEN %%s" %% p.name)
+sys.exit(1 if broken else 0)
+"""
+
+
+def _fake_path_tool(framework: Path, *, aimable: bool) -> None:
+    """Install the stand-in auditor; `aimable` = this copy has --runner-src."""
+    tools = framework / "tools"
+    tools.mkdir(parents=True, exist_ok=True)
+    arm = 'ap.add_argument("--runner-src", default=None)' if aimable else ""
+    (tools / "check_runner_paths.py").write_text(
+        _FAKE_PATH_TOOL % arm, encoding="utf-8"
+    )
+
+
+def test_check_runner_paths() -> None:
+    """The Build tab's runner-path audit: both halves, and the pin skew.
+
+    snesrecomp's runner/src is organised into layer folders, so moving a file
+    between them is a rename with no content change — nothing objects until a
+    port configures and cmake says "Cannot find source file", one file per
+    target, in the GAME's repo, for a defect that lives in the framework. The
+    op therefore audits the framework FIRST and the port second, and reports a
+    pin it cannot question as a failure rather than as a pass.
+    """
+    print("runner/src path audit")
+    from project_studio import buildops
+
+    prev = os.environ.get("SNESRECOMP_ROOT")
+    os.environ.pop("SNESRECOMP_ROOT", None)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Zed"
+            fw = root / "snesrecomp"
+            (fw / "runner" / "src" / "moved").mkdir(parents=True)
+            (root / "CMakeLists.txt").write_text("# clean\n", encoding="utf-8")
+
+            # 1. A pin with no tool is not a clean bill of health.
+            r = buildops.check_snes_runner_paths(root)
+            check(not r.ok, "a pin without the tool FAILS rather than passing")
+            check("check_runner_paths.py" in r.message,
+                  "...and names the tool the pin is missing")
+
+            # 2. Clean framework + clean port.
+            _fake_path_tool(fw, aimable=True)
+            r = buildops.check_snes_runner_paths(root)
+            check(r.ok, "a clean framework and port pass")
+
+            # 3. A stale reference in the PORT's own CMakeLists is caught —
+            #    the half a framework-only check would miss.
+            (root / "CMakeLists.txt").write_text(
+                "add_executable(t runner/src/stale.c)\n", encoding="utf-8")
+            r = buildops.check_snes_runner_paths(root)
+            check(not r.ok, "a stale reference in the port is a failure")
+            check("port" in r.message, "...and the message says which half")
+
+            # 4. --fix repairs it, and the next check is clean.
+            (fw / "runner" / "src" / "moved" / "stale.c").write_text("", encoding="utf-8")
+            r = buildops.check_snes_runner_paths(root, fix=True)
+            check(r.ok, "--fix repairs the port's reference")
+            check("runner/src/moved/stale.c" in
+                  (root / "CMakeLists.txt").read_text(encoding="utf-8"),
+                  "...by rewriting the file, not by reporting success")
+
+            # 5. A stale FRAMEWORK is reported as the framework's, even when
+            #    the port is spotless — that is the case that broke three ports.
+            (fw / "runner.cmake").write_text(
+                "set(S runner/src/stale.c)\n", encoding="utf-8")
+            r = buildops.check_snes_runner_paths(root)
+            check(not r.ok and "framework" in r.message,
+                  "a stale framework is named as the framework's defect")
+
+        # 6. Pin skew: the port builds against a framework somewhere else, and
+        #    the pinned tool has no --runner-src to aim at it. Studio must say
+        #    the port half could not be asked, not report it clean.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Zed"
+            root.mkdir(parents=True)
+            fw = Path(td) / "elsewhere" / "snesrecomp"
+            (fw / "runner" / "src" / "moved").mkdir(parents=True)
+            _fake_path_tool(fw, aimable=False)
+            os.environ["SNESRECOMP_ROOT"] = str(fw)
+            r = buildops.check_snes_runner_paths(root)
+            check(not r.ok, "an unaimable tool does not pass the port half")
+            check("--runner-src" in r.message,
+                  "...and names the flag the pinned tool is missing")
+            os.environ.pop("SNESRECOMP_ROOT", None)
+
+            # The same layout with an aimable tool is audited normally.
+            _fake_path_tool(fw, aimable=True)
+            os.environ["SNESRECOMP_ROOT"] = str(fw)
+            r = buildops.check_snes_runner_paths(root)
+            check(r.ok, "an aimable tool audits a port built elsewhere")
+    finally:
+        os.environ.pop("SNESRECOMP_ROOT", None)
+        if prev is not None:
+            os.environ["SNESRECOMP_ROOT"] = prev
+
 
 def test_regen_framework_skew() -> None:
     """Studio must not write a regen.sh the port's own snesrecomp cannot run.
@@ -960,6 +1106,811 @@ def test_advance_pins() -> None:
                 os.environ[k] = v
         if prev is not None:
             os.environ["SNESRECOMP_ROOT"] = prev
+
+def test_uncloned_submodules() -> None:
+    """A clone without --recurse-submodules, and the one op that heals it.
+
+    This is the state every peer's repo lands in: `git clone` writes the
+    .gitmodules entry and an empty directory, `git submodule status` prefixes
+    the module with '-', and every --modules op reports "checkout missing"
+    against a repo whose configuration is perfectly correct. The two answers
+    that used to disagree about that same repo were `git status` ("[OK]
+    snesrecomp") and `git switch --modules` ("checkout missing"), with Ensure
+    submodules claiming "already present" and changing nothing.
+    """
+    print("uncloned submodule checkouts")
+    from project_studio import gitops
+
+    prev = os.environ.get("SNESRECOMP_ROOT")
+    os.environ.pop("SNESRECOMP_ROOT", None)
+    saved = {k: os.environ.get(k) for k in _FILE_PROTOCOL_ENV}
+    os.environ.update(_FILE_PROTOCOL_ENV)
+    env = {**os.environ,
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    try:
+        platforms.set_current("snes")
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            origin, _old, _new, _lib = _stale_fork(base)
+            # What a peer does: clone the port, no --recurse-submodules.
+            clone = base / "clone"
+            subprocess.run(
+                ["git", "clone", "-q", str(origin), str(clone)],
+                env=env, capture_output=True, text=True,
+            )
+            sub = clone / "snesrecomp"
+            check(sub.is_dir() and not any(sub.iterdir()),
+                  "the clone leaves snesrecomp/ as an empty placeholder")
+            check((clone / ".gitmodules").is_file(),
+                  "while .gitmodules records it perfectly well")
+
+            # Status must not call that OK, and must not borrow the
+            # superproject's branch for it (git walks up out of an empty dir).
+            st = gitops.repo_status(clone)
+            rows = {x.path: x for x in st.submodules}
+            check(rows["snesrecomp"].present and not rows["snesrecomp"].initialized,
+                  "status reports it present but UNINITIALISED, not OK")
+            check(rows["snesrecomp"].checkout_branch == "",
+                  "and claims no checkout branch — the parent's is not its own")
+            check(any("never cloned" in n for n in st.notes),
+                  f"status names the state in a note ({st.notes})")
+
+            # The diagnosis every --modules op gives now carries the cure.
+            sw = gitops.switch_modules(
+                clone, paths=["snesrecomp"], branch_by_path={"snesrecomp": "main"})
+            check(not sw[0].ok, "switch still refuses to touch what is not there")
+            check("Ensure submodules first" in sw[0].message,
+                  f"and names the op that fixes it ({sw[0].message})")
+            check("--recurse-submodules" in sw[0].message,
+                  "and says why the directory is empty")
+
+            # Ensure submodules used to stop at .gitmodules. It finishes now.
+            res = gitops.ensure_known_submodules(clone)
+            fw_row = next(r for r in res if "snesrecomp" in r.message)
+            check(fw_row.ok, f"ensure-submodules succeeds ({fw_row.message})")
+            check(gitops._is_repo_root(sub),
+                  "snesrecomp is a real checkout afterwards, not a placeholder")
+            check("not cloned" in fw_row.message,
+                  "and says it cloned rather than claiming 'already present'")
+
+            # --recursive, so the nested module inside the framework came too.
+            check(gitops._is_repo_root(sub / "lib" / "recomp-net"),
+                  "the nested module inside it is cloned as well")
+
+            # And the op that failed a moment ago now works.
+            again = gitops.switch_modules(
+                clone, paths=["snesrecomp"], branch_by_path={"snesrecomp": "main"})
+            check(again[0].ok, f"switch --modules now succeeds ({again[0].message})")
+
+            # The symptom-named cure, on a second port, standing alone.
+            clone2 = base / "clone2"
+            subprocess.run(
+                ["git", "clone", "-q", str(origin), str(clone2)],
+                env=env, capture_output=True, text=True,
+            )
+            dry = gitops.init_module_checkouts(clone2, dry_run=True)
+            check(any("would clone" in r.message for r in dry),
+                  "init-modules dry-run says what it would do")
+            check(not gitops._is_repo_root(clone2 / "snesrecomp"),
+                  "and clones nothing")
+            init = gitops.init_module_checkouts(clone2)
+            check(all(r.ok for r in init), f"init-modules succeeds ({init[0].message})")
+            check(gitops._is_repo_root(clone2 / "snesrecomp"),
+                  "the framework checkout exists after it")
+            twice = gitops.init_module_checkouts(clone2)
+            check(all(r.ok for r in twice)
+                  and any("already checked out" in r.message for r in twice),
+                  "a second run is a no-op that says so")
+
+            # A stray non-repo directory in the way is a different failure and
+            # must not be silently deleted to make the clone succeed.
+            clone3 = base / "clone3"
+            subprocess.run(
+                ["git", "clone", "-q", str(origin), str(clone3)],
+                env=env, capture_output=True, text=True,
+            )
+            (clone3 / "snesrecomp" / "notes.txt").write_text("mine\n", encoding="utf-8")
+            blocked = gitops.init_module_checkouts(clone3, paths=["snesrecomp"])
+            check(not blocked[0].ok, "a non-empty non-repo directory is refused")
+            check("move it aside" in blocked[0].message,
+                  f"and says what to do about it ({blocked[0].message})")
+            check((clone3 / "snesrecomp" / "notes.txt").is_file(),
+                  "and the file that was in the way is still there")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if prev is not None:
+            os.environ["SNESRECOMP_ROOT"] = prev
+
+
+def test_game_id_is_read_not_derived() -> None:
+    """rom_identity.txt's game_id, and why Studio must never invent one.
+
+    The runtime matches a mod package's `[[target]] game_id` against the id
+    compiled in from rom_identity.txt with == (snesrecomp
+    runner/src/mod_runtime.cpp, target_matches). The framework derives that id
+    once, in setup_project.sh, from a project name Studio never sees —
+    `safe_slug(NAME).lower()` + region — and records the answer because it has
+    to stay stable across revisions. Re-deriving it from the ROM reproduces
+    that string only by luck, and a near-miss is the worst outcome available:
+    the build succeeds and every mod the port ships stops applying, with the
+    player told only "This feature does not support the selected stock ROM."
+    """
+    print("game_id is read, not derived")
+    from project_studio import snesops
+    from project_studio.models import MigrateOptions
+
+    platforms.set_current("snes")
+
+    def manifest(root: Path, pkg: str, gid: str) -> None:
+        d = root / "mods" / "preloaded" / "packages" / pkg / "1.0.0"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "manifest.toml").write_text(
+            f'format_version = 1\nid = "{pkg}"\n\n[[target]]\n'
+            f'game_id = "{gid}"\nrom_sha256 = "{"0" * 64}"\n',
+            encoding="utf-8",
+        )
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "port"
+        root.mkdir()
+        opts = MigrateOptions()
+
+        # Nothing records one. Refuse — and say what to pass, not just which
+        # template variable failed to expand.
+        gid, how = snesops.resolve_game_id(root, opts, {})
+        check(gid == "" and how == "", "with nothing to read, no id is produced")
+        help_text = snesops._token_help(root, ["GAME_ID"])
+        check("--game-id" in help_text,
+              f"the refusal names the override ({help_text[:60]}…)")
+        check("matches" in help_text,
+              "and says what the value is for, so it is not guessed at")
+
+        # The port's own mod packages name one. That is a recorded commitment
+        # in tracked files, and it is what would break.
+        manifest(root, "zelda-alttp.enhancement.widescreen", "zelda-alttp-us")
+        manifest(root, "zelda-alttp.enhancement.msu1", "zelda-alttp-us")
+        gid, how = snesops.resolve_game_id(root, opts, {})
+        check(gid == "zelda-alttp-us", f"the id the mods name is used ({gid})")
+        check("manifest" in how, f"and its provenance is reported ({how})")
+
+        # The formula would NOT have produced it: safe_slug strips hyphens and
+        # the recorded region is "USA", so derivation yields zeldaalttp-usa.
+        # This is the whole reason the order is read-first.
+        derived = "".join(ch for ch in "Zelda Alttp" if ch.isalnum()).lower() + "-usa"
+        check(derived != gid,
+              f"deriving would have produced a different id ({derived} != {gid})")
+
+        # rom_identity.txt outranks the manifests: it is the file the build
+        # compiles in and regen.sh reads.
+        gid, how = snesops.resolve_game_id(root, opts, {"game_id": "recorded-us"})
+        check(gid == "recorded-us" and "rom_identity" in how,
+              f"a recorded id wins over the manifests ({gid}, {how})")
+
+        # And the human override outranks everything.
+        gid, how = snesops.resolve_game_id(
+            root, MigrateOptions(game_id="told-us"), {"game_id": "recorded-us"})
+        check(gid == "told-us" and "--game-id" in how,
+              f"--game-id wins over both ({gid}, {how})")
+
+        # Manifests that disagree are not a majority vote.
+        manifest(root, "third.pkg", "something-else")
+        gid, how = snesops.resolve_game_id(root, opts, {})
+        check(gid == "", "manifests that disagree produce no id rather than a guess")
+        clash = snesops._token_help(root, ["GAME_ID"])
+        check("disagree" in clash and "something-else" in clash and "zelda-alttp-us" in clash,
+              "and the message lists the ids in conflict and where they came from")
+
+        # Not asked for, not explained.
+        check(snesops._token_help(root, ["ROM_SHA256"]) == "",
+              "a missing digest gets no game_id lecture")
+
+
+def test_configure_preflights_mod_catalog() -> None:
+    """Configure refuses on the mod-catalog guard instead of spending a cmake.
+
+    snesrecomp's guard is a FATAL_ERROR, and the audit already grades that
+    state as a REQUIRED failure carrying the id of the op that fixes it. What
+    used to happen is that Studio ran cmake anyway, the user read the
+    framework's 25-line hand-edit recipe, and the translation only arrived
+    afterwards from diagnose_configure_failure — after a configure that could
+    never have succeeded. The preflight has to reuse the audit's row rather
+    than re-derive the rule: the grading weighs four separate conditions and a
+    second copy of it in buildops would drift from the Migrate tab's.
+    """
+    print("configure preflights the mod catalog")
+    from project_studio import buildops
+
+    platforms.set_current("snes")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "port"
+        (root / "mods" / "preloaded" / "packages" / "a.pkg" / "1.0.0").mkdir(parents=True)
+        (root / "mods" / "preloaded" / "packages" / "a.pkg" / "1.0.0"
+         / "manifest.toml").write_text(
+            'format_version = 1\nid = "a.pkg"\n\n[[target]]\n'
+            f'game_id = "a-us"\nrom_sha256 = "{"0" * 64}"\n', encoding="utf-8")
+
+        # No framework checkout: the audit skips the row, so the preflight must
+        # not block. A port on an older pin has a load-bearing per-title block.
+        (root / "CMakeLists.txt").write_text("project(Zed C)\n", encoding="utf-8")
+        check(buildops.preflight_snes_mod_catalog(root) is None,
+              "with no framework checkout to judge against, nothing is blocked")
+
+        # A framework that defines the call, and a CMakeLists that never makes
+        # it — the state that aborts configure.
+        fw = root / "snesrecomp" / "runner"
+        fw.mkdir(parents=True)
+        (fw / "runner.cmake").write_text(
+            'set(SNESRECOMP_MOD_CATALOG_DEST "mods/preloaded/packages")\n'
+            "function(snesrecomp_target_mod_catalog target preloaded_dir)\n"
+            "endfunction()\n", encoding="utf-8")
+        (root / "CMakeLists.txt").write_text(
+            "project(Zed C)\n"
+            'set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL "" FORCE)\n'
+            "add_custom_command(TARGET Zed POST_BUILD COMMAND ${CMAKE_COMMAND}\n"
+            '  -E copy_directory "${CMAKE_SOURCE_DIR}/mods/preloaded"\n'
+            '  "$<TARGET_FILE_DIR:Zed>/mods")\n', encoding="utf-8")
+        pre = buildops.preflight_snes_mod_catalog(root)
+        check(pre is not None and not pre.ok, "an undeclared catalog is refused")
+        check("snes_declare_mod_catalog" in pre.message,
+              f"and the refusal names the op that fixes it ({pre.message[:70]}…)")
+        check("not started" in pre.message,
+              "and says no configure was spent on it")
+
+        # Declared properly: the row passes and the preflight gets out of the way.
+        (root / "CMakeLists.txt").write_text(
+            "project(Zed C)\n"
+            'set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL "" FORCE)\n'
+            'snesrecomp_target_mod_catalog(Zed "${CMAKE_SOURCE_DIR}/mods/preloaded")\n',
+            encoding="utf-8")
+        check(buildops.preflight_snes_mod_catalog(root) is None,
+              "a declared catalog blocks nothing")
+
+        # And the post-hoc translation stays, for what a preflight cannot see.
+        hint = buildops.diagnose_configure_failure(
+            "CMake Error: ... snesrecomp_target_mod_catalog(<target>\n"
+            "but no target declared it, so those packages ...", root)
+        check(hint is not None and "snes_declare_mod_catalog" in hint,
+              "cmake's own guard text still translates to the same op")
+
+
+# MegaManXSNESRecomp's real shape, reduced: a regional variant chosen
+# positionally, each variant's ROM required at a fixed staged path, and the
+# framework's internal tools driven directly rather than through its CLI.
+_REGEN_SH_PORT_OWNED = """#!/usr/bin/env bash
+VARIANT="usa"
+for arg in "$@"; do
+  case "$arg" in
+    --no-tests) RUN_TESTS=0 ;;
+    --strict-idempotent) STRICT=1 ;;
+    -h|--help) exit 0 ;;
+    usa|jp|all) VARIANT="$arg" ;;
+    *) echo "regen.sh: unknown argument: $arg (try --help)" >&2; exit 2 ;;
+  esac
+done
+"$PYTHON" "$SNESRECOMP_ROOT/tools/v2_emit.py" --rom "$rom" --cfg-dir recomp
+"""
+
+
+def test_port_owned_regen_script() -> None:
+    """A tools/regen.sh the PORT wrote: not driveable by flag, not ours to replace.
+
+    regen.sh belongs to the project, and Studio had two assumptions about it
+    that a hand-written one breaks. It passed ``--rom <path>`` unconditionally,
+    so a driver that selects a regional variant positionally answered
+    "unknown argument: --rom" and the refusal arrived as a Studio Generate
+    failure. And Probe ROM re-emits the identity carriers with force=True,
+    which reached regen.sh too — so the only thing between Studio and
+    overwriting a 130-line multi-variant driver was an unrelated
+    framework-version check that would stop applying the moment that port
+    advanced its submodule pin.
+    """
+    print("port-owned regen.sh")
+    from project_studio import buildops, snes_paths, snesops
+    from project_studio.models import MigrateOptions
+
+    platforms.set_current("snes")
+
+    # Classification first, because both fixes hang off it. The discriminator
+    # cannot be "looks like the current template": an OLDER wizard script also
+    # fails that, and re-emitting those is what Emit tools/regen.sh is for.
+    check(snes_paths.regen_is_port_authored(_REGEN_SH_PORT_OWNED),
+          "an own option vocabulary with none of the wizard's flags reads as port-authored")
+    check(not snes_paths.regen_is_port_authored(_REGEN_SH_MODERN),
+          "a wizard script is not")
+    check(not snes_paths.regen_is_port_authored(_REGEN_SH),
+          "and neither is an early wizard script with no parser — it is ours to replace")
+    check(not snes_paths.regen_is_port_authored("#!/bin/sh\n-h|--help) exit 0 ;;\n"),
+          "--help alone is not a vocabulary")
+    opts = snes_paths.regen_options(_REGEN_SH_PORT_OWNED)
+    check(opts == {"--no-tests", "--strict-idempotent", "-h", "--help"},
+          f"the option surface is read exactly, arrays and prose excluded ({sorted(opts)})")
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "Port"
+        (root / "tools").mkdir(parents=True)
+        script = root / "tools" / "regen.sh"
+        script.write_text(_REGEN_SH_PORT_OWNED, encoding="utf-8")
+        _fake_framework(root / "snesrecomp", ("build", "generate", "verify-rom"))
+
+        # Generate must name the interface mismatch, before running anything.
+        r = buildops.preflight_snes_generate(root, rom="/roms/mmx.sfc")
+        check(r is not None and not r.ok, "passing --rom to it is refused")
+        check("does not accept --rom" in r.message,
+              f"and the refusal says which flag ({r.message[:60]}…)")
+        check("--no-tests" in r.message and "--strict-idempotent" in r.message,
+              "and lists what the script does accept, so it can be driven by hand")
+
+        # Silently dropping the flag would be worse than refusing: generation
+        # would run against whatever ROM the script finds, not the one picked.
+        check("--help" in r.message or "directly" in r.message,
+              "and points at running it directly rather than guessing")
+
+        # With no flags to pass there is nothing to mismatch, so this gate
+        # must not fire — the framework checks behind it still run.
+        r2 = buildops.preflight_snes_generate(root)
+        check(r2 is None or "does not accept" not in r2.message,
+              "asking for no flags is not an interface mismatch")
+
+        # And a forced identity refresh leaves the script alone.
+        before = script.read_text(encoding="utf-8")
+        res = snesops._fill_regen(root, MigrateOptions(force=True), "op")
+        check(res.ok, f"the refresh does not fail over it ({res.message[:50]}…)")
+        check("left alone" in res.message,
+              "it reports declining to touch it rather than staying silent")
+        check(script.read_text(encoding="utf-8") == before,
+              "and the port's script is byte-identical afterwards")
+        check(not res.changed_paths,
+              "with nothing claimed as changed")
+
+
+# A port-owned driver that adds nothing the wizard's script lacks: same $CLI
+# calls, same flags, just hand-rolled argument parsing. Adopting the
+# framework's is pure cleanup here.
+_REGEN_SH_FORKED_PLAIN = """#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in
+    --skip) SKIP=1 ;;
+    -h|--help) exit 0 ;;
+    *) echo "unknown: $arg" >&2; exit 2 ;;
+  esac
+done
+"$PYTHON" "$CLI" verify-rom --rom "$ROM"
+"$PYTHON" "$CLI" generate --rom "$ROM"
+"""
+
+# MegaManX's shape, reduced: capability the wizard's single-target script has
+# no way to express.
+_REGEN_SH_FORKED_RICH = """#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in
+    --no-tests) RUN_TESTS=0 ;;
+    -h|--help) exit 0 ;;
+    usa|jp) VARIANT="$arg" ;;
+    *) echo "unknown: $arg" >&2; exit 2 ;;
+  esac
+done
+"$PYTHON" "$SNESRECOMP_ROOT/tools/v2_emit.py" --rom "$rom" --profile-manifest x.json
+"""
+
+
+def test_adopt_framework_regen() -> None:
+    """Handing a port-owned tools/regen.sh back to the framework.
+
+    A port carrying its own regen.sh carries a fork of engine tooling: wizard
+    fixes never reach it and Studio cannot drive it. The cleanup is worth
+    automating — but only where it is cleanup. A hand-written driver may have
+    grown capability the wizard's script cannot express, and replacing that one
+    reads as a successful tidy-up while deleting the only way to build half the
+    project, so the gate is a derived capability diff rather than a guess.
+    """
+    print("adopt the framework's regen.sh")
+    from project_studio import snesops
+    from project_studio.models import MigrateOptions
+
+    platforms.set_current("snes")
+    prev = os.environ.get("SNESRECOMP_ROOT")
+    os.environ.pop("SNESRECOMP_ROOT", None)
+    try:
+        # --- 1. A fork that adds nothing: mechanical, and tools/ goes with it.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Plain"
+            (root / "tools").mkdir(parents=True)
+            (root / "tools" / "regen.sh").write_text(
+                _REGEN_SH_FORKED_PLAIN, encoding="utf-8")
+            _fake_wizard(root / "snesrecomp", {"regen.sh.in": _REGEN_SH_MODERN})
+            _fake_framework(root / "snesrecomp", ("build", "generate", "verify-rom"))
+            (root / "rom_identity.txt").write_text(
+                "expected_crc32  = deadbeef\nexpected_sha256 = abc123\n",
+                encoding="utf-8")
+
+            rep = snesops.regen_adoption_report(root)
+            check(rep.state == "port", "the fork is recognised as port-owned")
+            check(rep.lost == [], f"and no capability would be lost ({rep.lost})")
+            check(any("--skip" in n for n in rep.notes),
+                  f"though its own flag is reported as an interface change ({rep.notes})")
+            check(rep.blocker == "", f"and the pinned framework can run it ({rep.blocker})")
+
+            dry = snesops._op_adopt_framework_regen(
+                root, MigrateOptions(dry_run=True))
+            check(dry.ok and "would replace" in dry.message, "dry-run says what it would do")
+            check("remove tools/" not in dry.message,
+                  "and does not promise to remove tools/ — the adopted script "
+                  "lives in it")
+            check(_REGEN_SH_FORKED_PLAIN in (root / "tools" / "regen.sh").read_text(
+                      encoding="utf-8"),
+                  "and changes nothing")
+
+            res = snesops._op_adopt_framework_regen(root, MigrateOptions())
+            check(res.ok, f"adoption succeeds ({res.message[:60]}…)")
+            check((root / "tools" / "regen.sh").is_file(),
+                  "tools/ stays: it is where the wizard emits the adopted script")
+            check(snesops.regen_adoption_report(root).state == "framework",
+                  "and the port no longer owns it — the framework does")
+
+        # --- 2. Same fork, but the port keeps its own research tooling there.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "WithTools"
+            (root / "tools").mkdir(parents=True)
+            (root / "tools" / "regen.sh").write_text(
+                _REGEN_SH_FORKED_PLAIN, encoding="utf-8")
+            (root / "tools" / "eye_scan.py").write_text("# mine\n", encoding="utf-8")
+            _fake_wizard(root / "snesrecomp", {"regen.sh.in": _REGEN_SH_MODERN})
+            _fake_framework(root / "snesrecomp", ("build", "generate", "verify-rom"))
+            (root / "rom_identity.txt").write_text(
+                "expected_crc32  = deadbeef\nexpected_sha256 = abc123\n",
+                encoding="utf-8")
+
+            res = snesops._op_adopt_framework_regen(root, MigrateOptions())
+            check(res.ok, "adoption still succeeds")
+            check((root / "tools" / "eye_scan.py").is_file(),
+                  "a port's own tool in tools/ survives — the folder is not the unit")
+            check("left alone" in res.message,
+                  f"and the op says it left it ({res.message[-70:]})")
+            after = (root / "tools" / "regen.sh").read_text(encoding="utf-8")
+            check(after != _REGEN_SH_FORKED_PLAIN and "$CLI" in after,
+                  "while regen.sh was actually replaced with the framework's")
+
+        # --- 3. A fork with real capability: refused, and itemised.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Rich"
+            (root / "tools").mkdir(parents=True)
+            (root / "tools" / "regen.sh").write_text(
+                _REGEN_SH_FORKED_RICH, encoding="utf-8")
+            _fake_wizard(root / "snesrecomp", {"regen.sh.in": _REGEN_SH_MODERN})
+            _fake_framework(root / "snesrecomp", ("build", "generate", "verify-rom"))
+            (root / "rom_identity.txt").write_text(
+                "expected_crc32  = deadbeef\nexpected_sha256 = abc123\n",
+                encoding="utf-8")
+
+            lost = snesops.regen_adoption_report(root).lost
+            check(any("positionally" in x for x in lost),
+                  f"the variant selector is named as a loss ({lost})")
+            check(any("v2_emit" in x for x in lost),
+                  "so is driving a framework tool the wizard's script never calls")
+            check(any("--profile-manifest" in x for x in lost),
+                  "and so is a generator flag it passes")
+
+            res = snesops._op_adopt_framework_regen(root, MigrateOptions())
+            check(not res.ok, "adoption is refused rather than done quietly")
+            check("delete capability, not duplication" in res.message,
+                  "and says why in those terms")
+            check("regen.sh.in" in res.message,
+                  "pointing the fix upstream, at the template")
+            before = (root / "tools" / "regen.sh").read_text(encoding="utf-8")
+            check(before == _REGEN_SH_FORKED_RICH, "the port's script is untouched")
+
+            # Visible in the GUI, but never ticked for you. Withholding the
+            # fix op entirely left the GUI showing a defect with no way to act
+            # on it; auto-ticking it would apply a known loss unasked.
+            report = snesops.audit_project(root)
+            row = next(c for c in report.checks if c.id == "regen_ownership")
+            check(row.fix_op == "snes_adopt_framework_regen",
+                  "the audit does name the op, so the GUI has a route to it")
+            step = next(x for x in snesops.build_plan(root, MigrateOptions(), report).steps
+                        if x.op_id == "snes_adopt_framework_regen")
+            check(step.selected is False,
+                  "but the plan leaves it unticked — the loss is opt-in")
+            check("would drop" in step.detail and "positionally" in step.detail,
+                  "with the loss itemised on the step itself")
+
+            # An explicit --force is the human saying yes.
+            forced = snesops._op_adopt_framework_regen(
+                root, MigrateOptions(force=True))
+            check(forced.ok, f"--force adopts anyway ({forced.message[:50]}…)")
+            check("accepted the loss" in forced.message,
+                  "and records what was given up")
+
+        # --- 4. A port already on the framework's script is left alone.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Already"
+            (root / "tools").mkdir(parents=True)
+            (root / "tools" / "regen.sh").write_text(_REGEN_SH_MODERN, encoding="utf-8")
+            _fake_wizard(root / "snesrecomp", {"regen.sh.in": _REGEN_SH_MODERN})
+            _fake_framework(root / "snesrecomp", ("build", "generate", "verify-rom"))
+            check(snesops.regen_adoption_report(root).state == "framework",
+                  "a wizard-emitted script is recognised as the framework's")
+            res = snesops._op_adopt_framework_regen(root, MigrateOptions())
+            check(res.ok and "already" in res.message, "and the op is a no-op")
+            row = next(c for c in snesops.audit_project(root).checks
+                       if c.id == "regen_ownership")
+            check(row.status.value == "pass", "with a passing audit row")
+    finally:
+        if prev is not None:
+            os.environ["SNESRECOMP_ROOT"] = prev
+
+
+def test_regen_advice_matches_the_plan() -> None:
+    """Generate's advice may never name a Migrate step the plan does not offer.
+
+    The reported symptom: Generate on SuperMetroidRecomp said to tick
+    "snes_adopt_framework_regen" in Migrate, the user went to the Migrate tab,
+    and no such step was there. Both statements were mine and both were
+    "right" in isolation — the audit withholds the fix op when the pinned
+    framework cannot run the replacement, and the refusal named it
+    unconditionally. This is the invariant that makes that combination
+    impossible, checked across all three adoption states rather than the one
+    that happened to be reported.
+    """
+    print("regen advice matches the plan")
+    from project_studio import snesops
+    from project_studio.models import MigrateOptions
+
+    platforms.set_current("snes")
+    prev = os.environ.get("SNESRECOMP_ROOT")
+    os.environ.pop("SNESRECOMP_ROOT", None)
+    try:
+        cases = (
+            ("mechanical", _REGEN_SH_FORKED_PLAIN, ("build", "generate", "verify-rom")),
+            ("lossy", _REGEN_SH_FORKED_RICH, ("build", "generate", "verify-rom")),
+            # The Super Metroid shape: the pinned CLI predates the script.
+            ("blocked", _REGEN_SH_FORKED_PLAIN, ("build",)),
+        )
+        for label, script_body, commands in cases:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td) / label
+                (root / "tools").mkdir(parents=True)
+                (root / "tools" / "regen.sh").write_text(script_body, encoding="utf-8")
+                _fake_wizard(root / "snesrecomp", {"regen.sh.in": _REGEN_SH_MODERN})
+                _fake_framework(root / "snesrecomp", commands)
+                (root / "rom_identity.txt").write_text(
+                    "expected_crc32  = deadbeef\nexpected_sha256 = abc123\n",
+                    encoding="utf-8")
+
+                advice = snesops.regen_ownership_guidance(root)
+                check(bool(advice), f"{label}: a port-owned script gets advice")
+
+                report = snesops.audit_project(root)
+                plan_ops = {st.op_id for st in snesops.build_plan(
+                    root, MigrateOptions(), report).steps}
+                names_step = snesops.ADOPT_REGEN_TITLE in advice
+                check(names_step == ("snes_adopt_framework_regen" in plan_ops),
+                      f"{label}: advice names the Migrate step iff the plan has it "
+                      f"(names={names_step}, planned="
+                      f"{'snes_adopt_framework_regen' in plan_ops})")
+
+                if label == "blocked":
+                    check("offers no step" in advice,
+                          f"blocked: the advice says so outright ({advice[:60]}…)")
+                    check("bash tools/regen.sh" in advice,
+                          "and points at the path that does work")
+                    check("pin" in advice or "submodule" in advice,
+                          "naming the pin as what has to move")
+                if label == "lossy":
+                    check("UNTICKED" in advice,
+                          "lossy: the advice warns the step is not pre-ticked")
+                    check("Force" in advice, "and that Force is required")
+                if label == "mechanical":
+                    check("Apply" in advice, "mechanical: just tick and Apply")
+    finally:
+        if prev is not None:
+            os.environ["SNESRECOMP_ROOT"] = prev
+
+
+def test_only_overrides_cautious_default() -> None:
+    """An op named in --only runs, even when the plan would leave it unticked.
+
+    The reported symptom: the user ticked "Hand tools/regen.sh back to the
+    framework" in Migrate, pressed Apply, and the op printed NOTHING — no OK,
+    no FAIL. --only forces the op into the plan, but build_plan then set
+    selected=False for a lossy adoption and apply_plan skipped unselected
+    steps in silence. --only IS the tick (the GUI's Apply sends the ticked ops
+    as --only), so it has to win; and a skipped-but-requested step must never
+    again be droppable without a word.
+    """
+    print("--only overrides the unticked default")
+    from project_studio import snesops
+    from project_studio.models import MigrateOptions, Plan, PlanStep
+
+    platforms.set_current("snes")
+    prev = os.environ.get("SNESRECOMP_ROOT")
+    os.environ.pop("SNESRECOMP_ROOT", None)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Lossy"
+            (root / "tools").mkdir(parents=True)
+            (root / "tools" / "regen.sh").write_text(
+                _REGEN_SH_FORKED_RICH, encoding="utf-8")
+            _fake_wizard(root / "snesrecomp", {"regen.sh.in": _REGEN_SH_MODERN})
+            _fake_framework(root / "snesrecomp", ("build", "generate", "verify-rom"))
+            (root / "rom_identity.txt").write_text(
+                "expected_crc32  = deadbeef\nexpected_sha256 = abc123\n",
+                encoding="utf-8")
+
+            # Reviewing the plan: still unticked, so Apply-everything is safe.
+            plain = snesops.build_plan(root, MigrateOptions())
+            step = next(x for x in plain.steps
+                        if x.op_id == "snes_adopt_framework_regen")
+            check(step.selected is False, "unticked when nobody asked for it")
+
+            # Asking for it by name: ticked, and it actually runs.
+            asked = MigrateOptions(only=["snes_adopt_framework_regen"])
+            plan = snesops.build_plan(root, asked)
+            step = next(x for x in plan.steps
+                        if x.op_id == "snes_adopt_framework_regen")
+            check(step.selected is True, "--only ticks it — that is the user saying yes")
+            results = snesops.apply_plan(plan)
+            ids = [r.op_id for r in results]
+            check("snes_adopt_framework_regen" in ids,
+                  f"and it produces a result line rather than silence ({ids})")
+            res = next(r for r in results
+                       if r.op_id == "snes_adopt_framework_regen")
+            check(not res.ok and "delete capability" in res.message,
+                  "still refusing without --force, but out loud")
+
+            # The backstop: an unselected step that WAS requested is reported.
+            forced_plan = Plan(
+                root=str(root), layout=plain.layout,
+                steps=[PlanStep(op_id="snes_adopt_framework_regen", title="t",
+                                selected=False)],
+                options=MigrateOptions(only=["snes_adopt_framework_regen"]))
+            out = snesops.apply_plan(forced_plan)
+            check(len(out) == 1 and not out[0].ok,
+                  "a requested-but-unselected step is reported, never swallowed")
+            check("Studio bug" in out[0].message,
+                  "and is labelled as the bug it would be")
+    finally:
+        if prev is not None:
+            os.environ["SNESRECOMP_ROOT"] = prev
+
+
+def test_game_id_derived_only_without_manifests() -> None:
+    """With no mod package in the repo, game_id is derived rather than refused.
+
+    A correction to my own earlier gate. Refusing to derive protects a port's
+    mods from being orphaned by an id that matches no [[target]] — real, and
+    why a recorded id always wins. But with NO manifest in the repo there is
+    nothing to orphan, and refusing blocked rom_identity.txt, which the current
+    framework *requires* as its identity carrier. Blocking a build over a field
+    nothing reads is the worse failure.
+    """
+    print("game_id derived only when nothing can be orphaned")
+    from project_studio import snesops
+    from project_studio.models import MigrateOptions
+
+    platforms.set_current("snes")
+    ident = {"region": "JPN", "display_name": "Super Metroid"}
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "Port"
+        root.mkdir()
+        gid, how = snesops.resolve_game_id(root, MigrateOptions(), ident)
+        check(gid == "supermetroid-jpn", f"derived as <slug>-<region> ({gid})")
+        check("scaffolder's own rule" in how,
+              "and says it was derived, not read")
+        check("orphaned" in how,
+              "stating why deriving is safe here rather than just doing it")
+
+        # A manifest changes the answer back: recorded wins, always.
+        d = root / "mods" / "preloaded" / "packages" / "p.kg" / "1.0.0"
+        d.mkdir(parents=True)
+        (d / "manifest.toml").write_text(
+            'format_version = 1\nid = "p.kg"\n\n[[target]]\n'
+            f'game_id = "chosen-by-hand"\nrom_sha256 = "{"0" * 64}"\n',
+            encoding="utf-8")
+        gid, how = snesops.resolve_game_id(root, MigrateOptions(), ident)
+        check(gid == "chosen-by-hand",
+              f"a manifest's id beats the formula ({gid})")
+        check("manifest" in how, "and is reported as read")
+
+        # Disagreeing manifests still refuse — deriving would break one.
+        d2 = root / "mods" / "preloaded" / "packages" / "q.kg" / "1.0.0"
+        d2.mkdir(parents=True)
+        (d2 / "manifest.toml").write_text(
+            'format_version = 1\nid = "q.kg"\n\n[[target]]\n'
+            f'game_id = "something-else"\nrom_sha256 = "{"0" * 64}"\n',
+            encoding="utf-8")
+        gid, _how = snesops.resolve_game_id(root, MigrateOptions(), ident)
+        check(gid == "", "manifests in conflict are still not resolved by formula")
+
+
+def test_git_errors_are_not_swallowed() -> None:
+    """snesops._git must report git's own reason, which git writes to stderr.
+
+    The reported symptom was a migrate step that said exactly
+    "snes_ensure_nested_modules: git failed: " — nothing after the colon. git
+    had said "fatal: No url found for submodule path 'lib/retcomm-rbengine' in
+    .gitmodules", on stderr, and the helper returned only stdout. A gate that
+    discards the one sentence explaining itself leaves nothing to act on.
+    """
+    print("git errors carry git's reason")
+    from project_studio import snesops
+
+    platforms.set_current("snes")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        code, out = snesops._git(root, "rev-parse", "--is-inside-work-tree")
+        check(code != 0, "a failing git command reports a non-zero code")
+        check(out.strip() != "",
+              f"and a non-empty reason rather than silence ({out!r})")
+
+        git(root, "init", "-q", "-b", "main")
+        code, out = snesops._git(root, "rev-parse", "--is-inside-work-tree")
+        check(code == 0 and out == "true", "success still returns stdout")
+
+        # The exact shape from the log: a real gitlink in the index whose
+        # .gitmodules section has a branch but no url. A plain directory does
+        # not reproduce it — git rejects the pathspec before ever reading
+        # .gitmodules, which is a different error and would let a regression
+        # through.
+        (root / ".gitmodules").write_text(
+            '[submodule "sub"]\n\tpath = sub\n\tbranch = main\n', encoding="utf-8")
+        git(root, "update-index", "--add", "--cacheinfo",
+            f"160000,{'0' * 39}1,sub")
+        code, out = snesops._git(root, "submodule", "update", "--init", "sub")
+        check(code != 0, "the real failure still fails")
+        check("url" in out.lower(),
+              f"and names the missing url rather than nothing ({out[:70]}…)")
+
+
+def test_build_failure_diagnosis() -> None:
+    """A header the found package did not provide, explained from the cache.
+
+    Configure succeeds, links SDL3::SDL3, prints "SDL3 desktop backend" — and
+    every file then fails on 'SDL3/SDL.h' file not found. The toolchain pack's
+    clang searches only its own sysroot, never /usr/include, while CMake omits
+    an include dir it thinks is implicit. So a tree whose SDL3_DIR resolved to
+    the host's /usr/lib/cmake/SDL3 configures cleanly and compiles nothing.
+    """
+    print("build failure diagnosis")
+    from project_studio import buildops
+
+    platforms.set_current("snes")
+    err = "fatal error: 'SDL3/SDL.h' file not found"
+    with tempfile.TemporaryDirectory() as td:
+        bdir = Path(td) / "build-release"
+        bdir.mkdir()
+        pack = buildops.toolchain_root()
+
+        hint = buildops.diagnose_build_failure(err, bdir)
+        check(hint is not None, "the missing header is recognised")
+        check("outside the compiler's sysroot" in hint,
+              "and the mechanism is named, not just the symptom")
+
+        if pack is not None:
+            # A poisoned cache: the entry must be quoted back with its value.
+            want = buildops.toolchain_env().get("SDL3_DIR", "")
+            if want:
+                (bdir / "CMakeCache.txt").write_text(
+                    "SDL3_DIR:PATH=/usr/lib/cmake/SDL3\n", encoding="utf-8")
+                hint = buildops.diagnose_build_failure(err, bdir)
+                check("/usr/lib/cmake/SDL3" in hint,
+                      f"the stale entry is quoted back ({hint[:70]}…)")
+                check(want in hint, "alongside where the pack ships its own")
+                check("Configure again" in hint, "and the cure is named")
+        else:
+            check("cannot re-point" in hint,
+                  "without a pack, it says so instead of inventing a path")
+
+        check(buildops.diagnose_build_failure("undefined reference to `foo'", bdir)
+              is None,
+              "an unrelated build failure gets no SDL lecture")
+        check(buildops.diagnose_build_failure("", bdir) is None,
+              "and neither does empty output")
+
 
 def test_module_urls() -> None:
     """Repointing a module at a fork, without committing it for everyone.
@@ -1241,6 +2192,40 @@ def test_module_targets() -> None:
         not hasattr(gitops, "KNOWN_SUBMODULES"),
         "the PSX-shaped constant is gone, so the bug cannot be re-imported",
     )
+
+
+def test_launch_picks_product_binary() -> None:
+    """Launch runs the game, not a ctest binary that shares its build dir.
+
+    A full ``cmake --build`` leaves the project's test executables next to the
+    product.  With every root executable scoring the same, an alphabetical
+    tie-break launched ``ppu_window_test`` for SuperMetroidRecomp, which exits
+    0 instantly and reads as "the game doesn't even launch".
+    """
+    print("launch picks the product binary")
+    from project_studio import buildops
+
+    platforms.set_current("snes")
+    with tempfile.TemporaryDirectory() as td:
+        bdir = Path(td) / "build-release"
+        bdir.mkdir()
+        for name in ("ppu_window_test", "sm_render_capture", "sm_video_test",
+                     "SuperMetroidSNESRecomp"):
+            f = bdir / name
+            f.write_bytes(b"#!/bin/sh\n")
+            f.chmod(0o755)
+        got = buildops.find_runtime_exe(bdir, preferred="SuperMetroidSNESRecomp")
+        check(got is not None and got.name == "SuperMetroidSNESRecomp",
+              f"the CMake target's own executable wins outright ({got})")
+        got = buildops.find_runtime_exe(bdir)
+        check(got is not None and got.name == "SuperMetroidSNESRecomp",
+              f"without a target hint, test binaries still lose to *Recomp ({got})")
+        # A project whose product name carries no hint at all: the test
+        # binaries are still demoted below it.
+        (bdir / "SuperMetroidSNESRecomp").rename(bdir / "zed")
+        got = buildops.find_runtime_exe(bdir)
+        check(got is not None and got.name == "zed",
+              f"an unhinted product still beats test/capture binaries ({got})")
 
 
 def test_launch_rom() -> None:
@@ -1526,6 +2511,194 @@ def test_moved_repo_urls() -> None:
           "the flag reaches the dialog over json")
 
 
+def test_mod_catalog(tmp: Path) -> None:
+    """The migration off per-title mod staging, on the shapes that exist.
+
+    Four SNES ports each spelled the staging differently and the framework
+    took the job over; the guard in runner.cmake makes the CMake half loud,
+    and nothing at all makes the host half loud -- so both halves are checked
+    here, along with the two blocks that must survive: an unrelated
+    copy_directory, and a port that already migrated.
+    """
+    print("mod catalog migration")
+    from project_studio import snesops
+
+    def port(name: str, cmake: str, main_c: str, packages=("a.mod",),
+             framework: bool = True) -> Path:
+        root = tmp / name
+        (root / "src").mkdir(parents=True, exist_ok=True)
+        (root / "CMakeLists.txt").write_text(cmake, encoding="utf-8")
+        (root / "src" / "main.c").write_text(main_c, encoding="utf-8")
+        for pkg in packages:
+            (root / "mods" / "preloaded" / "packages" / pkg / "1.0.0").mkdir(
+                parents=True, exist_ok=True)
+        if framework:
+            runner = root / "snesrecomp" / "runner"
+            runner.mkdir(parents=True, exist_ok=True)
+            (runner / "runner.cmake").write_text(
+                'set(SNESRECOMP_MOD_CATALOG_DEST "mods/preloaded/packages")\n'
+                "function(snesrecomp_target_mod_catalog target dir)\n"
+                "endfunction()\n", encoding="utf-8")
+        return root
+
+    HOST = ('int boot(void) {\n'
+            '  return snes_mod_runtime_initialize_c(\n'
+            '      "mods", "zed-us", "ff");\n'
+            '}\n')
+
+    # 1. The shape the guard fires on: a copy_directory POST_BUILD block,
+    #    inside an if(), fed by a variable, under a comment -- plus a second
+    #    copy_directory for shader presets that has nothing to do with mods.
+    legacy = port("legacy", '''cmake_minimum_required(VERSION 3.16)
+project(Zed C)
+set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL "" FORCE)
+include(${CMAKE_SOURCE_DIR}/snesrecomp/runner/runner.cmake)
+add_executable(ZedSNESRecomp src/main.c)
+
+# Release-owned mod catalog staged next to the exe.
+set(ZED_PRELOADED_MODS "${CMAKE_CURRENT_SOURCE_DIR}/mods/preloaded")
+if(EXISTS "${ZED_PRELOADED_MODS}/packages")
+    add_custom_command(TARGET ZedSNESRecomp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${ZED_PRELOADED_MODS}"
+            "$<TARGET_FILE_DIR:ZedSNESRecomp>/mods")
+endif()
+
+set(ZED_SHADERS "${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders")
+add_custom_command(TARGET ZedSNESRecomp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${ZED_SHADERS}" "$<TARGET_FILE_DIR:ZedSNESRecomp>/assets/shaders")
+''', HOST)
+
+    audit = {c.id: c for c in snesops.audit_project(legacy).checks}
+    row = audit["mod_catalog"]
+    check(row.status.value == "fail" and row.fix_op == "snes_declare_mod_catalog",
+          "un-declared catalog fails the audit and names the op")
+    check("configure aborts" in row.detail,
+          "the detail says configure will abort, which is what brought them here")
+    check("the Mods page would list nothing" in row.detail,
+          "and reports the silent host-root half as well")
+    check("snes_declare_mod_catalog" in
+          [s.op_id for s in snesops.build_plan(legacy).steps],
+          "the plan picks the op up from the failing check")
+
+    res = snesops._op_declare_mod_catalog(legacy, MigrateOptions(dry_run=True))
+    check(res.ok and (legacy / "CMakeLists.txt").read_text(
+              encoding="utf-8").count("copy_directory") == 2,
+          "--dry-run reports without writing")
+
+    res = snesops._op_declare_mod_catalog(legacy, MigrateOptions())
+    cml = (legacy / "CMakeLists.txt").read_text(encoding="utf-8")
+    check(res.ok and "snesrecomp_target_mod_catalog(ZedSNESRecomp" in cml,
+          "declares the catalog on the target the old block named")
+    check("ZED_PRELOADED_MODS" not in cml and "if(EXISTS" not in cml,
+          "and removes the block, its guard, and the variable feeding it")
+    check('"${ZED_SHADERS}"' in cml and cml.count("copy_directory") == 1,
+          "the unrelated shader copy_directory survives")
+    check('"mods/preloaded"' in (legacy / "src" / "main.c").read_text(
+              encoding="utf-8"),
+          "the host reads the directory the framework stages into")
+    check(snesops._op_declare_mod_catalog(legacy, MigrateOptions()).message
+          == "Mod catalog already framework-owned", "re-running is a no-op")
+    after = {c.id: c for c in snesops.audit_project(legacy).checks}
+    check(after["mod_catalog"].status.value == "pass", "and the audit clears")
+
+    # 2. snesrecomp_target_stage_dir(... mods) -- the other spelling, on a
+    #    port with no packages yet. Nothing is mis-staged and the guard has
+    #    nothing to fire on, so this is a cleanup rather than a failure, and
+    #    the host it already agreed with must not be touched. (With packages
+    #    present it is case 1: no declaration means configure aborts.)
+    staged = port("staged", '''cmake_minimum_required(VERSION 3.16)
+project(Zed C)
+set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL "" FORCE)
+include(${CMAKE_SOURCE_DIR}/snesrecomp/runner/runner.cmake)
+add_executable(ZedSNESRecomp src/main.c)
+snesrecomp_target_stage_dir(ZedSNESRecomp ${CMAKE_SOURCE_DIR}/mods mods)
+snesrecomp_target_stage_dir(ZedSNESRecomp ${CMAKE_SOURCE_DIR}/translations translations)
+''', 'char d[64];\n'
+     'int boot(void) {\n'
+     '  snesrecomp_exe_dir_path("translations", t, sizeof(t));\n'
+     '  snesrecomp_exe_dir_path("mods/preloaded", d, sizeof(d));\n'
+     '  return snes_mod_runtime_initialize_c(d, "zed-us", "ff");\n'
+     '}\n', packages=())
+    row = {c.id: c for c in snesops.audit_project(staged).checks}["mod_catalog"]
+    check(row.status.value == "warn",
+          "staging that already lands correctly is a cleanup, not a failure")
+    before_main = (staged / "src" / "main.c").read_text(encoding="utf-8")
+    snesops._op_declare_mod_catalog(staged, MigrateOptions())
+    cml = (staged / "CMakeLists.txt").read_text(encoding="utf-8")
+    check("snesrecomp_target_mod_catalog(ZedSNESRecomp" in cml
+          and "mods mods)" not in cml, "stage_dir(... mods) is replaced")
+    check("translations translations)" in cml,
+          "the translations stage_dir is left alone")
+    check((staged / "src" / "main.c").read_text(encoding="utf-8") == before_main,
+          "a host that already agreed with the framework is not rewritten")
+
+    # 3. Declared, but the host still reads the pre-migration root. Silent in
+    #    every build and every release zip -- the reason the op has a host half.
+    half = port("half", '''cmake_minimum_required(VERSION 3.16)
+project(Zed C)
+set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL "" FORCE)
+include(${CMAKE_SOURCE_DIR}/snesrecomp/runner/runner.cmake)
+add_executable(ZedSNESRecomp src/main.c)
+snesrecomp_target_mod_catalog(ZedSNESRecomp "${CMAKE_SOURCE_DIR}/mods/preloaded")
+''', HOST)
+    row = {c.id: c for c in snesops.audit_project(half).checks}["mod_catalog"]
+    check(row.status.value == "fail" and "Mods page" in row.detail,
+          "a half-migrated port is caught even though it configures cleanly")
+    snesops._op_declare_mod_catalog(half, MigrateOptions())
+    check('"mods/preloaded"' in (half / "src" / "main.c").read_text(
+              encoding="utf-8"), "and the host half alone is fixed")
+
+    # 4. An old framework pin has no such function. Migrating onto it would
+    #    turn a working build into a configure error.
+    old = port("old", '''cmake_minimum_required(VERSION 3.16)
+project(Zed C)
+include(${CMAKE_SOURCE_DIR}/snesrecomp/runner/runner.cmake)
+add_executable(ZedSNESRecomp src/main.c)
+snesrecomp_target_stage_dir(ZedSNESRecomp ${CMAKE_SOURCE_DIR}/mods mods)
+''', HOST)
+    (old / "snesrecomp" / "runner" / "runner.cmake").write_text(
+        "# a pin from before the catalog contract\n", encoding="utf-8")
+    row = {c.id: c for c in snesops.audit_project(old).checks}["mod_catalog"]
+    check(row.status.value == "skip" and row.fix_op is None,
+          "an older framework pin is skipped, not failed")
+    res = snesops._op_declare_mod_catalog(old, MigrateOptions())
+    check(not res.ok and "update the submodule" in res.message,
+          "and the op refuses rather than calling a function that is absent")
+    check("stage_dir(ZedSNESRecomp" in (old / "CMakeLists.txt").read_text(
+              encoding="utf-8"), "leaving the only staging it has intact")
+
+    # 5. Several executables and nothing saying which ships the catalog. A
+    #    guess here declares the catalog on the wrong binary.
+    many = port("many", '''cmake_minimum_required(VERSION 3.16)
+project(Zed C)
+set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL "" FORCE)
+include(${CMAKE_SOURCE_DIR}/snesrecomp/runner/runner.cmake)
+add_executable(ZedSNESRecomp src/main.c)
+add_executable(ZedJPSNESRecomp src/main.c)
+''', HOST)
+    res = snesops._op_declare_mod_catalog(many, MigrateOptions())
+    check(not res.ok and "several executables" in res.message,
+          "refuses to guess which of several targets ships the catalog")
+
+    # 6. The framework owns the destination: a renamed layout moves the host
+    #    with it, rather than this module carrying a second copy of the path.
+    renamed = port("renamed", '''cmake_minimum_required(VERSION 3.16)
+project(Zed C)
+set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL "" FORCE)
+include(${CMAKE_SOURCE_DIR}/snesrecomp/runner/runner.cmake)
+add_executable(ZedSNESRecomp src/main.c)
+''', HOST)
+    (renamed / "snesrecomp" / "runner" / "runner.cmake").write_text(
+        'set(SNESRECOMP_MOD_CATALOG_DEST "catalog/packages")\n'
+        "function(snesrecomp_target_mod_catalog target dir)\nendfunction()\n",
+        encoding="utf-8")
+    snesops._op_declare_mod_catalog(renamed, MigrateOptions())
+    check('"catalog"' in (renamed / "src" / "main.c").read_text(encoding="utf-8"),
+          "the host root follows SNESRECOMP_MOD_CATALOG_DEST, not a copy of it")
+
+
 def main() -> int:
     if not subprocess.run(["git", "--version"], capture_output=True).returncode == 0:
         print("git not available — skipping")
@@ -1547,8 +2720,19 @@ def main() -> int:
     test_identity_layouts()
     test_readme_toggle()
     test_generate_preflight()
+    test_check_runner_paths()
     test_regen_framework_skew()
     test_advance_pins()
+    test_uncloned_submodules()
+    test_game_id_is_read_not_derived()
+    test_configure_preflights_mod_catalog()
+    test_port_owned_regen_script()
+    test_adopt_framework_regen()
+    test_regen_advice_matches_the_plan()
+    test_only_overrides_cautious_default()
+    test_game_id_derived_only_without_manifests()
+    test_git_errors_are_not_swallowed()
+    test_build_failure_diagnosis()
     test_module_urls()
     test_moved_repo_urls()
     test_region_default()
@@ -1556,9 +2740,12 @@ def main() -> int:
     test_dispatch_inputs()
     test_new_project_command()
     test_launch_rom()
+    test_launch_picks_product_binary()
     test_module_targets()
     test_snes_functions()
     test_github_about_names_the_console()
+    with tempfile.TemporaryDirectory() as td:
+        test_mod_catalog(Path(td))
     print("FAILED" if failures else "PASSED")
     return 1 if failures else 0
 

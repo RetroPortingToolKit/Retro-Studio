@@ -879,6 +879,10 @@ std::vector<std::string> migrate_common_args(StudioModel& model) {
         a.push_back("--zip-prefix");
         a.push_back(model.zip_prefix);
     }
+    if (model.game_id[0]) {
+        a.push_back("--game-id");
+        a.push_back(model.game_id);
+    }
     if (model.github_owner[0]) {
         a.push_back("--github-owner");
         a.push_back(model.github_owner);
@@ -1566,6 +1570,17 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
         ImGui::SetNextItemWidth(zw);
         ImGui::InputText("##zip", model.zip_prefix, sizeof(model.zip_prefix));
     }
+    // game_id only exists in the SNES identity template, and only matters
+    // when the repo records none: leave it blank and Studio reads the id the
+    // port already commits to rather than minting a second one.
+    if (model.is_snes()) {
+        field_row("##game_id", "Game id", model.game_id, sizeof(model.game_id), kLabelW);
+        ImGui::TextColored(th.text_muted,
+                           "Blank = read from rom_identity.txt, or from the "
+                           "game_id this port's mod manifests already name. "
+                           "Only set it when Probe ROM says nothing records "
+                           "one — it is matched exactly by every mod package.");
+    }
     // GitHub owner/repo feed the README + About patch, which n64lle has no
     // template for and n64ops therefore has no op for.
     if (!model.is_n64()) {
@@ -1942,13 +1957,21 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     // returns it under a stable "framework" key precisely so this widget does
     // not have to know which.
     if (n64) {
-        // No framework ref to choose. n64lle's setup_project.sh pins the new
-        // project at the HEAD of the checkout it was run from — "the SHA this
-        // scaffold was cut against" — and has no flag to override it. A combo
-        // here would accept a value nothing reads.
-        left_label("n64lle ref", kLabelW);
-        ImGui::TextColored(th.text_muted,
-                           "Pinned to the n64lle checkout this scaffold is cut from.");
+        // n64lle's setup_project.sh grew --n64lle-ref / --recomp-ui-ref on
+        // 2026-09-12. Leaving this blank is not "main": it keeps the
+        // scaffolder's own behaviour, which is branch main pinned at the HEAD
+        // of the checkout it was run from — "the SHA this scaffold was cut
+        // against". A wizard older than the flag is not silently ignored: the
+        // CLI checks the script's own case arms and says so in the log.
+        branch_combo("##np_n64", "n64lle ref", model.np_n64_ref, sizeof(model.np_n64_ref),
+                     kLabelW, model.branches_psx, kBranchW);
+        branch_combo("##np_ui_n64", "recomp-ui ref", model.np_ui_ref, sizeof(model.np_ui_ref),
+                     kLabelW, model.branches_ui, kBranchW);
+        wrapped(th.text_muted,
+                "Leave n64lle ref empty to keep the scaffolder's own pin: branch main at "
+                "the HEAD of the n64lle checkout Studio drives. A branch is recorded in "
+                ".gitmodules and tracked; a tag or SHA is pinned detached, with no "
+                "branch= line for `submodule update --remote` to move it off.");
     } else if (snes) {
         branch_combo("##np_snes", "snesrecomp ref", model.np_snes_ref,
                      sizeof(model.np_snes_ref), kLabelW, model.branches_psx, kBranchW);
@@ -2128,6 +2151,16 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
             if (model.np_gh_owner[0]) {
                 args.push_back("--github-owner");
                 args.push_back(model.np_gh_owner);
+            }
+            // The submodule revisions. Blank n64lle ref = the scaffolder's own
+            // pin, so it is sent only when the user picked something.
+            if (model.np_n64_ref[0]) {
+                args.push_back("--n64lle-ref");
+                args.push_back(model.np_n64_ref);
+            }
+            if (model.np_ui_ref[0]) {
+                args.push_back("--recomp-ui-ref");
+                args.push_back(model.np_ui_ref);
             }
             // "Copy ROM" — the scaffolder symlinks by default.
             if (model.np_stage) args.push_back("--stage-disc");
@@ -2345,6 +2378,21 @@ void draw_git(StudioModel& model, const Theme& th) {
         retcomm::studio::run_project_studio_async(
             model, {"git", "ensure-nested", "--root", root}, nullptr);
     }
+    // The cure for "checkout missing", addressed at the symptom by name.
+    // A repo cloned without --recurse-submodules has the .gitmodules entry
+    // and an empty directory, so Switch / Pull / Commit / Push / Advance pins
+    // all report "checkout missing" on a repo whose config is perfect. This
+    // clones what is registered — both scopes, framework first, because the
+    // nested modules only become reachable once it is on disk.
+    if (action("Init checkouts")) {
+        retcomm::studio::run_project_studio_async(
+            model, {"git", "init-modules", "--root", root},
+            [&model](RunResult r) {
+                model.set_status(r.ok() ? "Module checkouts initialised"
+                                        : "Init checkouts failed — see log");
+                if (r.ok()) refresh_branches(model, true);
+            });
+    }
     // Two different operations, and the old label ("Update submodules") read
     // like the wrong one. `git submodule update` checks out the gitlink the
     // repo ALREADY records — on a fork carrying a stale pin it puts the old
@@ -2375,6 +2423,12 @@ void draw_git(StudioModel& model, const Theme& th) {
                        "records. Advance pins = move to each module's tracked "
                        "branch tip and stage the move (Modules / Nested per the "
                        "ticks below), then Commit.");
+    ImGui::TextColored(th.text_muted,
+                       "\"checkout missing\" = the submodule is registered in "
+                       ".gitmodules but was never cloned, which is what a clone "
+                       "without --recurse-submodules leaves behind. Init "
+                       "checkouts fixes it; Refresh status marks such a module "
+                       "UNINIT rather than OK.");
 
     ImGui::TextUnformatted("Targets");
     checkbox_wrapped("Game", &model.git_tgt_game);
@@ -3124,6 +3178,84 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             if (model.snes_regen_cfg_roots) args.push_back("--cfg-roots");
             retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
         }
+        // snesrecomp's runner/src is organised into layer folders, and moving
+        // a file between them is a rename with no content change — so nothing
+        // objects until a port configures and cmake reports "Cannot find
+        // source file", ONE file per target, in the GAME's repo, for a defect
+        // that lives in the framework. A stale list of thirty reads as three
+        // unrelated bugs in the port. That is not a hypothetical: one
+        // reorganisation reached three ports separately that way, each of
+        // which debugged it alone.
+        //
+        // Two buttons rather than one control with a checkbox, because the
+        // second one WRITES: Check is a question anybody can ask at any time,
+        // Repair edits sources in both the framework and this port.
+        const bool chk = build_btn("Check runner paths");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Runs the pinned snesrecomp's tools/check_runner_paths.py over\n"
+                "the framework and then over this port. Reports every reference\n"
+                "to a runner source that is not where it says it is — build\n"
+                "files, shell harnesses, and this port's own CMakeLists.\n"
+                "Reads only; nothing is written.");
+        }
+        if (chk) {
+            retcomm::studio::run_project_studio_async(
+                model, {"build", "check-paths", "--root", root}, nullptr);
+        }
+        const bool rep = build_btn("Repair runner paths");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "The same audit with --fix: rewrites every reference whose file\n"
+                "is findable under runner/src, in BOTH the pinned snesrecomp and\n"
+                "this port. Anything ambiguous — two layer folders carrying the\n"
+                "same basename — is reported and left alone rather than guessed.\n"
+                "Edits tracked files: run it on a clean tree so `git diff` shows\n"
+                "you exactly what moved.");
+        }
+        if (rep) {
+            retcomm::studio::run_project_studio_async(
+                model, {"build", "check-paths", "--root", root, "--fix"}, nullptr);
+        }
+    } else if (n64) {
+        // Two buttons, and the ORDER is the point: n64lle is not
+        // add_subdirectory()'d, so a port cannot even configure until the
+        // framework has been built out of tree into build-n64lle/. Everything
+        // on this row after that runs inside the port's own CMake graph.
+        //
+        // What is deliberately absent, and why:
+        //   * Ensure BIOS       — a cartridge boots from its own reset vector.
+        //                         There is no BIOS image, and the CLI refuses
+        //                         the subcommand on a cartridge.
+        //   * Generate emitters — psxrecomp builds psxrecomp-game and
+        //                         psxrecomp-bios as separate binaries to run.
+        //                         n64lle has one emitter, n64emit, and it is
+        //                         produced by the framework build below; there
+        //                         is no second one to keep in step.
+        if (build_btn("Build framework")) {
+            std::vector<std::string> args = {"build", "framework", "--root", root,
+                                             "--build-type", model.build_type};
+            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+        }
+        if (build_btn("Generate C from ROM")) {
+            // n64lle harvests the real boot for a window of frames and then
+            // emits; both are custom commands behind the port's own
+            // <slug>-generate target, so this is a cmake build, not a script.
+            std::vector<std::string> args = {"build", "generate", "--root", root,
+                                             "--build-dir", model.build_dir,
+                                             "--build-type", model.build_type};
+            if (model.disc_cue[0]) {
+                // Sets <SLUG>_ROM, the cache variable the port's CMakeLists
+                // declares. Studio never moves a dump to make a build work.
+                args.push_back("--rom");
+                args.push_back(model.disc_cue);
+            } else {
+                model.append_log(
+                    "No ROM set on the Migrate tab — the port's own game.toml "
+                    "default dump will be harvested.");
+            }
+            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+        }
     } else {
         if (build_btn("Generate ROM + BIOS C")) {
             model.gen_popup_open = true;
@@ -3251,6 +3383,27 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
                 "source tree — a local build, not a release. A build dir configured "
                 "-DSNESRECOMP_SETUP_HOST=ON instead gets the repo's own "
                 "scripts/package_release.sh, i.e. the setup pack a release ships.");
+    } else if (n64) {
+        wrapped(th.text_muted,
+                "Build framework runs n64lle/tools/build_framework.sh — the framework's "
+                "OWN script, shared by every port — never a Studio reimplementation of "
+                "it. On a port pinned to an n64lle from before that script existed it "
+                "falls back to the port's tools/build_framework.sh, which is otherwise "
+                "just a shim onto the shared one. Configure cannot succeed until it has "
+                "run: a port resolves already-built libraries and tools out of "
+                "build-n64lle/ rather than add_subdirectory()ing the framework.");
+        ImGui::Spacing();
+        wrapped(th.text_muted,
+                "It used to run the port's own copy, on the reasoning that the copy "
+                "carries the flags the pinned n64lle revision needs. That holds for what "
+                "a port ADDS and fails for what the framework later REQUIRES: a private "
+                "copy cannot inherit a fix. -DN64LLE_RSP_CENSUS=1 reached one port's copy "
+                "and no other, so seven of nine N64 ports harvested no RSP microcode and "
+                "ran the RSP fully interpreted while every build reported success.");
+        ImGui::Spacing();
+        wrapped(th.text_muted,
+                "Bundle + Export zips the build dir as it stands (exe + assets, no ROM) "
+                "into dist/ and opens a save dialog. Build first — it does not rebuild.");
     } else {
         ImGui::TextColored(th.text_muted,
                            "Bundle + Export zips the build dir as it stands (exe + assets + "
@@ -3263,7 +3416,11 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     // cross-compiles two emitters, stages OpenBIOS and drives PSX_NETPLAY,
     // which a cartridge has none of. `build mingw` routes on the session's
     // platform, so the controls below are identical.
-    {
+    //
+    // n64lle ships no cross-build script at all (platform_has_mingw), so the
+    // whole section is ABSENT there rather than present and dead — the same
+    // rule the tabs follow.
+    if (platform_has_mingw(model.platform)) {
     ImGui::Separator();
     ImGui::TextUnformatted("Windows (MinGW)");
     if (snes) {

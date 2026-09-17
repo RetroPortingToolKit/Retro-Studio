@@ -34,7 +34,7 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "tools" / "new_project_layout"))
 
-from project_studio import platforms  # noqa: E402
+from project_studio import n64_paths, platforms  # noqa: E402
 from project_studio.models import MigrateOptions  # noqa: E402
 
 failures = 0
@@ -333,8 +333,24 @@ def test_new_project_command(tmp: Path) -> None:
     # so a habitual PSX flag would kill the run before it probed the ROM.
     for flag in ("--description", "--publisher", "--year", "--region", "--zip-prefix",
                  "--enable-ci", "--no-ci", "--fetch-boxart", "--enable-build",
-                 "--netplay", "--recomp-ui", "--n64lle-ref"):
+                 "--netplay", "--recomp-ui"):
         check(flag not in joined, f"never sends {flag} (n64lle has no such flag)")
+    # --n64lle-ref / --recomp-ui-ref exist on wizards from 2026-09-12 on, and
+    # are sent ONLY to a copy whose parser declares them: Studio drives
+    # whichever setup_project.sh it found, and that copy can be older than
+    # Studio. A blank ref is never sent at all — blank means "keep the
+    # scaffolder's own pin", which is not the same as naming main.
+    check("--n64lle-ref" not in joined, "a blank n64lle ref sends no flag")
+    script = n64_paths.setup_script(None)
+    opts.n64lle_ref = "fix/some-branch"
+    ref_cmd = " ".join(npj.build_command(opts)[0])
+    if npj.script_supports(script, "--n64lle-ref"):
+        check("--n64lle-ref fix/some-branch" in ref_cmd,
+              "forwards --n64lle-ref to a wizard that declares it")
+    else:
+        check("--n64lle-ref" not in ref_cmd,
+              "withholds --n64lle-ref from a wizard that would exit 2 on it")
+    opts.n64lle_ref = ""
 
     # Five seats is a PSX/SNES notion; the N64 has four ports and the script
     # rejects anything else outright.

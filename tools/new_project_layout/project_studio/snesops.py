@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from collections.abc import Callable
 from pathlib import Path
 
@@ -45,6 +46,8 @@ OP_ORDER: tuple[str, ...] = (
     "snes_ensure_nested_modules",
     "snes_enable_netplay",
     "snes_disable_netplay",
+    "snes_declare_mod_catalog",
+    "snes_adopt_framework_regen",
     "snes_merge_gitignore",
     "snes_untrack_generated",
     "snes_ensure_src_gen",
@@ -60,6 +63,8 @@ OP_ORDER: tuple[str, ...] = (
     "snes_patch_readme_metrics",
     "snes_record_framework_pins",
 )
+
+ADOPT_REGEN_TITLE = "Hand tools/regen.sh back to the framework"
 
 OP_TITLES: dict[str, str] = {
     "snes_ensure_framework_submodule": "Add snesrecomp submodule",
@@ -83,6 +88,9 @@ OP_TITLES: dict[str, str] = {
         "Patch README badges, Retro Launcher, and R.A.I.D. footer",
     "snes_enable_netplay": "Wire netplay (snesrecomp_enable_recomp_net)",
     "snes_disable_netplay": "Unwire netplay (comment the call out)",
+    "snes_declare_mod_catalog":
+        "Hand mod staging to the framework (snesrecomp_target_mod_catalog)",
+    "snes_adopt_framework_regen": ADOPT_REGEN_TITLE,
 }
 
 # Matches snesrecomp's tools/new_project/templates/gitignore.in. The launcher
@@ -163,6 +171,15 @@ def list_ops() -> list[str]:
 # Reading the repo
 # ---------------------------------------------------------------------------
 def _git(root: Path, *args: str) -> tuple[int, str]:
+    """``(returncode, output)`` — stdout on success, stderr on failure.
+
+    git writes its diagnostics to stderr, and returning only stdout meant
+    every failure here reported an empty reason: "git failed: " with nothing
+    after it, for a `submodule update` that had said
+    "fatal: No url found for submodule path 'lib/retcomm-rbengine' in
+    .gitmodules". A gate that discards the one sentence explaining itself is
+    worse than no gate, because the user has nothing to act on.
+    """
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -172,9 +189,15 @@ def _git(root: Path, *args: str) -> tuple[int, str]:
             encoding="utf-8",
             errors="replace",
         )
-    except OSError:
-        return 1, ""
-    return proc.returncode, (proc.stdout or "").strip()
+    except OSError as exc:
+        return 1, f"could not run git: {exc}"
+    out = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        # Prefer stderr, but never return empty when either stream said
+        # something — callers put this straight in front of the user.
+        return proc.returncode, err or out
+    return proc.returncode, out
 
 
 def _is_git_repo(root: Path) -> bool:
@@ -341,6 +364,7 @@ def rom_identity(root: Path, rom: str | None = None) -> dict[str, str]:
             ("rom_size", "rom_size"),
             ("mapping", "mapping"),
             ("region", "region"),
+            ("game_id", "game_id"),
         ):
             if data.get(field):
                 out.setdefault(key, data[field])
@@ -526,6 +550,94 @@ def _audit_readme(root: Path, add: Callable[..., None]) -> None:
         add("readme_metrics", "README download metrics / launcher / RAID / boxart",
             CheckStatus.PASS, Severity.RECOMMENDED,
             "Badges, boxart, Retro Launcher, and R.A.I.D. footer present.")
+
+
+def _audit_mod_catalog(
+    root: Path,
+    cml_text: str,
+    have_framework: bool,
+    add: Callable[..., None],
+) -> None:
+    """The mod catalog row: who stages it, and does the host read that place.
+
+    Split out for the same reason ``_audit_readme`` is: it answers several
+    questions against one file and one framework pin, and inlining it would
+    bury the ``audit_project`` sequence it sits in.
+
+    Severity is graded rather than uniform. A catalog the framework aborts on,
+    two staging paths disagreeing, or a host reading the wrong directory are
+    all shipped-product failures. A per-title block that still stages the
+    right bytes to the right place is only a spelling the framework has taken
+    over -- worth migrating, not worth failing.
+    """
+    title = "Mod catalog staging"
+    op = "snes_declare_mod_catalog"
+    if not have_framework or not cml_text:
+        add("mod_catalog", title, CheckStatus.SKIP, Severity.OPTIONAL,
+            "Needs the framework checkout and a CMakeLists.txt.")
+        return
+    if not framework_has_mod_catalog(root):
+        # Not a defect: on this pin the per-title block is load-bearing, and
+        # the fix op refuses to run rather than call a function that does not
+        # exist. Advance the submodule and the row becomes actionable.
+        add("mod_catalog", title, CheckStatus.SKIP, Severity.OPTIONAL,
+            f"The checked-out {FRAMEWORK} pin predates {MOD_CATALOG_CALL}(); "
+            "update the submodule to migrate.")
+        return
+
+    pkgs = catalog_package_ids(root)
+    declared = _mod_catalog_declared(cml_text)
+    legacy = _legacy_mod_staging(cml_text)
+    dest = framework_catalog_dest(root)
+    want = host_mod_root(dest)
+    bad_hosts = [(src, got) for src, got in host_mod_roots(root) if got != want]
+
+    broken: list[str] = []     # ships wrong, or does not configure
+    cleanup: list[str] = []    # works, but the framework owns this now
+    unreadable: list[str] = [] # the op will not touch these
+
+    if pkgs and declared is None:
+        broken.append(
+            f"{len(pkgs)} package(s) ({', '.join(pkgs[:3])}"
+            + (", …" if len(pkgs) > 3 else "")
+            + f") but no {MOD_CATALOG_CALL}() — configure aborts on the "
+              "framework's guard")
+    if legacy:
+        labels = "; ".join(label for _s, _e, label, _t in legacy)
+        if declared is not None:
+            broken.append(f"per-title staging alongside the declaration "
+                          f"({labels}) — two blocks writing two layouts")
+        else:
+            cleanup.append(f"per-title staging ({labels}) — the framework "
+                           "owns the destination now")
+    if pkgs and not _mods_enabled(cml_text):
+        broken.append("SNESRECOMP_ENABLE_MODS is not forced ON before "
+                      "runner.cmake, so the loader is not compiled")
+    for src, got in bad_hosts:
+        if got == "?":
+            unreadable.append(
+                f"{src} initializes mod_runtime at a root this audit cannot "
+                "read — check it by hand")
+        else:
+            broken.append(
+                f'{src} initializes mod_runtime at "{got}" while the build '
+                f"stages {dest} — the Mods page would list nothing")
+
+    if broken:
+        add("mod_catalog", title, CheckStatus.FAIL, Severity.REQUIRED,
+            "; ".join(broken + cleanup + unreadable), op)
+    elif cleanup:
+        add("mod_catalog", title, CheckStatus.WARN, Severity.RECOMMENDED,
+            "; ".join(cleanup + unreadable), op)
+    elif unreadable:
+        # No fix op: rewriting an argument nobody can read is how a migration
+        # breaks a host that was working.
+        add("mod_catalog", title, CheckStatus.WARN, Severity.RECOMMENDED,
+            "; ".join(unreadable))
+    else:
+        add("mod_catalog", title, CheckStatus.PASS, Severity.REQUIRED,
+            f"{len(pkgs)} package(s) staged by {MOD_CATALOG_CALL}()."
+            if pkgs else "No catalog to stage.")
 
 
 def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditReport:
@@ -834,6 +946,14 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
             "snesrecomp_enable_recomp_net() call (host code must also wire "
             "the launcher; see MetalWarriorsSNESRecomp src/main.c).")
 
+    # --- mod catalog ----------------------------------------------------------
+    # Two failures live here and only one of them is loud. runner.cmake aborts
+    # configure when packages exist that no target declared; nothing at all
+    # complains when the host reads a different directory than the build
+    # stages into, and that one ships an empty Mods page in a release zip.
+    _audit_mod_catalog(root, cml_text, live, add)
+    _audit_regen_ownership(root, options, add)
+
     # --- lobby pin stamp vs VERSION ------------------------------------------
     # Fires only when a build tree carries a version stamp; drift between the
     # stamp and VERSION splits netplay lobbies onto different pins.
@@ -993,12 +1113,26 @@ def build_plan(
     ordered = [op for op in OP_ORDER if op in wanted]
     ordered.extend(sorted(op for op in wanted if op not in ordered))
 
+    # Everything is ticked by default except a step that would knowingly drop
+    # capability: adopting a regen.sh whose port had grown past the wizard's is
+    # a choice, so it is shown, explained, and left for the user to tick.
+    #
+    # `--only` overrides that, and must: it IS the user ticking the box (the
+    # GUI's Apply sends the ticked ops as --only). Without this, naming the op
+    # explicitly put it in the plan and then apply_plan skipped it for being
+    # unselected — printing no line at all, so the op appeared to do nothing.
+    # A silent no-op is worse than either running or refusing.
+    explicit = set(options.only or ())
+    lossy_adoption = bool(regen_adoption_report(root, options).lost)
     steps = [
         PlanStep(
             op_id=op,
             title=OP_TITLES.get(op, op),
             detail=next((c.detail for c in report.checks if c.fix_op == op), ""),
-            selected=True,
+            selected=(
+                op in explicit
+                or not (op == "snes_adopt_framework_regen" and lossy_adoption)
+            ),
         )
         for op in ordered
     ]
@@ -1012,8 +1146,18 @@ def apply_plan(plan: Plan) -> list[ApplyResult]:
     root = Path(plan.root).expanduser().resolve()
     opts = plan.options
     results: list[ApplyResult] = []
+    requested = set(opts.only or ())
     for step in plan.steps:
         if not step.selected:
+            # Never drop a step the caller asked for without a word. The
+            # selection default exists to stop a lossy op running unasked, not
+            # to swallow an explicit request.
+            if step.op_id in requested:
+                results.append(ApplyResult(
+                    step.op_id, False,
+                    "Requested but not selected — this is a Studio bug; "
+                    "please report it with the op name",
+                ))
             continue
         fn = _OPS.get(step.op_id)
         if fn is None:
@@ -1060,8 +1204,18 @@ def _op_ensure_nested(root: Path, opts: MigrateOptions) -> ApplyResult:
         return ApplyResult(op, False, "No snesrecomp checkout")
     if _dry(opts):
         return ApplyResult(op, True, f"[dry-run] submodule update --init in {fw}")
+    # Delegate rather than re-run `submodule update` here. gitops already
+    # knows how to heal a .gitmodules section with no url — the exact state
+    # several engine pins are in for lib/retcomm-rbengine — and a second,
+    # weaker implementation in this file cannot inherit fixes to that one.
+    from .gitops import ensure_nested_modules
+
+    heal = ensure_nested_modules(root)
+    failed = [r for r in heal if not r.ok]
     code, out = _git(fw, "submodule", "update", "--init", "--recursive", *NESTED_PATHS)
     ok = code == 0
+    if not ok and failed:
+        out = f"{out} (also: " + "; ".join(r.message for r in failed) + ")"
     return ApplyResult(op, ok, "Initialised nested libs" if ok else f"git failed: {out}",
                        [f"{FRAMEWORK}/{p}" for p in NESTED_PATHS] if ok else [])
 
@@ -1133,6 +1287,111 @@ def _op_emit_version(root: Path, opts: MigrateOptions) -> ApplyResult:
     return ApplyResult(op, True, "Wrote VERSION (0.1.0)", ["VERSION"])
 
 
+# A mod package's [[target]] names the title it applies to as
+# `game_id = "..."`, and the runtime matches it with ==  against the id
+# compiled in from rom_identity.txt (snesrecomp runner/src/mod_runtime.cpp,
+# target_matches). So game_id is not a cosmetic slug: get it wrong and every
+# mod the port ships stops applying, with the player seeing only "This feature
+# does not support the selected stock ROM."
+_MOD_MANIFEST_GLOB = "mods/*/packages/*/*/manifest.toml"
+_GAME_ID_RE = re.compile(r'^\s*game_id\s*=\s*["\']([^"\']+)["\']', re.MULTILINE)
+
+
+def recorded_game_ids(root: Path) -> dict[str, list[str]]:
+    """Every game_id this port's own mod manifests name → which files name it."""
+    found: dict[str, list[str]] = {}
+    for manifest in sorted(root.glob(_MOD_MANIFEST_GLOB)):
+        try:
+            text = manifest.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for gid in _GAME_ID_RE.findall(text):
+            rel = str(manifest.relative_to(root)).replace("\\", "/")
+            found.setdefault(gid.strip(), []).append(rel)
+    return found
+
+
+def resolve_game_id(root: Path, opts: MigrateOptions, ident: dict[str, str]) -> tuple[str, str]:
+    """``(game_id, how)`` — read from what the port already commits to.
+
+    Deliberately NOT derived first. The framework's scaffolder derives it once,
+    at `setup_project.sh` time, from a project name Studio never sees
+    (`safe_slug(NAME).lower()` + region), and rom_identity.txt then records the
+    answer because it has to stay stable across revisions. Re-deriving it here
+    reproduces that string only by luck: this port's mods name
+    `zelda-alttp-us`, while the same formula on its recorded region ("USA")
+    and display name yields `zeldaalttp-usa`. Writing the derived one would
+    silently orphan every mod package in the repo — the kind of wrong value
+    that looks like a successful run.
+
+    So the order is read, read, ask — and the caller refuses to write the file
+    at all rather than invent one.
+    """
+    explicit = (getattr(opts, "game_id", "") or "").strip()
+    if explicit:
+        return explicit, "--game-id"
+    recorded = (ident.get("game_id") or "").strip()
+    if recorded:
+        return recorded, f"recorded in {IDENTITY_FILE}"
+    ids = recorded_game_ids(root)
+    if len(ids) == 1:
+        gid, files = next(iter(ids.items()))
+        return gid, f"named by {len(files)} mod manifest(s), e.g. {files[0]}"
+    if ids:
+        # Several, disagreeing. Picking one is a coin toss that breaks the
+        # packages naming the other.
+        return "", ""
+    # No manifests at all — and that changes the answer. The whole reason not
+    # to derive is that a derived id can silently match no [[target]] and
+    # orphan the port's own mods. With no mod package in the repo there is
+    # nothing to orphan: game_id has no consumer yet, and it becomes the
+    # string future manifests must name. Refusing here blocked the identity
+    # carrier the current framework *requires* over a field nothing reads,
+    # which is a worse failure than deriving the scaffolder's own answer and
+    # saying so out loud.
+    derived, how = _scaffolder_game_id(root, ident)
+    if derived:
+        return derived, how
+    return "", ""
+
+
+def _scaffolder_game_id(root: Path, ident: dict[str, str]) -> tuple[str, str]:
+    """``<slug>-<region>``, by the scaffolder's own rule and its own slugger.
+
+    ``safe_slug`` is imported from the wizard rather than reimplemented: it is
+    the function ``setup_project.sh`` line 343 uses, and a second copy here
+    would drift from it — the exact way a port ends up with an id the
+    framework would never have generated.
+    """
+    region = (ident.get("region") or "").strip().lower()
+    if not region:
+        return "", ""
+    display = (ident.get("display_name") or "").strip() or display_name(root)
+    if not display:
+        return "", ""
+    import sys as _sys
+
+    wizard = str(snes_paths.wizard_dir(root))
+    added = wizard not in _sys.path
+    if added:
+        _sys.path.insert(0, wizard)
+    try:
+        from probe_rom import safe_slug  # type: ignore
+    except ImportError:
+        return "", ""
+    finally:
+        if added and wizard in _sys.path:
+            _sys.path.remove(wizard)
+    slug = safe_slug(display).lower()
+    if not slug:
+        return "", ""
+    return f"{slug}-{region}", (
+        f"derived as <slug>-<region> from {display!r} + {region.upper()}, the "
+        "scaffolder's own rule — this repo ships no mod package to read it "
+        "from, so nothing can be orphaned; future manifests must name this"
+    )
+
+
 def _template_values(root: Path, opts: MigrateOptions) -> dict[str, str]:
     name = opts.project_name or project_name(root)
     shown = display_name(root)
@@ -1159,6 +1418,9 @@ def _template_values(root: Path, opts: MigrateOptions) -> dict[str, str]:
         values.setdefault(token, "")
     if values.get("ROM_FILE"):
         values["ROM_SLUG"] = Path(values["ROM_FILE"]).stem
+    gid, _how = resolve_game_id(root, opts, ident)
+    if gid:
+        values["GAME_ID"] = gid
     return values
 
 
@@ -1204,7 +1466,9 @@ def _fill_template(
         # nobody should be inventing.
         return ApplyResult(
             op, False,
-            f"{rel} not written — unresolved tokens: {', '.join(sorted(set(missing)))}",
+            f"{rel} not written — unresolved tokens: "
+            f"{', '.join(sorted(set(missing)))}"
+            + _token_help(root, sorted(set(missing))),
         )
     if _dry(opts):
         return ApplyResult(op, True, f"[dry-run] would write {rel} from {template}")
@@ -1213,6 +1477,37 @@ def _fill_template(
     if rel.endswith(".sh"):
         dst.chmod(dst.stat().st_mode | 0o111)
     return ApplyResult(op, True, f"Wrote {rel} ({snes_paths.wizard_source(root)})", [rel])
+
+
+def _token_help(root: Path, missing: list[str]) -> str:
+    """What to do about the tokens that did not resolve.
+
+    "unresolved tokens: GAME_ID" names a template variable and no action, and
+    the action is not the same for every token: a missing ROM digest means
+    probe the ROM, while a missing GAME_ID means nothing in the repo records
+    the id its own mod packages match against — a value that must be supplied,
+    never guessed.
+    """
+    if "GAME_ID" not in missing:
+        return ""
+    ids = recorded_game_ids(root)
+    if len(ids) > 1:
+        listed = "; ".join(
+            f"{gid} ({', '.join(files)})" for gid, files in sorted(ids.items())
+        )
+        return (
+            f". This port's mod manifests disagree about game_id — {listed} — "
+            "so there is no single id to record. Fix the manifests, or pass "
+            "--game-id to say which one this build is."
+        )
+    return (
+        f". Nothing in this repo records a game_id: no {IDENTITY_FILE} to read "
+        "it from and no mod manifest naming one. It is the id a mod package's "
+        "[[target]] matches with == (snesrecomp docs/MOD_PACKAGES.md), so it "
+        "cannot be derived from the ROM without risking one that silently "
+        "matches nothing — pass --game-id (the scaffolder's own form is "
+        "<slug>-<region>, e.g. zelda-alttp-us)."
+    )
 
 
 def _regen_gap(root: Path, rendered: str) -> str | None:
@@ -1236,8 +1531,291 @@ def _regen_gap(root: Path, rendered: str) -> str | None:
     return framework_gap_message(cli, missing, have)
 
 
+# ---------------------------------------------------------------------------
+# Handing tools/regen.sh back to the framework
+#
+# A port carrying its own regen.sh is carrying a fork of engine tooling: fixes
+# to the wizard's script never reach it, and Studio and CI cannot drive it
+# (MegaManX's answers `--rom` with "unknown argument"). The end state is one
+# script, owned upstream, emitted per port.
+#
+# What this must never do is mistake a fork for a duplicate. A hand-written
+# driver may have grown capability the wizard's script has no way to express,
+# and replacing it then looks like a successful cleanup while quietly deleting
+# the only way to build half the project.
+# ---------------------------------------------------------------------------
+REGEN_REL = "tools/regen.sh"
+
+
+def _rendered_regen_template(root: Path, opts: MigrateOptions) -> str:
+    """The wizard's regen.sh as it would be written for THIS port, or "".
+
+    Rendered, not raw: the comparison is against the file that would actually
+    replace the port's, and against the template generation this port's own
+    framework checkout carries — the vendored copy is a different vintage and
+    diffing against it invents losses that are not there.
+    """
+    src = snes_paths.templates_dir(root) / "regen.sh.in"
+    if not src.is_file():
+        return ""
+    try:
+        rendered, _missing = _render(
+            src.read_text(encoding="utf-8"), _template_values(root, opts))
+    except OSError:
+        return ""
+    return rendered
+
+
+@dataclass
+class RegenAdoption:
+    """Whether tools/regen.sh can be handed back to the framework, and at what cost."""
+
+    state: str = "absent"          # absent | framework | port
+    lost: list[str] = field(default_factory=list)   # capability adoption would drop
+    notes: list[str] = field(default_factory=list)  # interface differences, not capability
+    blocker: str = ""              # adoption impossible, regardless of consent
+
+
+def regen_adoption_report(
+    root: Path, opts: MigrateOptions | None = None
+) -> RegenAdoption:
+    """Read this port's tools/regen.sh and say what adopting would mean.
+
+    ``blocker`` is a reason adoption cannot happen at all — a pinned framework
+    that could not run the replacement, which is the same rule
+    :func:`_fill_regen` already applies. ``lost`` is capability; ``notes`` are
+    interface differences that a caller should hear about but that do not
+    justify refusing.
+    """
+    opts = opts or MigrateOptions()
+    root = Path(root).expanduser().resolve()
+    script = root / REGEN_REL
+    if not script.is_file():
+        return RegenAdoption("absent")
+    try:
+        existing = script.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return RegenAdoption("absent")
+    if not snes_paths.regen_is_port_authored(existing):
+        return RegenAdoption("framework")
+    rendered = _rendered_regen_template(root, opts)
+    if not rendered:
+        return RegenAdoption("port", blocker=(
+            f"no regen.sh.in in {snes_paths.templates_dir(root)} — there is no "
+            "framework script to adopt"
+        ))
+    lost, notes = snes_paths.regen_capability_delta(existing, rendered)
+    return RegenAdoption("port", lost, notes, _regen_gap(root, rendered) or "")
+
+
+def regen_ownership_guidance(root: Path, opts: MigrateOptions | None = None) -> str:
+    """What to actually do about a port-owned tools/regen.sh, in this repo.
+
+    The three adoption states need three different instructions, and picking
+    the wrong one is worse than saying nothing. Generate used to tell everyone
+    to tick "snes_adopt_framework_regen" in Migrate — including a port where
+    the audit deliberately offers no such step, because the pinned framework
+    cannot run the replacement. Super Metroid is that port, so the message sent
+    the user hunting for a checkbox that was never rendered. Both sentences now
+    come from :func:`regen_adoption_report`, so they cannot disagree.
+    """
+    rep = regen_adoption_report(root, opts or MigrateOptions())
+    if rep.state != "port":
+        return ""
+    if rep.blocker:
+        return (
+            "Migrate offers no step for this and should not: the framework's "
+            f"script would not run here — {rep.blocker} Until that pin moves, "
+            "this port's own script is the working path: run "
+            "`bash tools/regen.sh` in the repo (its --help lists the arguments, "
+            "and it says which ROM it expects where)."
+        )
+    if rep.lost:
+        return (
+            f'Migrate → Audit + Plan lists "{ADOPT_REGEN_TITLE}" UNTICKED, '
+            "because adopting would drop: " + "; ".join(rep.lost)
+            + ". Tick it and tick Force to accept that, or keep this port's "
+              "script and run `bash tools/regen.sh` by hand."
+        )
+    return (
+        f'Migrate → Audit + Plan, tick "{ADOPT_REGEN_TITLE}", Apply — it '
+        "replaces the script with the wizard's, which Studio and CI both know "
+        "how to drive."
+    )
+
+
+def _audit_regen_ownership(
+    root: Path,
+    options: MigrateOptions,
+    add: Callable[..., None],
+) -> None:
+    """Who owns tools/regen.sh — and whether handing it back is mechanical."""
+    title = "regen.sh ownership"
+    op = "snes_adopt_framework_regen"
+    rep = regen_adoption_report(root, options)
+    state, lost, blocker = rep.state, rep.lost, rep.blocker
+    if state == "absent":
+        add("regen_ownership", title, CheckStatus.SKIP, Severity.OPTIONAL,
+            "No tools/regen.sh yet.")
+        return
+    if state == "framework":
+        add("regen_ownership", title, CheckStatus.PASS, Severity.RECOMMENDED,
+            "tools/regen.sh is the framework's — engine fixes reach this port "
+            "on a submodule bump.")
+        return
+    detail = (
+        "tools/regen.sh is this port's own, not the framework's: engine fixes "
+        "never reach it and Studio cannot drive it (it takes no --rom)"
+    )
+    if blocker:
+        # No fix op: the replacement would not run here, and writing it anyway
+        # is the defect this refuses to create.
+        add("regen_ownership", title, CheckStatus.WARN, Severity.RECOMMENDED,
+            f"{detail}. Cannot adopt the framework's yet — {blocker}")
+        return
+    if lost:
+        # The fix op is offered, but build_plan leaves this one UNTICKED and the
+        # op still refuses without --force. Withholding the op entirely was the
+        # first shape and it was worse: the only route left was the CLI, so the
+        # GUI showed a defect with no way to act on it. Visible and opt-in beats
+        # invisible, and neither auto-applies.
+        add("regen_ownership", title, CheckStatus.WARN, Severity.RECOMMENDED,
+            f"{detail}. Adopting the framework's script would drop: "
+            + "; ".join(lost)
+            + ". Teach the framework's regen.sh.in to express these, then "
+              "adopt — or tick Force to accept the loss.", op)
+        return
+    add("regen_ownership", title, CheckStatus.WARN, Severity.RECOMMENDED,
+        f"{detail}. Nothing it does is missing from the framework's script, "
+        "so adopting is mechanical."
+        + ("; " + "; ".join(rep.notes) if rep.notes else ""), op)
+
+
+def _port_tools_inventory(root: Path) -> tuple[list[str], list[str]]:
+    """``(engine_named, port_specific)`` for everything else in tools/.
+
+    Reported, never deleted. "Remove the tools folder" is right for a port
+    whose tools/ held nothing but the wizard's script, and wrong for one that
+    keeps its own research tooling there — MegaManX has 48 other files
+    (eye_*.py, oracle_*.py, sprite_cap.py …) and not one of them shares a name
+    with anything the framework ships. Deleting a folder because of its name
+    is how a port loses work that no engine fix will ever bring back.
+    """
+    tools = Path(root) / "tools"
+    if not tools.is_dir():
+        return [], []
+    fw = snes_paths.snesrecomp_root(root)
+    engine_names: set[str] = set()
+    if fw is not None:
+        for d in (fw / "tools", fw / "tools" / "new_project"):
+            if d.is_dir():
+                engine_names.update(x.name for x in d.iterdir())
+    engine_named: list[str] = []
+    port_specific: list[str] = []
+    for entry in sorted(tools.iterdir()):
+        if entry.name == "regen.sh":
+            continue
+        (engine_named if entry.name in engine_names else port_specific).append(entry.name)
+    return engine_named, port_specific
+
+
+def _op_adopt_framework_regen(root: Path, opts: MigrateOptions) -> ApplyResult:
+    """Replace a port-owned tools/regen.sh with the framework's."""
+    op = "snes_adopt_framework_regen"
+    root = Path(root).expanduser().resolve()
+    rep = regen_adoption_report(root, opts)
+    state, lost, blocker = rep.state, rep.lost, rep.blocker
+    if state == "absent":
+        return ApplyResult(op, True, "No tools/regen.sh to adopt")
+    if state == "framework":
+        return ApplyResult(op, True, "tools/regen.sh is already the framework's")
+    if blocker:
+        return ApplyResult(
+            op, False,
+            "Not adopted — the framework's regen.sh would not run against "
+            f"this port's own snesrecomp. {blocker}",
+        )
+    if lost and not opts.force:
+        return ApplyResult(
+            op, False,
+            "Not adopted — this port's regen.sh does things the framework's "
+            "cannot express, so replacing it would delete capability, not "
+            "duplication: " + "; ".join(lost)
+            + ". Teach snesrecomp's tools/new_project/templates/regen.sh.in to "
+              "express these and adopt afterwards, or re-run with --force to "
+              "accept the loss.",
+        )
+    script = root / REGEN_REL
+    engine_named, port_specific = _port_tools_inventory(root)
+    notes: list[str] = list(rep.notes)
+    if lost:
+        notes.append("--force accepted the loss of: " + "; ".join(lost))
+    if _dry(opts):
+        msg = (
+            f"[dry-run] would replace {REGEN_REL} with the framework's "
+            f"({snes_paths.wizard_source(root)})"
+        )
+        return ApplyResult(op, True, "; ".join([msg, *notes]))
+    try:
+        script.unlink()
+    except OSError as exc:
+        return ApplyResult(op, False, f"Could not remove {REGEN_REL}: {exc}")
+    # force=False on purpose: the old script is gone, so there is nothing to
+    # overwrite, and _fill_regen's guard against silently clobbering a
+    # port-owned script stays armed for every other caller.
+    import dataclasses as _dc
+
+    res = _fill_regen(root, _dc.replace(opts, force=False), op)
+    if not res.ok:
+        return res
+    # tools/ itself deliberately stays. The framework's regen.sh is emitted
+    # INTO tools/regen.sh — that is where the wizard puts it and where CI and
+    # Studio look — so "remove the tools folder" cannot be part of adopting
+    # it: the folder is where the adopted script lives. What ends here is the
+    # fork, not the directory. Removing the port-local script entirely would
+    # mean teaching Studio and every port's CI to call snesrecomp_cli directly,
+    # which is a framework decision, not a per-port migration.
+    if engine_named:
+        notes.append(
+            "tools/ also has files the framework ships by the same name, worth "
+            "a look: " + ", ".join(engine_named))
+    if port_specific:
+        notes.append(
+            f"{len(port_specific)} other file(s) in tools/ are this port's own "
+            "and were left alone (nothing the framework ships shares their "
+            "names)")
+    msg = f"tools/regen.sh is now the framework's ({snes_paths.wizard_source(root)})"
+    return ApplyResult(op, True, "; ".join([msg, *notes]), [REGEN_REL])
+
+
 def _fill_regen(root: Path, opts: MigrateOptions, op: str) -> ApplyResult:
-    """tools/regen.sh, but never a version the pinned framework cannot run."""
+    """tools/regen.sh, but never a version the pinned framework cannot run.
+
+    And never over one the port wrote itself. "Never edit generated output"
+    has a mirror: hand-authored output is not Studio's to regenerate. Probe
+    ROM refreshes the identity carriers with ``force=True`` — it has to, that
+    is the op — and that force reached regen.sh too, so on a port whose
+    regen.sh is its own the only thing standing between Studio and replacing
+    it was an unrelated framework-version check. MegaManXSNESRecomp's is a
+    130-line multi-variant driver (a second regional variant, per-variant
+    profile manifests, a strict-idempotency pass, a native-analyzer build);
+    the wizard's single-variant script would have silently replaced all of it
+    the moment that port advanced its submodule pin.
+    """
+    dst = root / "tools" / "regen.sh"
+    if dst.is_file() and opts.force:
+        try:
+            existing = dst.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            existing = ""
+        if existing and snes_paths.regen_is_port_authored(existing):
+            return ApplyResult(
+                op, True,
+                "tools/regen.sh left alone — this port wrote its own (it does "
+                "not drive the framework CLI the wizard's does). Overwriting "
+                "it would drop whatever it adds; re-emit deliberately with "
+                "Emit tools/regen.sh if that is really what you want.",
+            )
     src = snes_paths.templates_dir(root) / "regen.sh.in"
     if src.is_file():
         try:
@@ -1368,6 +1946,571 @@ def _op_disable_netplay(root: Path, opts: MigrateOptions) -> ApplyResult:
                        ["CMakeLists.txt"])
 
 
+# ---------------------------------------------------------------------------
+# Mod catalog
+# ---------------------------------------------------------------------------
+#
+# snesrecomp used to leave mod staging to each title, and every title spelled
+# it differently: a copy_directory POST_BUILD block here, a
+# snesrecomp_target_stage_dir(... mods) there, each choosing its own
+# destination beside the executable. runner.cmake now owns both the call and
+# the destination, and fails configure when a repo ships packages that no
+# target declared -- which is the error that brings people here.
+#
+# The CMake half is only half. mod_runtime scans <root>/packages where <root>
+# is what the host passes to snes_mod_runtime_initialize_c(); the framework
+# stages into mods/preloaded/packages. A port whose host still says "mods"
+# therefore configures cleanly, builds cleanly, and shows an empty Mods page,
+# which is a worse failure than the one the guard produces. So this op moves
+# the host root too, and the audit reports the mismatch on its own.
+
+MOD_CATALOG_CALL = "snesrecomp_target_mod_catalog"
+# Repo-side catalog root: the directory holding packages/.
+MOD_CATALOG_SRC = "mods/preloaded"
+# Fallback only. The live value is read from runner.cmake below, because the
+# framework is where that layout is decided and a copy here would rot.
+MOD_CATALOG_DEST_DEFAULT = "mods/preloaded/packages"
+
+_MOD_CATALOG_DEST_RE = re.compile(
+    r"""set\s*\(\s*SNESRECOMP_MOD_CATALOG_DEST\s+"?([^"\s)]+)"?""")
+
+
+def framework_catalog_dest(root: Path) -> str:
+    """Staged layout beside the executable, as the framework declares it."""
+    runner = root / FRAMEWORK / "runner" / "runner.cmake"
+    try:
+        text = runner.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return MOD_CATALOG_DEST_DEFAULT
+    m = _MOD_CATALOG_DEST_RE.search(text)
+    return m.group(1) if m else MOD_CATALOG_DEST_DEFAULT
+
+
+def framework_has_mod_catalog(root: Path) -> bool:
+    """True when the checked-out pin defines snesrecomp_target_mod_catalog().
+
+    Older pins do not, and on those the per-title copy block is still the only
+    thing that stages anything. Migrating a repo onto a function its framework
+    has never heard of would turn a working build into a configure error.
+    """
+    runner = root / FRAMEWORK / "runner" / "runner.cmake"
+    try:
+        text = runner.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(re.search(r"function\s*\(\s*" + MOD_CATALOG_CALL + r"\b", text))
+
+
+def host_mod_root(dest: str) -> str:
+    """What the host must pass as mod_runtime's root: the parent of packages/."""
+    parts = [p for p in dest.replace("\\", "/").split("/") if p]
+    if parts and parts[-1] == "packages":
+        parts = parts[:-1]
+    return "/".join(parts) or "mods"
+
+
+def catalog_package_ids(root: Path) -> list[str]:
+    """Package ids under mods/preloaded/packages, the way the guard counts."""
+    pkgs = root / MOD_CATALOG_SRC / "packages"
+    if not pkgs.is_dir():
+        return []
+    try:
+        return sorted(p.name for p in pkgs.iterdir() if p.is_dir())
+    except OSError:
+        return []
+
+
+# Read and write without touching line endings. A migration that also
+# normalizes CRLF rewrites every line of a host's main.c, and a diff where the
+# one real change is buried in 1200 whitespace hunks is a diff nobody reviews.
+def _read_verbatim(path: Path) -> str:
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+        return fh.read()
+
+
+def _write_verbatim(path: Path, text: str) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+
+
+def _newline_of(text: str) -> str:
+    crlf = text.count("\r\n")
+    return "\r\n" if crlf and crlf * 2 >= text.count("\n") else "\n"
+
+
+def _as_newline(block: str, nl: str) -> str:
+    return block if nl == "\n" else block.replace("\n", nl)
+
+
+# --- a CMake reader that does not truncate ---------------------------------
+#
+# A POST_BUILD block is full of generator expressions and nested parentheses,
+# so the `\(([^)]*)\)` shape used for the netplay one-liner above stops in the
+# middle of one. A span that stops in the middle is a wrong edit, and a wrong
+# edit to a CMakeLists is worse than the error we came to fix -- hence a real
+# paren-balanced scan that knows about comments and quoted strings.
+
+_CMAKE_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _skip_quoted(text: str, i: int) -> int:
+    i += 1
+    n = len(text)
+    while i < n:
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == '"':
+            return i + 1
+        i += 1
+    return n
+
+
+def _match_paren(text: str, i: int) -> int | None:
+    """Index just past the ')' matching the '(' at `i`, or None if unbalanced."""
+    depth = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "#":
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            i = _skip_quoted(text, i)
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _cmake_calls(text: str) -> list[tuple[str, int, int, str]]:
+    """``(name, start, end, args)`` for every command invocation in `text`.
+
+    Descends into argument lists as well, so a command inside a function()
+    body is found -- Mega Man X stages its shader presets from one, and the
+    filter below has to be able to see it in order to leave it alone.
+    """
+    calls: list[tuple[str, int, int, str]] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "#":
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            i = _skip_quoted(text, i)
+            continue
+        m = _CMAKE_IDENT_RE.match(text, i)
+        if not m:
+            i += 1
+            continue
+        j = m.end()
+        k = j
+        while k < n and text[k] in " \t":
+            k += 1
+        if k < n and text[k] == "(":
+            end = _match_paren(text, k)
+            if end is None:
+                break
+            calls.append((m.group(0), i, end, text[k + 1:end - 1]))
+            i = k + 1
+            continue
+        i = j
+    return calls
+
+
+# "mods" as a path segment, or the _MODS tail of a MMX_PRELOADED_MODS-style
+# variable. Deliberately not a bare substring test: MMX_SHADER_ASSETS is
+# staged by a copy_directory block that must survive this migration.
+_MODS_WORD_RE = re.compile(
+    r"(?<![A-Za-z0-9_])mods(?![A-Za-z0-9_])|_MODS(?![A-Za-z0-9])", re.I)
+
+_CUSTOM_CMD_TARGET_RE = re.compile(
+    r"(?<![A-Za-z0-9_])TARGET\s+([A-Za-z0-9_.$={}-]+)")
+
+
+def _legacy_mod_staging(text: str) -> list[tuple[int, int, str, str]]:
+    """``(start, end, label, target)`` for each per-title mod staging command."""
+    hits: list[tuple[int, int, str, str]] = []
+    for name, start, end, args in _cmake_calls(text):
+        if not _MODS_WORD_RE.search(args):
+            continue
+        if name == "snesrecomp_target_stage_dir":
+            tok = args.split()
+            hits.append((start, end, "snesrecomp_target_stage_dir(... mods)",
+                         tok[0] if tok else ""))
+        elif name == "add_custom_command" and (
+                "copy_directory" in args or "remove_directory" in args):
+            m = _CUSTOM_CMD_TARGET_RE.search(args)
+            hits.append((start, end,
+                         "add_custom_command(... copy_directory ... mods)",
+                         m.group(1) if m else ""))
+    # A hit fully inside another is the same block seen twice; keep the outer.
+    outer: list[tuple[int, int, str, str]] = []
+    for h in sorted(hits, key=lambda x: (x[0], -x[1])):
+        if any(o[0] <= h[0] and h[1] <= o[1] for o in outer):
+            continue
+        outer.append(h)
+    return outer
+
+
+def _mod_catalog_declared(text: str) -> str | None:
+    """The target the catalog is declared on, or None."""
+    for name, _s, _e, args in _cmake_calls(text):
+        if name == MOD_CATALOG_CALL:
+            tok = args.split()
+            return tok[0] if tok else ""
+    return None
+
+
+def _mods_enabled(text: str) -> bool:
+    """SNESRECOMP_ENABLE_MODS forced ON before runner.cmake is included.
+
+    The framework refuses a catalog without it: the loader is not compiled, so
+    the packages would be staged beside the executable and read by nothing.
+    """
+    for name, start, _e, args in _cmake_calls(text):
+        if name != "set":
+            continue
+        if "SNESRECOMP_ENABLE_MODS" in args and re.search(
+                r"(?<![A-Za-z0-9_])ON(?![A-Za-z0-9_])", args):
+            return start < _runner_include_pos(text)
+    return False
+
+
+def _runner_include_pos(text: str) -> int:
+    for name, start, _e, args in _cmake_calls(text):
+        if name == "include" and "runner.cmake" in args:
+            return start
+    return len(text)
+
+
+# --- the host half ---------------------------------------------------------
+
+_HOST_INIT_RE = re.compile(
+    r"snes_mod_runtime_initialize_c\s*\(\s*([^,]+),", re.S)
+def _exe_dir_path_for(text: str, ident: str) -> str:
+    """The literal an exe_dir_path() wrote into `ident`, or ``"?"``.
+
+    Following the actual out-parameter rather than "the only exe_dir_path in
+    the file": a host stages several exe-relative directories (translations,
+    assets), and picking whichever one happened to be first would report a
+    mismatch that is not there.
+    """
+    m = re.search(r'snesrecomp_exe_dir_path\s*\(\s*"([^"]*)"\s*,\s*'
+                  + re.escape(ident) + r'(?![A-Za-z0-9_])', text)
+    return m.group(1) if m else "?"
+
+
+def _host_sources(root: Path) -> list[Path]:
+    out: list[Path] = []
+    src = root / "src"
+    if not src.is_dir():
+        return out
+    for ext in ("*.c", "*.cpp", "*.cc", "*.inc"):
+        out.extend(sorted(src.rglob(ext)))
+    return out
+
+
+def host_mod_roots(root: Path) -> list[tuple[str, str]]:
+    """``(repo-relative source, root it passes)`` for every mod_runtime init.
+
+    ``"?"`` when the argument is neither a literal nor an exe_dir_path() the
+    same file resolves -- reported rather than guessed at, because rewriting
+    an argument we cannot read is how a migration breaks a working host.
+    """
+    found: list[tuple[str, str]] = []
+    for path in _host_sources(root):
+        try:
+            text = _read_verbatim(path)
+        except OSError:
+            continue
+        if "snes_mod_runtime_initialize_c" not in text:
+            continue
+        rel = str(path.relative_to(root)).replace("\\", "/")
+        for m in _HOST_INIT_RE.finditer(text):
+            arg = m.group(1).strip()
+            lit = re.fullmatch(r'"([^"]*)"', arg)
+            if lit:
+                found.append((rel, lit.group(1)))
+                continue
+            ident = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", arg)
+            found.append((rel, _exe_dir_path_for(text, arg)
+                          if ident else "?"))
+    return found
+
+
+# --- rewriting CMakeLists.txt ----------------------------------------------
+
+def _line_span(text: str, start: int, end: int) -> tuple[int, int]:
+    """Grow a span to whole lines, trailing newline included."""
+    s = text.rfind("\n", 0, start) + 1
+    e = text.find("\n", max(end - 1, start))
+    return s, (len(text) if e < 0 else e + 1)
+
+
+def _prev_line_span(text: str, start: int) -> tuple[int, int] | None:
+    """The line above `start`, or None at the top of the file."""
+    if start <= 0:
+        return None
+    e = start
+    s = text.rfind("\n", 0, e - 1) + 1
+    return s, e
+
+
+def _expand_region(text: str, start: int, end: int) -> tuple[int, int, list[str]]:
+    """Grow a staging command to everything that existed only to serve it.
+
+    Three layers, each one observed in a real port: the ``if(EXISTS ...)`` /
+    ``endif()`` Zelda and Super Mario World wrap the block in, the
+    ``set(<X>_PRELOADED_MODS ...)`` line that feeds it, and the comment
+    paragraph above explaining a staging rule that is now the framework's.
+    Leaving any of them behind leaves a reader believing the repo still
+    decides where the catalog goes.
+    """
+    notes: list[str] = []
+    s, e = _line_span(text, start, end)
+
+    # if()/endif() that brackets the block exactly: the previous non-blank,
+    # non-comment line opens it and the next one closes it, so the block is
+    # the whole body and both lines go with it.
+    def _prev_code(i: int) -> tuple[int, int, str] | None:
+        while True:
+            sp = _prev_line_span(text, i)
+            if sp is None:
+                return None
+            line = text[sp[0]:sp[1]]
+            if line.strip() and not line.lstrip().startswith("#"):
+                return sp[0], sp[1], line
+            if not line.strip():
+                return None  # a blank line ends the association
+            i = sp[0]
+
+    def _next_code(i: int) -> tuple[int, int, str] | None:
+        while i < len(text):
+            e2 = text.find("\n", i)
+            e2 = len(text) if e2 < 0 else e2 + 1
+            line = text[i:e2]
+            if line.strip():
+                return i, e2, line
+            i = e2
+        return None
+
+    prev = _prev_code(s)
+    nxt = _next_code(e)
+    if (prev and nxt
+            and re.match(r"\s*if\s*\(", prev[2])
+            and re.match(r"\s*endif\s*\(", nxt[2])):
+        s, e = prev[0], nxt[1]
+        notes.append("its if()/endif() guard")
+
+    # set(<X>_PRELOADED_MODS ...) directly above, if nothing else reads it.
+    prev = _prev_code(s)
+    if prev and re.match(r"\s*set\s*\(", prev[2]) and _MODS_WORD_RE.search(prev[2]):
+        var = re.match(r"\s*set\s*\(\s*([A-Za-z0-9_]+)", prev[2])
+        rest = text[:prev[0]] + text[e:]
+        if var and f"${{{var.group(1)}}}" not in rest:
+            s = prev[0]
+            notes.append(f"the {var.group(1)} variable")
+
+    # The comment paragraph immediately above (no blank line between).
+    while True:
+        sp = _prev_line_span(text, s)
+        if sp is None or not text[sp[0]:sp[1]].lstrip().startswith("#"):
+            break
+        s = sp[0]
+    return s, e, notes
+
+
+def _mod_catalog_block(target: str, dest: str) -> str:
+    return (
+        "# The mod catalog. The framework owns the staged layout\n"
+        f"# ({dest} beside the executable) and verifies it after\n"
+        "# every build, so a rename touches snesrecomp/runner/runner.cmake and\n"
+        "# nothing here. Pass NONE instead of a directory if this title ships\n"
+        "# no catalog.\n"
+        f"{MOD_CATALOG_CALL}({target}\n"
+        f'    "${{CMAKE_SOURCE_DIR}}/{MOD_CATALOG_SRC}")\n'
+    )
+
+
+def _catalog_target(text: str, legacy: list) -> tuple[str, str]:
+    """``(target, how)``. Empty target when the repo does not say which one."""
+    for _s, _e, _label, tgt in legacy:
+        if tgt and not tgt.startswith("$"):
+            return tgt, "named by the staging block it replaces"
+    declared = _mod_catalog_declared(text)
+    if declared:
+        return declared, "already declared"
+    exes = [args.split()[0] for name, _s, _e, args in _cmake_calls(text)
+            if name == "add_executable" and args.split()]
+    literal = [e for e in exes if not e.startswith("$")]
+    if len(literal) == 1:
+        return literal[0], "the only add_executable() target"
+    if len(literal) > 1:
+        return "", ("several executables (" + ", ".join(literal[:4])
+                    + ") and no staging block naming one — "
+                    "declare the catalog by hand on the one that ships it")
+    return "", "no literal add_executable() target to declare it on"
+
+
+def _insert_after_pos(text: str) -> int:
+    """Where a fresh declaration goes when no legacy block marks the spot."""
+    best = -1
+    for name, _s, end, _args in _cmake_calls(text):
+        if name.startswith("snesrecomp_target_") or name in (
+                "recomp_target_launcher_ui", "target_link_libraries"):
+            best = max(best, end)
+    if best < 0:
+        return len(text)
+    nl = text.find("\n", best)
+    return len(text) if nl < 0 else nl + 1
+
+
+def _op_declare_mod_catalog(root: Path, opts: MigrateOptions) -> ApplyResult:
+    """Hand mod staging to the framework, on both sides of the boundary.
+
+    CMake: one snesrecomp_target_mod_catalog() call, every per-title staging
+    block deleted, SNESRECOMP_ENABLE_MODS forced on before runner.cmake.
+    Host: the mod_runtime root moved to wherever the framework now stages, so
+    the Mods page lists what the build actually shipped.
+    """
+    op = "snes_declare_mod_catalog"
+    cml = root / "CMakeLists.txt"
+    if not cml.is_file():
+        return ApplyResult(op, False, "No CMakeLists.txt")
+    if not framework_has_mod_catalog(root):
+        return ApplyResult(
+            op, False,
+            f"The checked-out {FRAMEWORK} pin has no {MOD_CATALOG_CALL}() — "
+            "update the submodule first; on this pin the per-title staging "
+            "block is still the only thing that stages the catalog.")
+    try:
+        text = _read_verbatim(cml)
+    except OSError as exc:
+        return ApplyResult(op, False, f"Cannot read CMakeLists.txt: {exc}")
+    nl = _newline_of(text)
+
+    dest = framework_catalog_dest(root)
+    legacy = _legacy_mod_staging(text)
+    target, how = _catalog_target(text, legacy)
+    if not target:
+        return ApplyResult(op, False, f"Cannot name the target: {how}")
+
+    changed: list[str] = []
+    done: list[str] = []
+    new = text
+
+    # 1. Delete the per-title staging, innermost-last so earlier spans keep
+    #    their offsets.
+    anchor: int | None = None
+    for start, end, label, _tgt in sorted(legacy, reverse=True):
+        s, e, notes = _expand_region(new, start, end)
+        new = new[:s] + new[e:]
+        anchor = s
+        done.append("removed " + label
+                    + (" with " + " and ".join(notes) if notes else ""))
+
+    # 2. Declare it -- in the hole the old block left, so the catalog stays
+    #    where a reader of this file already expects to find it.
+    if _mod_catalog_declared(new) is None:
+        at = anchor if anchor is not None else _insert_after_pos(new)
+        block = _as_newline(_mod_catalog_block(target, dest), nl)
+        if at > 0 and not new[:at].endswith(nl + nl):
+            block = nl + block
+        new = new[:at] + block + new[at:]
+        done.append(f"declared {MOD_CATALOG_CALL}({target})")
+
+    # 3. The loader has to be compiled or the catalog is read by nothing.
+    inc = _runner_include_pos(new)
+    if catalog_package_ids(root) and not _mods_enabled(new) and inc < len(new):
+        at = new.rfind("\n", 0, inc) + 1
+        new = new[:at] + _as_newline(
+            "# Forces the package loader and the launcher's Mods view to be\n"
+            "# compiled. Must precede runner.cmake: the framework refuses a\n"
+            "# catalog it cannot read.\n"
+            'set(SNESRECOMP_ENABLE_MODS ON CACHE BOOL\n'
+            '    "Enable this title\'s mod catalog" FORCE)\n\n', nl) + new[at:]
+        done.append("forced SNESRECOMP_ENABLE_MODS ON")
+
+    if new != text:
+        changed.append("CMakeLists.txt")
+
+    # 4. The host half. mod_runtime scans <root>/packages; the framework now
+    #    stages into `dest`, so anything else silently lists nothing.
+    want = host_mod_root(dest)
+    host_changes, host_notes = _rewrite_host_mod_root(root, want, opts)
+    done.extend(host_notes)
+
+    if not done:
+        return ApplyResult(op, True, "Mod catalog already framework-owned")
+    if _dry(opts):
+        return ApplyResult(op, True, "[dry-run] " + "; ".join(done),
+                           changed + host_changes)
+    if "CMakeLists.txt" in changed:
+        _write_verbatim(cml, new)
+    return ApplyResult(op, True, "; ".join(done), changed + host_changes)
+
+
+def _rewrite_host_mod_root(
+    root: Path, want: str, opts: MigrateOptions
+) -> tuple[list[str], list[str]]:
+    """Point snes_mod_runtime_initialize_c() at the framework's staged root.
+
+    Edits only the literal that call actually reads -- its own first argument,
+    or the exe_dir_path() that filled its out-parameter. A host stages other
+    exe-relative directories from the same file, and a blanket substitution
+    would move one of those instead.
+    """
+    changed: list[str] = []
+    notes: list[str] = []
+    for path in _host_sources(root):
+        try:
+            text = _read_verbatim(path)
+        except OSError:
+            continue
+        if "snes_mod_runtime_initialize_c" not in text:
+            continue
+        rel = str(path.relative_to(root)).replace("\\", "/")
+        edits: list[tuple[int, int, str]] = []   # (start, end, replacement)
+        for m in _HOST_INIT_RE.finditer(text):
+            arg = m.group(1).strip()
+            lit = re.fullmatch(r'"([^"]*)"', arg)
+            if lit:
+                if lit.group(1) != want:
+                    s = m.start(1) + (len(m.group(1)) - len(m.group(1).lstrip()))
+                    edits.append((s, s + len(arg), f'"{want}"'))
+                continue
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", arg):
+                notes.append(f"{rel}: mod_runtime root is an expression this "
+                             "migration will not rewrite — check it by hand")
+                continue
+            d = re.search(r'snesrecomp_exe_dir_path\s*\(\s*("[^"]*")\s*,\s*'
+                          + re.escape(arg) + r"(?![A-Za-z0-9_])", text)
+            if d is None:
+                notes.append(f"{rel}: cannot find where {arg} is filled — "
+                             "check the mod_runtime root by hand")
+            elif d.group(1) != f'"{want}"':
+                edits.append((d.start(1), d.end(1), f'"{want}"'))
+        if not edits:
+            continue
+        new = text
+        for s, e, repl in sorted(edits, reverse=True):
+            new = new[:s] + repl + new[e:]
+        changed.append(rel)
+        notes.append(f'{rel}: mod_runtime root → "{want}"')
+        if not _dry(opts):
+            _write_verbatim(path, new)
+    return changed, notes
+
+
 def _op_repair_framework(root: Path, opts: MigrateOptions) -> ApplyResult:
     op = "snes_repair_framework_submodule"
     broken = diagnose_framework_checkout(root)
@@ -1443,6 +2586,12 @@ def _op_probe_rom_refresh(root: Path, opts: MigrateOptions) -> ApplyResult:
     changed = [pth for r in results for pth in r.changed_paths]
     ok = all(r.ok for r in results)
     detail = f"crc32 {ident['crc32']}, sha256 {ident['sha256'][:12]}…"
+    # Say where game_id came from. Reading it off the port's mod manifests is
+    # still an inference, and it is being written into the file the build
+    # compiles in — so it gets stated rather than assumed to be noticed.
+    gid, how = resolve_game_id(root, forced, ident)
+    if gid:
+        detail += f", game_id {gid} ({how})"
     msgs = "; ".join(r.message for r in results if not r.ok) or detail
     return ApplyResult(op, ok, ("Refreshed identity: " + detail) if ok else msgs, changed)
 
@@ -1610,4 +2759,6 @@ _OPS = {
     "snes_patch_readme_metrics": _op_patch_readme_metrics,
     "snes_enable_netplay": _op_enable_netplay,
     "snes_disable_netplay": _op_disable_netplay,
+    "snes_declare_mod_catalog": _op_declare_mod_catalog,
+    "snes_adopt_framework_regen": _op_adopt_framework_regen,
 }

@@ -365,7 +365,43 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$DO_GENERATE" -eq 1 ]; then
   step "Building the framework (out of tree, low priority)"
-  "$ROOT/tools/build_framework.sh" Release
+  # THE FRAMEWORK OWNS THIS SCRIPT. n64lle/tools/build_framework.sh is shared by
+  # every port; tools/build_framework.sh is a shim onto it (see the template).
+  # Run the shared one directly when the pinned n64lle has it, so a scaffold is
+  # never at the mercy of the copy it just wrote, and fall back to the shim for
+  # a pin older than 2026-09-15.
+  if [ -f "$ROOT/n64lle/tools/build_framework.sh" ]; then
+    N64LLE_PORT_ROOT="$ROOT" sh "$ROOT/n64lle/tools/build_framework.sh" Release
+  else
+    say "  note: this n64lle pin predates n64lle/tools/build_framework.sh;"
+    say "        using the port's shim, which builds inline."
+    "$ROOT/tools/build_framework.sh" Release
+  fi
+
+  # THE RSP CENSUS HAS TO BE ON, AND A SCAFFOLD IS THE RIGHT PLACE TO SAY SO.
+  #
+  # -DN64LLE_RSP_CENSUS=1 gates the harvest's RSP microcode capture. Without it
+  # the harvest writes no <image>.n64img.rsp/ sidecar, rspemit compiles no
+  # programs, the binary links zero n64_rspgen_ symbols, and the RSP runs fully
+  # interpreted -- 44.2% of the emulation thread on the title where it was
+  # finally caught (2026-09-15), on which seven of nine N64 ports were then
+  # found to be in the same state.
+  #
+  # The harvester refuses to finish without it now, so the build below would
+  # fail anyway. Checking here turns that into a sentence about the framework
+  # build rather than a fatal error three steps later in a log nobody reads yet.
+  if [ -f "$ROOT/build-n64lle/CMakeCache.txt" ] &&
+     ! grep -q 'N64LLE_RSP_CENSUS=1' "$ROOT/build-n64lle/CMakeCache.txt"; then
+    say ""
+    say "  WARNING: the framework was built WITHOUT -DN64LLE_RSP_CENSUS=1."
+    say "           The harvest will refuse to finish, and if it were forced"
+    say "           past that the RSP would run fully interpreted with no"
+    say "           build step reporting it. Rebuild with the shared"
+    say "           n64lle/tools/build_framework.sh, or set"
+    say "           N64LLE_HARVEST_ALLOW_NO_RSP=1 if this title truly runs no"
+    say "           RSP tasks."
+    say ""
+  fi
 
   step "Harvest -> emit -> compile -> gates"
   cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_BUILD_TYPE=Release \
@@ -410,6 +446,8 @@ cat <<DONE
 Next, in that directory:
 
   tools/build_framework.sh Release        # if you skipped --generate
+                                          #   (a shim onto the shared
+                                          #    n64lle/tools/build_framework.sh)
   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
   cmake --build build -j
   ctest --test-dir build --output-on-failure

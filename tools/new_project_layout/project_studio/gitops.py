@@ -332,6 +332,145 @@ def _is_repo_root(path: Path) -> bool:
         return False
 
 
+def _module_checked_out(owner: Path, path: str) -> bool:
+    """True only when ``owner/path`` is a cloned module, not a placeholder.
+
+    ``SubmoduleInfo.present`` answers "the directory exists", which is also
+    true of the empty directory ``git clone`` leaves behind when it is not
+    given ``--recurse-submodules``. Every ``--modules`` op needs this stronger
+    question instead, or it reports "checkout missing" against a repo whose
+    .gitmodules is perfectly correct.
+    """
+    sub = owner / _normalize_module_path(path, nested=False)
+    return sub.is_dir() and _is_repo_root(sub)
+
+
+def missing_module_reason(root: Path, path: str, *, nested: bool = False) -> str:
+    """Why a module checkout did not resolve, ending in the op that fixes it.
+
+    "checkout missing" on its own named a symptom and no cure, and the three
+    states behind it want different sentences: never cloned (the common one,
+    from a clone without --recurse-submodules), a stray non-repo directory in
+    the way, or — for a nested module — a framework that is not checked out
+    either. Ending every one of them with "Ensure submodules first" is the
+    rule living in the message rather than in someone's memory.
+    """
+    root = root.expanduser().resolve()
+    path = _normalize_module_path(path, nested=nested)
+    if nested:
+        owner = resolve_framework_dir(root)
+        if owner is None:
+            fw = framework_name()
+            return (
+                f"{path}: checkout missing — {fw} itself is not checked out; "
+                "run Ensure submodules first, then Ensure nested"
+            )
+    else:
+        owner = root
+    sub = owner / path
+    if not sub.exists():
+        return (
+            f"{path}: checkout missing — nothing at {sub}; "
+            "run Ensure submodules first"
+        )
+    if sub.is_dir() and not any(sub.iterdir()):
+        return (
+            f"{path}: checkout missing — {path}/ is the empty placeholder a "
+            "clone without --recurse-submodules leaves behind (git submodule "
+            "status prefixes it with '-'); run Ensure submodules first"
+        )
+    return (
+        f"{path}: checkout missing — {sub} has files but is not a git "
+        "checkout; move it aside, then run Ensure submodules first"
+    )
+
+
+def _init_one_module(owner: Path, path: str, *, dry_run: bool = False) -> CmdResult:
+    """``git submodule update --init --recursive`` for one registered module.
+
+    The missing half of Ensure submodules. Being registered in .gitmodules and
+    being cloned on disk are two states, and a plain ``git clone`` produces the
+    first without the second.
+    """
+    path = _normalize_module_path(path, nested=False)
+    sub = owner / path
+    if sub.is_dir() and not _is_repo_root(sub) and any(sub.iterdir()):
+        return CmdResult(
+            False,
+            f"{path} has files but is not a git checkout ({sub}) — move it "
+            "aside, then Ensure submodules again",
+        )
+    if dry_run:
+        return CmdResult(
+            True, f"[dry-run] would clone {path} (submodule update --init --recursive)"
+        )
+    # sync first: a local `submodule.<path>.url` override left by an earlier
+    # fork experiment otherwise decides where this clone comes from.
+    _git(owner, "submodule", "sync", "--", path)
+    code, out, err = _git(
+        owner, "submodule", "update", "--init", "--recursive", "--", path
+    )
+    if code != 0:
+        return CmdResult(False, f"Failed to clone {path}", err or out)
+    if not _is_repo_root(sub):
+        # Tool Skepticism: git exited 0, so check the thing it claimed to do.
+        return CmdResult(
+            False,
+            f"git reported success but {sub} is still not a checkout",
+            out or err,
+        )
+    branch = current_branch(sub)
+    _, head, _ = _git(sub, "rev-parse", "--short=12", "HEAD")
+    where = branch or f"detached at {head or 'HEAD'}"
+    return CmdResult(True, f"Cloned {path} ({where})", out)
+
+
+def init_module_checkouts(
+    root: Path,
+    *,
+    paths: list[str] | None = None,
+    nested: bool = False,
+    dry_run: bool = False,
+) -> list[CmdResult]:
+    """Clone the module checkouts a clone without --recurse-submodules skipped."""
+    root = root.expanduser().resolve()
+    if not _is_git_repo(root):
+        return [CmdResult(False, "Not a git repository")]
+    owner = resolve_framework_dir(root) if nested else root
+    if owner is None:
+        fw = framework_name()
+        return [
+            CmdResult(
+                False,
+                f"No {fw} checkout found — run Ensure submodules first",
+            )
+        ]
+    want = paths or list(default_module_paths(nested=nested))
+    cp = _read_gitmodules(owner)
+    results: list[CmdResult] = []
+    for path in want:
+        path = _normalize_module_path(path, nested=nested)
+        if _module_checked_out(owner, path):
+            results.append(CmdResult(True, f"{path}: already checked out"))
+            continue
+        # Registered is this op's whole input. A module the repo does not
+        # vendor at all is not a failure to clone it — plenty of ports carry
+        # no recomp-ui — and reporting it as one would put a red FAIL next to
+        # a healthy repo. Adding it is Ensure submodules' job, and it says so.
+        if _section_for_path(cp, path) is None:
+            results.append(
+                CmdResult(
+                    True,
+                    f"{path}: not in .gitmodules — nothing to clone "
+                    "(Ensure submodules adds it)",
+                )
+            )
+            continue
+        r = _init_one_module(owner, path, dry_run=dry_run)
+        results.append(CmdResult(r.ok, f"{path}: {r.message}", r.detail))
+    return results
+
+
 def _read_gitmodules(root: Path) -> configparser.ConfigParser:
     cp = configparser.ConfigParser(interpolation=None)
     gm = root / ".gitmodules"
@@ -436,25 +575,34 @@ def _list_submodules(
             branch=cp.get(section, "branch", fallback=""),
             sha=_submodule_sha(root, path),
             present=(root / path).exists(),
-            initialized=(root / path / ".git").exists()
-            or ((root / path).is_dir() and (root / ".git" / "modules" / path).exists()),
-            checkout_branch=current_branch(root / path) or ""
-            if (root / path).is_dir()
-            else "",
+            # `initialized` is the strong question, and it has to be: an empty
+            # placeholder directory satisfies every weaker test, and
+            # current_branch() inside one resolves to the SUPERPROJECT's branch
+            # (git walks up), so an uninitialised snesrecomp used to report the
+            # game repo's branch as its own.
+            initialized=_module_checked_out(root, path),
+            checkout_branch=(
+                current_branch(root / path) or ""
+                if _module_checked_out(root, path)
+                else ""
+            ),
         )
     # Ensure known slots show up even if missing from .gitmodules
     for path in known:
         if path not in found:
             url = _submodule_remote_url(root, path) or _default_url_for_path(path)
             present = (root / path).exists()
+            checked_out = _module_checked_out(root, path)
             found[path] = SubmoduleInfo(
                 name=path,
                 path=path,
                 url=url,
                 present=present,
-                initialized=(root / path / ".git").exists(),
+                initialized=checked_out,
                 sha=_submodule_sha(root, path) if present else "",
-                checkout_branch=(current_branch(root / path) or "") if present else "",
+                checkout_branch=(
+                    (current_branch(root / path) or "") if checked_out else ""
+                ),
             )
     # Stable order: known first, then others
     ordered: list[SubmoduleInfo] = []
@@ -570,6 +718,25 @@ def repo_status(root: Path) -> RepoStatus:
             )
         else:
             st.nested_submodules = list_nested_modules(root)
+    else:
+        fw = framework_name()
+        st.notes.append(
+            f"{fw} is registered but not checked out — every --modules and "
+            "--nested op will report 'checkout missing' until you run Ensure "
+            "submodules (git submodule update --init --recursive)."
+        )
+    stale = [
+        x.path
+        for x in (*st.submodules, *st.nested_submodules)
+        if x.present and not x.initialized
+    ]
+    if stale:
+        st.notes.append(
+            "Registered but never cloned (empty placeholder directories): "
+            + ", ".join(stale)
+            + " — run Ensure submodules. This is what a `git clone` without "
+            "--recurse-submodules leaves behind."
+        )
     return st
 
 
@@ -680,7 +847,6 @@ def module_urls(root: Path) -> list[ModuleUrl]:
         if owner is None or not _is_git_repo(owner):
             continue
         for path in default_module_paths(nested=nested):
-            sub_dir = owner / path
             rows.append(ModuleUrl(
                 path=path,
                 nested=nested,
@@ -688,7 +854,11 @@ def module_urls(root: Path) -> list[ModuleUrl]:
                 gitmodules_url=_gitmodules_url(owner, path) or _default_url_for_path(path),
                 local_url=_local_url(owner, path),
                 origin_url=_submodule_remote_url(owner, path),
-                present=sub_dir.is_dir(),
+                # Same strong question the --modules ops ask: an empty
+                # placeholder directory is not a checkout, and reporting it as
+                # present is what let "(not checked out)" go missing from the
+                # one listing that would have explained the whole problem.
+                present=_module_checked_out(owner, path),
             ))
     return rows
 
@@ -839,6 +1009,20 @@ def ensure_submodule(
             notes.append(url_r.message)
         set_r = set_submodule_branch(root, path, branch, dry_run=dry_run)
         notes.append(set_r.message)
+        # Registered is not cloned, and this used to stop here. A repo cloned
+        # without --recurse-submodules has the .gitmodules entry and an empty
+        # directory, so Ensure submodules reported "already present" while
+        # every later --modules op reported "checkout missing" — the two
+        # answers disagreeing about the same repo, with neither naming the
+        # cure. Ensure now finishes the job it claims to have done.
+        if not _module_checked_out(root, path):
+            init_r = _init_one_module(root, path, dry_run=dry_run)
+            notes.append(init_r.detail)
+            return CmdResult(
+                init_r.ok,
+                f"{path} registered but not cloned → {init_r.message}",
+                "; ".join(n for n in notes if n),
+            )
         return CmdResult(
             True,
             f"{path} already present",
@@ -898,7 +1082,13 @@ def ensure_nested_modules(
     psx = resolve_psxrecomp_dir(root)
     if psx is None:
         fw = framework_name()
-        return [CmdResult(False, f"No {fw} checkout found (need root or root/{fw})")]
+        return [
+            CmdResult(
+                False,
+                f"No {fw} checkout found (need root or root/{fw}) — the nested "
+                "modules live inside it, so run Ensure submodules first",
+            )
+        ]
     if not _is_git_repo(psx):
         return [CmdResult(False, f"{framework_name()} is not a git repo: {psx}")]
 
@@ -1408,15 +1598,21 @@ def advance_submodule_pins(
     # that owns the nested modules.
     owner = resolve_framework_dir(root) if nested else root
     if owner is None:
-        return [CmdResult(False, f"No {framework_name()} checkout found")]
+        return [
+            CmdResult(
+                False,
+                f"No {framework_name()} checkout found — run Ensure submodules first",
+            )
+        ]
     want = paths or list(default_module_paths(nested=nested))
     results: list[CmdResult] = []
     for path in want:
         path = _normalize_module_path(path, nested=nested)
         sub_dir = resolve_module_dir(root, path, nested=nested)
         if sub_dir is None or not _is_git_repo(sub_dir):
-            results.append(CmdResult(
-                False, f"{path}: checkout missing — Ensure submodules first"))
+            results.append(
+                CmdResult(False, missing_module_reason(root, path, nested=nested))
+            )
             continue
         code, old, _ = _git(sub_dir, "rev-parse", "HEAD")
         old = old.strip() if code == 0 else ""
@@ -1771,7 +1967,9 @@ def switch_modules(
             continue
         sub = resolve_module_dir(root, path, nested=nested)
         if sub is None:
-            results.append(CmdResult(False, f"{path}: checkout missing"))
+            results.append(
+                CmdResult(False, missing_module_reason(root, path, nested=nested))
+            )
             continue
         r = switch_branch(sub, branch, create=create, dry_run=dry_run)
         msg = f"{path}: {r.message}"
@@ -1834,7 +2032,9 @@ def pull_modules(
         path = _normalize_module_path(path, nested=nested)
         sub = resolve_module_dir(root, path, nested=nested)
         if sub is None:
-            results.append(CmdResult(False, f"{path}: checkout missing"))
+            results.append(
+                CmdResult(False, missing_module_reason(root, path, nested=nested))
+            )
             continue
         r = pull(sub, mode=mode, dirty=dirty, dry_run=dry_run)
         results.append(CmdResult(r.ok, f"{path}: {r.message}", r.detail))
@@ -1857,7 +2057,9 @@ def push_modules(
         path = _normalize_module_path(path, nested=nested)
         sub = resolve_module_dir(root, path, nested=nested)
         if sub is None:
-            results.append(CmdResult(False, f"{path}: checkout missing"))
+            results.append(
+                CmdResult(False, missing_module_reason(root, path, nested=nested))
+            )
             continue
         r = push(sub, branch=branches.get(path, ""), dry_run=dry_run)
         results.append(CmdResult(r.ok, f"{path}: {r.message}", r.detail))
@@ -1882,7 +2084,9 @@ def commit_modules(
         path = _normalize_module_path(path, nested=nested)
         sub = resolve_module_dir(root, path, nested=nested)
         if sub is None:
-            results.append(CmdResult(False, f"{path}: checkout missing"))
+            results.append(
+                CmdResult(False, missing_module_reason(root, path, nested=nested))
+            )
             continue
         r = commit_all(sub, message, dry_run=dry_run)
         results.append(CmdResult(r.ok, f"{path}: {r.message}", r.detail))

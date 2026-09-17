@@ -33,6 +33,11 @@ evidence the game is stuck when it is evidence the flag is missing.
   `bench/` and `n64ref/` still resolve paths through `CMAKE_SOURCE_DIR`, which
   breaks under nesting. Build with `tools/build_framework.sh`, never a bare
   `cmake` on `n64lle/`.
+  `tools/build_framework.sh` is a SHIM onto `n64lle/tools/build_framework.sh`,
+  which the framework owns and every port shares. Do not add build logic to
+  the shim: a private per-port copy is what left seven of nine N64 ports
+  building without `-DN64LLE_RSP_CENSUS=1`, which silently compiled their
+  generated-RSP tier to nothing (2026-09-15). Fixes go upstream.
 - **There is no host source in this repo, on purpose.** The executable comes from
   one `n64lle_add_runtime_target()` call; the host lives in n64lle
   `runtime/host/`. If the launcher, input, audio or run loop needs a change, it

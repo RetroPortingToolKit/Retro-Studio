@@ -889,6 +889,12 @@ struct StudioModel {
     int log_height = 160;
     char disc_cue[1024] = {};
     char zip_prefix[128] = {};
+    // Override for the id a mod package's [[target]] matches. Normally blank:
+    // Studio reads it from rom_identity.txt, or from the ids this port's own
+    // mod manifests already name. It is here for the port where nothing
+    // records one yet, because a derived id that matches no manifest ships a
+    // build whose own mods silently refuse to apply.
+    char game_id[128] = {};
     char github_owner[128] = {};
     char github_repo[128] = {};
     int players = 2;
@@ -953,6 +959,12 @@ struct StudioModel {
     // it", which is the default a terminal run would have offered.
     char np_n64_slug[128] = {};
     char np_n64_exe[128] = {};
+    // The n64lle revision to cut the port against. Blank is NOT "main": it is
+    // "let the scaffolder decide", which means branch main pinned at the HEAD
+    // of the n64lle checkout the wizard was run from. Naming one here
+    // overrides that pin, and an older wizard without the flag says so in the
+    // log rather than silently ignoring it.
+    char np_n64_ref[128] = {};
     // The execution-derived harvest window. n64lle records what actually ran
     // rather than following seeds, so these two ARE the coverage decision for
     // a new port; 0 takes the scaffolder's own defaults (900 / 3000M) rather

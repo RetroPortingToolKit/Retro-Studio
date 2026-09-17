@@ -585,6 +585,7 @@ def cmd_new_project(args: argparse.Namespace) -> int:
         # what a terminal run would have offered as the default.
         n64_slug=(getattr(args, "n64_slug", None) or "").strip(),
         n64_exe=(getattr(args, "n64_exe", None) or "").strip(),
+        n64lle_ref=(getattr(args, "n64lle_ref", None) or "").strip(),
         harvest_frames=int(getattr(args, "frames", 0) or 0),
         harvest_step_cap_m=int(getattr(args, "step_cap", 0) or 0),
         dry_run=bool(getattr(args, "dry_run", False)),
@@ -1919,6 +1920,43 @@ def cmd_build_ensure_bios(args: argparse.Namespace) -> int:
     return 0 if r.ok else 1
 
 
+def cmd_build_framework(args: argparse.Namespace) -> int:
+    """Build the out-of-tree framework a port configures against.
+
+    N64 only, and not because the other consoles are unfinished: psxrecomp and
+    snesrecomp are add_subdirectory()'d into the port, so "build the framework"
+    is not a step a user can be missing. n64lle is not — a port includes
+    runtime/runtime.cmake and calls n64lle_runtime_resolve_framework(), which
+    looks for libraries and tools ALREADY BUILT under build-n64lle/. Configure
+    without them and cmake dies inside a resolve function several files from
+    the step that was actually skipped.
+    """
+    profile = platforms.current()
+    if profile.key != "n64":
+        print(
+            f"error: build framework is n64lle-only — {profile.framework} is "
+            "add_subdirectory()'d into the port, so there is no out-of-tree "
+            "framework build to run. Use `build configure`.",
+            file=sys.stderr,
+        )
+        return 2
+    from project_studio.buildops import build_n64_framework
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    r = build_n64_framework(
+        root,
+        config=getattr(args, "build_type", "") or "Release",
+        dry_run=args.dry_run,
+        log=print,
+    )
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    if r.detail and not r.ok:
+        print(r.detail)
+    return 0 if r.ok else 1
+
+
 def cmd_build_generate(args: argparse.Namespace) -> int:
     from project_studio.buildops import (
         generate_n64_c,
@@ -2004,12 +2042,14 @@ def cmd_build_ensure_emitters(args: argparse.Namespace) -> int:
 
 
 def cmd_build_compile(args: argparse.Namespace) -> int:
-    from project_studio.buildops import build, default_target
+    from project_studio.buildops import build, default_build_target
 
     root = _root_or_die(args)
     if root is None:
         return 2
-    target = (getattr(args, "target", None) or "").strip() or default_target(root)
+    # default_BUILD_target, not default_target: on N64 the product target
+    # leaves the gates' own executables unbuilt. A typed --target still wins.
+    target = (getattr(args, "target", None) or "").strip() or default_build_target(root)
     r = build(
         root,
         build_dir=args.build_dir,
@@ -2101,6 +2141,38 @@ def cmd_build_run(args: argparse.Namespace) -> int:
         wait=True,
     )
     print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}", flush=True)
+    return 0 if r.ok else 1
+
+
+def cmd_build_check_paths(args: argparse.Namespace) -> int:
+    """Audit runner/src references in the pinned framework and in this port.
+
+    SNES-only, and not as a placeholder: the failure this catches is specific
+    to snesrecomp's runner/src layer folders. psxrecomp and n64lle have no
+    equivalent layout, and offering the button there would be a control that
+    reports on nothing.
+    """
+    profile = platforms.current()
+    if profile.key != "snes":
+        print(
+            f"error: build check-paths is snesrecomp-only — it audits "
+            f"runner/src's layer folders, which {profile.framework} does not "
+            "have.",
+            file=sys.stderr,
+        )
+        return 2
+    from project_studio.buildops import check_snes_runner_paths
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    r = check_snes_runner_paths(
+        root,
+        fix=bool(getattr(args, "fix", False)),
+        include_docs=bool(getattr(args, "include_docs", False)),
+        log=print,
+    )
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
     return 0 if r.ok else 1
 
 
@@ -2561,10 +2633,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_np.add_argument("--psxrecomp-ref", "--framework-ref", dest="psxrecomp_ref",
                       default="master")
     p_np.add_argument("--snesrecomp-ref", default="main")
-    # N64. There is deliberately no --n64lle-ref: n64lle's setup_project.sh
-    # pins the new project at the HEAD of the checkout it was run from ("the
-    # SHA this scaffold was cut against") and has no flag to override it, so
-    # offering one here would accept a value nothing reads.
+    # N64. Blank is not "main": it is "let the scaffolder decide", which means
+    # branch main pinned at the HEAD of the n64lle checkout the wizard was run
+    # from — "the SHA this scaffold was cut against". Naming a ref here
+    # overrides that, and is forwarded only to a wizard whose parser has the
+    # flag (newproject.script_supports).
+    p_np.add_argument(
+        "--n64lle-ref", dest="n64lle_ref", default="",
+        help="N64: branch, tag or SHA for the n64lle submodule "
+             "(default: the scaffolder's own pin)",
+    )
     p_np.add_argument(
         "--n64-slug", dest="n64_slug", default="",
         help="N64: target prefix, lowercase [a-z0-9_] (default: from the name)",
@@ -3327,6 +3405,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_bg.set_defaults(func=cmd_build_generate)
 
+    p_bfw = build_sub.add_parser(
+        "framework",
+        help="N64: build n64lle out of tree (n64lle/tools/build_framework.sh, "
+             "the shared one; falls back to the port's copy on an older pin)",
+    )
+    add_build_root(p_bfw)
+    p_bfw.add_argument(
+        "--build-type",
+        default="Release",
+        help="Config passed to build_framework.sh (Release | Debug)",
+    )
+    p_bfw.set_defaults(func=cmd_build_framework)
+
     p_bee = build_sub.add_parser(
         "ensure-emitters",
         help="Build psxrecomp-game + psxrecomp-bios (psxrecomp_cli ensure-emitters)",
@@ -3385,6 +3476,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="SNES: ROM to run (default: the one recorded for this repo)",
     )
     p_br.set_defaults(func=cmd_build_run)
+
+    p_bcp = build_sub.add_parser(
+        "check-paths",
+        help="SNES: audit (--fix: repair) runner/src references in the pinned "
+             "snesrecomp and in this port",
+    )
+    add_build_root(p_bcp)
+    p_bcp.add_argument(
+        "--fix",
+        action="store_true",
+        help="Rewrite every repairable reference in place",
+    )
+    p_bcp.add_argument(
+        "--include-docs",
+        action="store_true",
+        help="Also sweep .md prose (not part of the gate: a doc may name a "
+             "deleted file on purpose)",
+    )
+    p_bcp.set_defaults(func=cmd_build_check_paths)
 
     p_bs = build_sub.add_parser("stop", help="Stop Studio-launched process")
     p_bs.set_defaults(func=cmd_build_stop)

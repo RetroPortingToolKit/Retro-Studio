@@ -19,6 +19,7 @@ no gap to compute, and inventing one would be a check that cannot fail.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from .paths import toolkit_dir
@@ -117,15 +118,120 @@ def framework_build_dir(game_root: Path | str) -> Path:
     return Path(str(game_root)).expanduser().resolve() / FRAMEWORK_BUILD_DIR
 
 
+FRAMEWORK_OWNED_BUILD_SCRIPT = Path("n64lle") / "tools" / "build_framework.sh"
+
+
 def framework_build_script(game_root: Path | str) -> Path | None:
     """The port's own ``tools/build_framework.sh``, or None.
 
-    Scaffolded into every n64lle port (templates/build_framework.sh.in) and
-    owned by the port, exactly as SNES's tools/regen.sh is: it carries the
-    workarounds that port needs for the framework revision it is pinned to.
+    Scaffolded into every n64lle port (templates/build_framework.sh.in). It
+    USED to be owned by the port, the way SNES's tools/regen.sh is, on the
+    reasoning that it carries the workarounds that port needs for the framework
+    revision it is pinned to.
+
+    That reasoning was wrong in one direction and it was expensive. A private
+    copy per port cannot inherit a fix: -DN64LLE_RSP_CENSUS=1 reached Mario
+    Kart 64's copy on 2026-09-12 and none of the others, so seven of nine N64
+    ports harvested no RSP microcode, compiled their generated-RSP tier to
+    nothing, and ran the RSP fully interpreted with no build step saying a word.
+    The template is now a SHIM onto the framework's copy, and this function is
+    the fallback rather than the primary. See framework_owned_build_script.
     """
     p = Path(str(game_root)).expanduser().resolve() / FRAMEWORK_BUILD_SCRIPT
     return p if p.is_file() else None
+
+
+def framework_owned_build_script(game_root: Path | str) -> Path | None:
+    """The framework's own ``n64lle/tools/build_framework.sh``, or None.
+
+    Present only on ports pinned to an n64lle from 2026-09-15 or later. When it
+    is there it is the one to run: it is shared, so a fix lands once.
+    """
+    p = Path(str(game_root)).expanduser().resolve() / FRAMEWORK_OWNED_BUILD_SCRIPT
+    return p if p.is_file() else None
+
+
+def port_script_is_shim(game_root: Path | str) -> bool | None:
+    """Does the port's copy simply delegate to the framework's?
+
+    None when there is no port copy to judge. A shim is the expected state; a
+    port copy that is NOT a shim is carrying build logic that no other port can
+    inherit, which is the condition worth reporting.
+    """
+    p = framework_build_script(game_root)
+    if p is None:
+        return None
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return "n64lle/tools/build_framework.sh" in text and "exec" in text
+
+
+# What "built" means is not Studio's to define: n64lle_runtime_resolve_framework()
+# enumerates the artifacts it will FATAL_ERROR on, and that list is the contract.
+# It is read out of the port's own pinned runtime.cmake rather than copied here,
+# because it grows — libn64lle-runtime-cosim.a and -xxhash.a are both newer than
+# the first port — and a second copy would go stale in the direction that hurts:
+# reporting a tree as built that cmake then rejects.
+_RESOLVE_ARTIFACT_RE = re.compile(r'"\$\{BUILD\}/([^"\n]+)"')
+_EXE_SUFFIX_RE = re.compile(r"\$\{CMAKE_EXECUTABLE_SUFFIX\}")
+
+
+def framework_runtime_cmake(game_root: Path | str) -> Path | None:
+    """The port's pinned ``n64lle/runtime/runtime.cmake``, or None."""
+    p = Path(str(game_root)).expanduser().resolve() / "n64lle" / MARKER
+    return p if p.is_file() else None
+
+
+def framework_required_artifacts(game_root: Path | str) -> list[str]:
+    """Paths under build-n64lle/ that resolve_framework() insists exist.
+
+    Returned relative to the build dir, in the order runtime.cmake checks them,
+    so the first missing one is the one cmake would name. Empty when the file
+    cannot be read or its shape changed — callers fall back rather than treat
+    "I could not tell" as "nothing is required".
+    """
+    cmake = framework_runtime_cmake(game_root)
+    if cmake is None:
+        return []
+    try:
+        text = cmake.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    # Only what the FATAL_ERROR loop actually checks. Everything ${BUILD}-
+    # relative that comes AFTER it is output — N64LLE_ISA_INC is an include
+    # DIRECTORY, and demanding it as a file reported a complete tree as
+    # unbuilt. So the scan stops at the foreach that does the checking.
+    body = text.split("function(n64lle_runtime_resolve_framework", 1)
+    if len(body) < 2:
+        return []
+    head = body[1].split("foreach(", 1)[0]
+    out: list[str] = []
+    for raw in _RESOLVE_ARTIFACT_RE.findall(head):
+        # ${CMAKE_EXECUTABLE_SUFFIX} is empty off Windows; the caller tries the
+        # .exe spelling too, so drop the token rather than guess here.
+        rel = _EXE_SUFFIX_RE.sub("", raw).strip()
+        if rel and rel not in out:
+            out.append(rel)
+    return out
+
+
+def _artifact_present(build: Path, rel: str) -> bool:
+    p = build / rel
+    return p.is_file() or p.with_suffix(p.suffix + ".exe").is_file()
+
+
+def framework_missing_artifacts(game_root: Path | str) -> list[str]:
+    """Which of those are absent, in runtime.cmake's own order."""
+    build = framework_build_dir(game_root)
+    if not build.is_dir():
+        return framework_required_artifacts(game_root)
+    return [
+        rel
+        for rel in framework_required_artifacts(game_root)
+        if not _artifact_present(build, rel)
+    ]
 
 
 def framework_is_built(game_root: Path | str) -> bool:
@@ -134,12 +240,24 @@ def framework_is_built(game_root: Path | str) -> bool:
     Checked by artifact, not by "the directory exists": an aborted build leaves
     build-n64lle/ behind with a CMakeCache and nothing else, and treating that
     as built moves the failure into n64lle_runtime_resolve_framework().
+
+    It checks the WHOLE list, and that is the fix for a real failure rather
+    than tidiness. This used to look for n64emit alone, on the reasoning that
+    the emitter is "the last thing the framework build produces". It is not:
+    ninja builds the emitter and the runtime libraries in parallel, so a build
+    that dies compiling runtime/src/rsp/rsp.c still leaves n64emit behind. The
+    preflight then passed, configure ran, and cmake failed several files away
+    naming libn64lle-runtime-devices.a — with Studio having just reported the
+    prerequisite as satisfied.
     """
     build = framework_build_dir(game_root)
     if not build.is_dir():
         return False
-    # The emitter is the tool the generate step runs, and the last thing the
-    # framework build produces that a port cannot do without.
+    required = framework_required_artifacts(game_root)
+    if required:
+        return all(_artifact_present(build, rel) for rel in required)
+    # runtime.cmake unreadable (no submodule checkout, or its shape changed).
+    # Fall back to the emitter rather than claim either answer confidently.
     for name in ("n64emit", "n64emit.exe"):
         if list(build.rglob(name)):
             return True

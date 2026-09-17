@@ -1,35 +1,33 @@
 #!/usr/bin/env bash
-# build_framework.sh — build the pinned n64lle submodule out of tree, into
-# build-n64lle/, so @PROJECT@'s CMake can link it. Mirrors what n64lle itself
-# does with Ares.
 #
-# Runs at low priority: the family rule is that a build must not starve an
-# interactive machine.
+# SHIM. The framework build lives in n64lle and is shared by every port:
+# n64lle/tools/build_framework.sh. This file exists only so the familiar
+# tools/build_framework.sh path keeps working from a port checkout, and so a
+# port pinned to an n64lle that predates the canonical script still has one.
 #
-# ONE FRAMEWORK DEFECT IS WORKED AROUND HERE, FROM THE COMMAND LINE ONLY. It
-# does not edit the submodule, and it belongs upstream in n64lle.
-#
-#   -frounding-math on the whole tree.
-#   runtime/src/interp/fpu.c's round_mode_ll() sets the host rounding mode with
-#   fesetround() and then calls rint(). Without -frounding-math the compiler may
-#   assume round-to-nearest and fold the call, and at -O3 GCC does: n64lle's own
-#   fpu_fixture fails "ceil.w.s 2.5 -> 3" in Release and passes in Debug. That
-#   silently mis-rounds every R4300i ceil/floor/round/trunc and cvt.w/cvt.l in
-#   any optimized build. The A/B that proves it: build twice, once with this
-#   flag and once without, and run fpu_fixture.
-#
-# Usage:
-#   tools/build_framework.sh [Release|Debug]    build (default Release)
-#   tools/build_framework.sh Release --test     build, then run n64lle's suite
-
+# DO NOT ADD LOGIC HERE. A private per-port copy is what let seven of nine N64
+# ports build without -DN64LLE_RSP_CENSUS=1, which silently compiled their
+# generated-RSP tier to nothing and ran the RSP fully interpreted -- 44.2% of
+# the emulation thread on the title where it was finally noticed (2026-09-15).
+# Each copy had to be fixed by hand and none of them was. Anything that belongs
+# to the framework build belongs upstream, where the next port inherits it.
 set -euo pipefail
-
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CANON="$REPO/n64lle/tools/build_framework.sh"
+
+if [ -x "$CANON" ] || [ -f "$CANON" ]; then
+  exec env N64LLE_PORT_ROOT="$REPO" sh "$CANON" "$@"
+fi
+
+# Fallback: this port is pinned to an n64lle from before the canonical script
+# existed. Build it the old way, WITH the census flag, so the pin alone cannot
+# cost this port its RSP tier.
+echo "build_framework.sh: $REPO/n64lle has no tools/build_framework.sh;" >&2
+echo "  this port is pinned to a pre-2026-09-15 framework. Building inline." >&2
 SRC="$REPO/n64lle"
 BUILD="$REPO/build-n64lle"
 CONFIG="${1:-Release}"
 RUN_TESTS="${2:-}"
-
 if [ ! -f "$SRC/CMakeLists.txt" ]; then
   echo "n64lle submodule is empty. Run:" >&2
   echo "  git submodule update --init --recursive" >&2
@@ -40,29 +38,19 @@ if [ ! -f "$SRC/recompiler/lib/rabbitizer/include/rabbitizer.h" ]; then
   echo "  git -C n64lle submodule update --init recompiler/lib/rabbitizer" >&2
   exit 1
 fi
-
 GEN=()
 command -v ninja >/dev/null 2>&1 && GEN=(-G Ninja)
-
-# n64ref is the Ares oracle frontend. Its CMake links pre-built Ares by
-# hard-coded MinGW .obj paths and defines VK_USE_PLATFORM_WIN32_KHR, so it does
-# not configure off Windows at all. OFF here is a portability fact, not a choice
-# — and it means nothing built by this script is graded against hardware.
+CENSUS="${N64LLE_CENSUS:-1}"
+if [ "$CENSUS" = "1" ]; then CENSUS_FLAGS=" -DN64LLE_RSP_CENSUS=1"; else CENSUS_FLAGS=""; fi
 nice -n 15 cmake -S "$SRC" -B "$BUILD" "${GEN[@]}" \
   -DCMAKE_BUILD_TYPE="$CONFIG" \
   -DN64LLE_BUILD_N64REF=OFF \
-  -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -frounding-math" \
-  -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -frounding-math"
-
+  -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -frounding-math${CENSUS_FLAGS}" \
+  -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -frounding-math${CENSUS_FLAGS}"
 nice -n 15 cmake --build "$BUILD" -j "$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
-
 if [ "$RUN_TESTS" = "--test" ]; then
-  # The framework's own suite. Anchor-ROM gates SKIP (77) unless the user has
-  # staged n64lle/roms/; the Ares differential gates are absent entirely because
-  # n64ref is off. A green run here does NOT mean the whole suite ran.
   ( cd "$BUILD" && nice -n 15 ctest -j 4 --output-on-failure )
 fi
-
 echo
-echo "n64lle built into $BUILD ($CONFIG)."
-echo "Now configure this repo:  cmake -S \"$REPO\" -B \"$REPO/build\" -DCMAKE_BUILD_TYPE=$CONFIG"
+echo "n64lle built into $BUILD ($CONFIG, census=${CENSUS})."
+echo "Now configure this repo:  cmake -S \"$REPO\" -B \"$REPO/build-release\" -DCMAKE_BUILD_TYPE=$CONFIG"
