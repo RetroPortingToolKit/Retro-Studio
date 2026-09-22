@@ -3074,6 +3074,29 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     field_row("##bexe", "Exe", model.build_exe, sizeof(model.build_exe), kLabelW);
     field_row("##bargs", "Launch args", model.build_launch_args, sizeof(model.build_launch_args),
               kLabelW);
+    if (n64) {
+        left_label("Graphics", kLabelW);
+        ImGui::Checkbox("Launch with HLE graphics (experimental)##bhlegfx",
+                        &model.build_n64_hle_gfx);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Runs the frame through n64lle's HLE graphics executor instead of the\n"
+                "RSP executing the graphics microcode. Launch-time only -- it sets env\n"
+                "on the run, so it needs no rebuild and cannot change what was built:\n"
+                "  N64LLE_GFX_HLE=1  N64LLE_GFX_HLE_DRIVE=1  N64LLE_GFX_HLE_DRIVE_F3DEX2=1\n"
+                "\n"
+                "EXPERIMENTAL. The executor's vertex pipeline is byte-exact against the\n"
+                "microcode, but its triangle stream is not yet, so the picture can differ\n"
+                "from a faithful run -- n64lle KI-96 and KI-97 carry the measurements.\n"
+                "Leave it off to run the game the way it ships.");
+        }
+        left_label("", kLabelW);
+        ImGui::TextColored(model.build_n64_hle_gfx ? th.warn : th.text_muted,
+                           model.build_n64_hle_gfx
+                               ? "Experimental path: the frame is the executor's, not the RSP's."
+                               : "Off = the RSP runs the graphics microcode, as shipped.");
+    }
+
     left_label("Env", kLabelW);
     ImGui::InputTextMultiline("##benv", model.build_env, sizeof(model.build_env),
                               ImVec2(ImGui::GetContentRegionAvail().x, 100.f));
@@ -3297,9 +3320,26 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             args.push_back("--exe");
             args.push_back(model.build_exe);
         }
-        if (model.build_env[0]) {
-            args.push_back("--env");
-            args.push_back(model.build_env);
+        {
+            // The checkbox PREPENDS, and the order is the point. It never
+            // replaces the Env box -- that box is the user's, and a toggle
+            // that silently dropped a line they had typed would be the worst
+            // kind of convenience -- and going first means anything they typed
+            // still wins, because buildops' parser takes the LAST assignment
+            // of a key. So `N64LLE_GFX_HLE_DRIVE=0` in the box turns the drive
+            // back off with the checkbox still ticked, which is what someone
+            // bisecting a difference between the two paths needs.
+            std::string env;
+            if (n64 && model.build_n64_hle_gfx) {
+                env = "N64LLE_GFX_HLE=1\n"
+                      "N64LLE_GFX_HLE_DRIVE=1\n"
+                      "N64LLE_GFX_HLE_DRIVE_F3DEX2=1\n";
+            }
+            env += model.build_env;
+            if (!env.empty()) {
+                args.push_back("--env");
+                args.push_back(env);
+            }
         }
         // One --args, built here. Pushing a second one would silently win and
         // drop whatever the user typed in the Launch args field.
