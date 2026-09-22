@@ -5,6 +5,19 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# windows.h (reached through winsock2.h in studio_debug.cpp, its test, and
+# studio_snes_data.cpp) defines min and max as MACROS. One `std::min` in a TU
+# that has seen it fails as "illegal token on right side of '::'", pointing at
+# the call rather than at the header that broke it -- which is how
+# debug_client_test.cpp broke the Windows CI build and nothing else.
+#
+# Set here, once, so a TU cannot inherit the trap by adding an include. The
+# files that pull windows.h in still guard it themselves: they are vendored
+# into other repos and cannot rely on this file being the one that builds them.
+if(WIN32)
+    add_compile_definitions(NOMINMAX)
+endif()
+
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" RETCOMM_STUDIO_VERSION_FILE)
 string(STRIP "${RETCOMM_STUDIO_VERSION_FILE}" RETCOMM_STUDIO_VERSION)
 

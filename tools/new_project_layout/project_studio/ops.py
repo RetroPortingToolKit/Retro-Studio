@@ -53,10 +53,17 @@ def _run(cmd: list[str], cwd: Path, dry_run: bool) -> tuple[bool, str]:
 
 
 def _write(path: Path, text: str, dry_run: bool) -> None:
+    # newline="\n" is not a style choice. Without it, Python on Windows
+    # translates every "\n" to "\r\n" on the way out, so a scaffold or a
+    # `git install-ci` run from Windows commits a CRLF
+    # scripts/package_setup_release.sh -- which the Linux runner that CI hands
+    # it to answers with "bad interpreter: /usr/bin/env bash^M", days later, in
+    # somebody else's Actions log. These files are repository content with one
+    # correct line ending, not host text.
     if dry_run:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    path.write_text(text, encoding="utf-8", newline="\n")
 
 
 def _fill(src: Path, dst: Path, tokens: dict[str, str], dry_run: bool, *, ci: bool = False) -> None:

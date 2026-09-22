@@ -489,7 +489,9 @@ def _write_gitmodules(root: Path, cp: configparser.ConfigParser, *, dry_run: boo
             buf.append(f"\t{key} = {value}")
         buf.append("")
     text = "\n".join(buf).rstrip() + "\n"
-    (root / ".gitmodules").write_text(text, encoding="utf-8")
+    # newline="\n": tracked repository content, so it gets LF on every host
+    # rather than whatever the writing machine's os.linesep happens to be.
+    (root / ".gitmodules").write_text(text, encoding="utf-8", newline="\n")
 
 
 def _section_for_path(cp: configparser.ConfigParser, path: str) -> str | None:

@@ -329,6 +329,15 @@ def test_new_project_command(tmp: Path) -> None:
     joined = " ".join(cmd)
     for flag in ("--yes", "--rom", "--project", "--slug", "--exe", "--players", "--dir"):
         check(flag in cmd, f"sends {flag}")
+    # argv[0] is a RESOLVED shell, not the word "sh". Windows has no sh on
+    # PATH, so a literal one never reached the wizard at all; and n64lle's
+    # scaffolder is `#!/usr/bin/env bash`, so running it under a /bin/sh that
+    # is dash breaks it on Debian and Ubuntu too.
+    check(cmd[0] != "sh", "argv[0] is not the bare word sh")
+    check(Path(cmd[0]).is_absolute() and "bash" in Path(cmd[0]).name,
+          "argv[0] is the bash the host actually has")
+    check(cmd[1] == str(n64_paths.setup_script(None)),
+          "argv[1] is the scaffolder the shell is handed")
     # Flags this scaffolder does not have. An unknown option is `exit 2` there,
     # so a habitual PSX flag would kill the run before it probed the ROM.
     for flag in ("--description", "--publisher", "--year", "--region", "--zip-prefix",
@@ -395,6 +404,24 @@ def test_framework_preflight(root: Path) -> None:
     check(r is not None and not r.ok, "an unbuilt framework blocks configure")
     check(r is not None and "build_framework" in r.message,
           "and the message names the step that was skipped")
+
+    # And the script is run through a resolved shell. build_framework.sh is
+    # `#!/usr/bin/env bash`; `sh` was neither that nor anything Windows has on
+    # PATH, so the N64 Build tab's first button could not start at all there.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        port = Path(td) / "ZedRecomp"
+        (port / "tools").mkdir(parents=True)
+        (port / "n64lle" / "runtime").mkdir(parents=True)
+        (port / "n64lle" / "runtime" / "runtime.cmake").write_text("")
+        (port / "tools" / "build_framework.sh").write_text("#!/usr/bin/env bash\n")
+        d = buildops.build_n64_framework(port, config="Release", dry_run=True)
+        argv = d.message.removeprefix("dry-run: ").split()
+        check(d.ok and argv[0] != "sh", "the framework build is not run by `sh`")
+        check("bash" in Path(argv[0]).name,
+              "it is run by the bash its shebang asks for")
+        check(argv[-1] == "Release", "the build config is still the last argument")
 
 
 def test_refusals() -> None:

@@ -2307,6 +2307,11 @@ def test_new_project_command() -> None:
         check("--rollback" in cmd and "--netplay" in cmd, "rollback implies netplay in the argv")
         check("--bios" not in cmd, "the PSX BIOS field never reaches the SNES scaffolder")
         check(env.get("SNESRECOMP_SETUP_YES") == "1", "non-interactive env is set")
+        # argv[0] is a RESOLVED shell, not the word "sh": Windows has no sh on
+        # PATH, and setup_project.ps1 is only a launcher that finds Git for
+        # Windows' bash and runs this same script.
+        check(cmd[0] != "sh", "argv[0] is not the bare word sh")
+        check("bash" in Path(cmd[0]).name, "argv[0] is the bash the host actually has")
         check("BIOS" in np.snes_ignored_fields(opts), "ignored PSX fields are reported, not dropped")
 
         # The prompts the wizard grew. Studio always runs it with --yes, which

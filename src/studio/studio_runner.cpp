@@ -19,6 +19,12 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <poll.h>
+// kill() and SIGTERM, used by process_alive / process_stop. glibc hands them
+// over transitively through <sys/wait.h>, so Linux built without this line for
+// as long as it has existed; Apple's libc does not, and the macOS build failed
+// on "no member named 'kill' in the global namespace". Declared where it is
+// used rather than relied on from a neighbour.
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif

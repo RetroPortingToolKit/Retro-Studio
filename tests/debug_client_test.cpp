@@ -10,6 +10,14 @@
 // Same platform shim as studio_debug.cpp: Winsock is close enough to BSD
 // sockets that only the header, the close name and the length types differ.
 #ifdef _WIN32
+// winsock2.h drags in windows.h, which defines min/max as MACROS unless this
+// is set first -- and then `std::min(lo, e.func)` expands to `std::(...)`,
+// which MSVC reports as "illegal token on right side of '::'" several lines
+// from anything that looks wrong. Set before the include, not after: the
+// macros are defined by the header being pulled in here.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 using socklen_t = int;
@@ -23,6 +31,7 @@ using socklen_t = int;
 #define CLOSESOCK ::close
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>

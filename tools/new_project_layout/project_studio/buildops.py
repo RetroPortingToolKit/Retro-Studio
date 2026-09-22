@@ -122,8 +122,47 @@ def _clear_launch_pid() -> None:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Is `pid` still running? Asks; never signals.
+
+    ``os.kill(pid, 0)`` is the POSIX idiom and is NOT portable: on Windows
+    CPython implements os.kill as OpenProcess + TerminateProcess(handle, sig),
+    so signal 0 does not probe the process — it KILLS it, with exit code 0.
+    Every caller here is a liveness question asked on the way to something
+    else (Launch's "already running?" guard, Stop's cross-process lookup,
+    ``build status``), so on Windows the probe itself was terminating the
+    running game — or, after PID reuse, an unrelated process. Ask the kernel
+    instead, by opening a handle and asking whether it has been signalled.
+    """
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x102
+        ERROR_INVALID_PARAMETER = 87  # no such pid (as opposed to "not yours")
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = k32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            # No handle is two different answers. ERROR_INVALID_PARAMETER means
+            # there is no such process; anything else (access denied) means one
+            # exists that is not ours to open — which is the PermissionError
+            # arm below, and must not read as "dead".
+            return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
+        try:
+            # A process handle is signalled when the process EXITS, so a wait
+            # that times out immediately is a process still running. Preferred
+            # over GetExitCodeProcess because STILL_ACTIVE is 259 and a game
+            # that genuinely exits 259 would otherwise read as alive forever.
+            return k32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            k32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1008,7 +1047,7 @@ def preflight_n64_framework(root: Path) -> CmdResult | None:
         False,
         f"n64lle is not built yet — missing {_missing_summary(root)}, so "
         "n64lle_runtime_resolve_framework() would fail inside cmake. "
-        f"Run: {script.relative_to(root)} Release",
+        f"Run: bash {script.relative_to(root).as_posix()} Release",
     )
 
 
@@ -1065,7 +1104,18 @@ def build_n64_framework(
             "The n64lle submodule is not checked out. Run: "
             "git submodule update --init --recursive n64lle",
         )
-    cmd = ["sh", str(script), config]
+    # NOT ``sh``: build_framework.sh is `#!/usr/bin/env bash`, and Windows has
+    # no sh on PATH at all — the same resolution tools/regen.sh and
+    # package_release.sh already go through.
+    shell = find_bash()
+    if shell is None:
+        return CmdResult(
+            False,
+            "No POSIX shell found to run build_framework.sh. On Windows "
+            "install Git for Windows (it ships bash.exe); on Linux/macOS put "
+            "bash on PATH.",
+        )
+    cmd = [shell, str(script), config]
     # The shared script writes build-n64lle/ under the PORT, not under n64lle.
     env = dict(os.environ)
     env["N64LLE_PORT_ROOT"] = str(root)

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from . import n64_paths, platforms, snes_paths
 from .gitops import CmdResult, switch_modules
-from .paths import toolkit_dir
+from .paths import find_bash, toolkit_dir
 
 # Upper bound on a PSX disc set. Four covers every PS1 release we know of; the
 # setup scripts have no limit of their own, so this is the one place that
@@ -119,6 +119,33 @@ def setup_script_paths() -> tuple[Path, Path]:
     """Return (setup_project.sh, setup_project.ps1) under the toolkit."""
     base = toolkit_dir()
     return base / "setup_project.sh", base / "setup_project.ps1"
+
+
+def wizard_shell_argv(script: Path, *, framework: str) -> list[str]:
+    """``[shell, script]`` for a cartridge wizard's setup_project.sh.
+
+    NOT a literal ``sh``, and for two reasons that both bite.
+
+    Windows has no ``sh`` on PATH, so ``["sh", …]`` is a FileNotFoundError
+    before the wizard is reached. The console's own setup_project.ps1 is not a
+    second scaffolder to drive instead -- read its header: it finds the bash
+    that Git for Windows ships and runs THIS script with the same arguments.
+    Resolving that bash here is the same run without the extra hop, and it is
+    already what the toolkit does for every other .sh it drives (regen.sh,
+    package_release.sh, build_framework.sh) via paths.find_bash.
+
+    And off Windows, n64lle's wizard is ``#!/usr/bin/env bash``: ``sh`` runs it
+    under whatever /bin/sh is, which on a Debian or Ubuntu host is dash. The
+    shebang is the script's own statement of what it needs, so honour it.
+    """
+    shell = find_bash()
+    if shell is None:
+        raise FileNotFoundError(
+            f"No POSIX shell found to run {framework}'s setup_project.sh. "
+            "On Windows install Git for Windows (it ships bash.exe); on "
+            "Linux/macOS put bash on PATH."
+        )
+    return [shell, str(script)]
 
 
 def is_windows() -> bool:
@@ -366,8 +393,7 @@ def build_snes_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, st
     # every console in build_command(); it used to be here, alone.
 
     cmd: list[str] = [
-        "sh",
-        str(script),
+        *wizard_shell_argv(script, framework="snesrecomp"),
         "--yes",
         "--rom",
         str(Path(opts.disc).expanduser().resolve()),
@@ -459,8 +485,7 @@ def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str
     env = os.environ.copy()
 
     cmd: list[str] = [
-        "sh",
-        str(script),
+        *wizard_shell_argv(script, framework="n64lle"),
         "--yes",
         "--rom",
         str(Path(opts.disc).expanduser().resolve()),
@@ -857,13 +882,19 @@ def run_new_project(
             str(root),
         )
 
-    # Optional nested rbengine (and net on Windows, where script has no ref flag)
+    # Optional nested rbengine (and net where the entry point has no ref flag)
     post_notes: list[str] = []
     if root.is_dir():
         nested_branches: dict[str, str] = {}
         net = (opts.recomp_net_ref or "").strip()
         rb = (opts.rbengine_ref or "").strip()
-        if net and is_windows():
+        # This compensates for ONE entry point, not for an OS: psxrecomp's
+        # setup_project.ps1 declares no -RecompNetRef, so on Windows the PSX
+        # scaffold has to be told afterwards. The cartridge wizards are driven
+        # through their own setup_project.sh on every host (wizard_shell_argv),
+        # so the flag they take is the flag that was sent, and re-switching a
+        # module they may not even have would be a failed op for no reason.
+        if net and is_windows() and not (is_snes(opts) or is_n64(opts)):
             nested_branches["lib/recomp-net"] = net
         if rb:
             nested_branches["lib/retcomm-rbengine"] = rb

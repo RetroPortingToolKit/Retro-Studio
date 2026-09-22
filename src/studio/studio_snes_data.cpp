@@ -17,6 +17,11 @@
 #include <sstream>
 
 #ifdef _WIN32
+// windows.h arrives through winsock2.h and defines min/max as macros — see
+// the NOMINMAX note in CMakeLists.txt.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 using socklen_t = int;
