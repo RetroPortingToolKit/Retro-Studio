@@ -773,6 +773,91 @@ def _build_command_for_platform(
     return cmd, env
 
 
+
+KEEP_FAILED_ENV = "RETCOMM_KEEP_FAILED_SCAFFOLD"
+
+
+def discard_failed_scaffold(
+    root: Path,
+    opts: NewProjectOptions,
+    *,
+    existed_before: bool,
+    reason: str,
+    on_line: Callable[[str], None] | None = None,
+) -> str:
+    """Remove the half-written project a failed scaffold left behind.
+
+    A scaffold that dies partway through leaves a directory that LOOKS like a
+    project and is not one: submodules half-cloned, no game.toml, sometimes no
+    commit. The next run then refuses it ("Destination already exists") and the
+    user has to work out which of their repos is real before they can retry.
+    Worse, an audit or a bulk sweep will happily pick it up.
+
+    So the rule is the one the wizard itself implies: a run that does not
+    finish produces nothing. Only ever the directory THIS run created, and only
+    when validate_options had already established it was absent or empty -- a
+    directory the user had already put something in is never ours to remove.
+
+    shutil.rmtree does not follow directory symlinks, and roms/<dump> is
+    usually a symlink to the user's own file. That is the whole reason this is
+    rmtree and not a walk: the link is unlinked, the dump it points at is not
+    touched. Checked, not assumed -- it is the difference between cleaning up
+    and deleting somebody's ROM library.
+
+    Returns a note for the caller's detail, or "" when nothing was removed.
+    """
+    if os.environ.get(KEEP_FAILED_ENV, "").strip() not in ("", "0"):
+        note = f"kept {root} for inspection ({KEEP_FAILED_ENV} is set)"
+        if on_line:
+            on_line(f"note: {note}")
+        return note
+    try:
+        target = root.expanduser().resolve()
+    except OSError:
+        return ""
+    if not target.is_dir():
+        return ""
+    # Never above the parent the user chose, and never the parent itself.
+    try:
+        parent = Path(opts.parent_dir or ".").expanduser().resolve()
+    except OSError:
+        return ""
+    if target == parent or parent not in target.parents:
+        return f"refused to remove {target}: it is not inside {parent}"
+
+    notes: list[str] = []
+    try:
+        if existed_before:
+            # The directory was there and empty before this run, so the
+            # contents are ours and the directory is not.
+            for child in target.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+            notes.append(f"emptied {target} ({reason})")
+        else:
+            shutil.rmtree(target, ignore_errors=True)
+            notes.append(f"removed {target} ({reason})")
+    except OSError as exc:
+        return f"could not remove {target}: {exc}"
+
+    if target.exists() and not existed_before:
+        notes.append(f"note: {target} is still present — remove it by hand")
+    if opts.create_github:
+        # The local tree is gone; a repo the wizard may already have created
+        # on GitHub is not, and deleting someone's remote is not a cleanup
+        # step Studio gets to take on its own.
+        notes.append(
+            "a GitHub repository may already have been created for this "
+            "project — the local tree was removed, the remote was not"
+        )
+    for n in notes:
+        if on_line:
+            on_line(f"cleanup: {n}")
+    return "; ".join(notes)
+
+
 def run_new_project(
     opts: NewProjectOptions,
     *,
@@ -851,6 +936,12 @@ def run_new_project(
     if on_line:
         on_line(f"$ {' '.join(cmd)}")
 
+    # Recorded BEFORE the wizard runs, because afterwards there is no way to
+    # tell a directory this run created from one that was already there.
+    # validate_options has established it is absent or empty by this point.
+    dest = project_root_for(opts)
+    dest_existed = dest.is_dir()
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -869,18 +960,30 @@ def run_new_project(
     for line in proc.stdout:
         if cancel_event is not None and cancel_event.is_set():
             proc.terminate()
-            return CmdResult(False, "New project cancelled")
+            proc.wait()
+            note = discard_failed_scaffold(
+                dest, opts, existed_before=dest_existed,
+                reason="cancelled", on_line=on_line,
+            )
+            return CmdResult(False, "New project cancelled", note)
         text = line.rstrip("\n")
         if on_line:
             on_line(text)
     code = proc.wait()
     root = project_root_for(opts)
     if code != 0:
-        return CmdResult(
-            False,
-            f"setup_project failed (exit {code})",
-            str(root),
+        # A scaffold that failed produces nothing. The failure itself is in the
+        # Activity log above, which is where it is read from -- what is NOT
+        # wanted is a directory that looks like a project and is not one, which
+        # the next attempt then refuses as "Destination already exists".
+        note = discard_failed_scaffold(
+            root, opts, existed_before=dest_existed,
+            reason=f"setup_project exit {code}", on_line=on_line,
         )
+        detail = str(root)
+        if note:
+            detail += "\n" + note
+        return CmdResult(False, f"setup_project failed (exit {code})", detail)
 
     # Optional nested rbengine (and net where the entry point has no ref flag)
     post_notes: list[str] = []

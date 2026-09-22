@@ -27,6 +27,7 @@ Run:  python3 tests/n64_platform_test.py
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -424,6 +425,69 @@ def test_framework_preflight(root: Path) -> None:
         check(argv[-1] == "Release", "the build config is still the last argument")
 
 
+def test_failed_scaffold_is_discarded(tmp: Path) -> None:
+    """A scaffold that does not finish leaves nothing behind.
+
+    The failure that prompted this was an n64lle compile error partway through
+    `--generate`: the wizard exited 1 having already laid out the repo and
+    cloned submodules, and MarioPartyRecomp/ stayed on disk looking like a
+    project. The next attempt then refused it as "Destination already exists".
+    """
+    print("failed scaffold cleanup")
+    from project_studio import newproject as npj
+
+    platforms.set_current("n64")
+    parent = tmp / "src"
+    parent.mkdir(exist_ok=True)
+    # The user's own dump, OUTSIDE the project. The scaffolder symlinks it into
+    # roms/, so cleanup that followed links would eat the library it came from.
+    rom = tmp / "library" / "Zed Adventure (USA).z64"
+    rom.parent.mkdir(exist_ok=True)
+    rom.write_bytes(b"\x80\x37\x12\x40" + b"\0" * 64)
+
+    opts = npj.NewProjectOptions(
+        platform="n64", name="Zed Adventure", disc=str(rom),
+        parent_dir=str(parent), players=2,
+    )
+    dest = npj.project_root_for(opts)
+
+    real_build_command = npj.build_command
+
+    def half_finished_wizard(_opts):
+        """Stand in for a wizard that lays the repo out and then dies."""
+        script = (
+            f"import os,sys;"
+            f"os.makedirs(r'{dest}/roms', exist_ok=True);"
+            f"os.symlink(r'{rom}', r'{dest}/roms/{rom.name}');"
+            f"open(r'{dest}/game.toml','w').write('partial');"
+            f"sys.exit(1)"
+        )
+        return [sys.executable, "-c", script], dict(os.environ)
+
+    npj.build_command = half_finished_wizard
+    try:
+        r = npj.run_new_project(opts)
+    finally:
+        npj.build_command = real_build_command
+
+    check(not r.ok, "a wizard that exits non-zero is a failure")
+    check(not dest.exists(), "and the half-written project is gone")
+    check("removed" in (r.detail or ""), "the cleanup is reported, not silent")
+    check(rom.is_file() and rom.stat().st_size == 68,
+          "the dump the symlink pointed at is untouched")
+
+    # The escape hatch, for anyone debugging the scaffolder itself.
+    os.environ["RETCOMM_KEEP_FAILED_SCAFFOLD"] = "1"
+    npj.build_command = half_finished_wizard
+    try:
+        r = npj.run_new_project(opts)
+    finally:
+        npj.build_command = real_build_command
+        del os.environ["RETCOMM_KEEP_FAILED_SCAFFOLD"]
+    check(dest.is_dir(), f"{npj.KEEP_FAILED_ENV} keeps the tree for inspection")
+    shutil.rmtree(dest)
+
+
 def test_refusals() -> None:
     """Dead ends refuse at the question, with a reason."""
     print("CLI refusals")
@@ -463,6 +527,7 @@ def main() -> int:
         test_audit_plan_apply(root)
         test_refuses_unresolved_tokens(tmp)
         test_new_project_command(tmp)
+        test_failed_scaffold_is_discarded(tmp)
         test_refusals()
     print("FAILED" if failures else "PASSED")
     return 1 if failures else 0
