@@ -3077,25 +3077,25 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
               kLabelW);
     if (n64) {
         left_label("Graphics", kLabelW);
-        ImGui::Checkbox("Launch with HLE graphics (experimental)##bhlegfx",
-                        &model.build_n64_hle_gfx);
+        ImGui::Checkbox("Disable HLE graphics (force LLE)##blle",
+                        &model.build_n64_force_lle);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                "Runs the frame through n64lle's HLE graphics executor instead of the\n"
-                "RSP executing the graphics microcode. Launch-time only -- it sets env\n"
-                "on the run, so it needs no rebuild and cannot change what was built:\n"
-                "  N64LLE_GFX_HLE=1  N64LLE_GFX_HLE_DRIVE=1  N64LLE_GFX_HLE_DRIVE_F3DEX2=1\n"
+                "Switches n64lle's HLE graphics executor off, so the RSP executes the\n"
+                "graphics microcode instead. Launch-time only -- it sets env on the\n"
+                "run, so it needs no rebuild and cannot change what was built:\n"
+                "  N64LLE_GFX_HLE=0  N64LLE_GFX_HLE_DRIVE=0  N64LLE_GFX_HLE_DRIVE_F3DEX2=0\n"
                 "\n"
-                "EXPERIMENTAL. The executor's vertex pipeline is byte-exact against the\n"
-                "microcode, but its triangle stream is not yet, so the picture can differ\n"
-                "from a faithful run -- n64lle KI-96 and KI-97 carry the measurements.\n"
-                "Leave it off to run the game the way it ships.");
+                "HLE is the default: the title's game.toml `[runtime] hle_tier` turns it\n"
+                "on, and the environment overrides it per knob. Tick this to get the\n"
+                "LLE frame to compare against when the executor's picture is in doubt.\n"
+                "With hle_tier = false the run is already LLE and this changes nothing.");
         }
         left_label("", kLabelW);
-        ImGui::TextColored(model.build_n64_hle_gfx ? th.warn : th.text_muted,
-                           model.build_n64_hle_gfx
-                               ? "Experimental path: the frame is the executor's, not the RSP's."
-                               : "Off = the RSP runs the graphics microcode, as shipped.");
+        ImGui::TextColored(model.build_n64_force_lle ? th.warn : th.text_muted,
+                           model.build_n64_force_lle
+                               ? "LLE: the RSP runs the graphics microcode (slower)."
+                               : "Off = game.toml's hle_tier decides (HLE by default).");
     }
 
     left_label("Env", kLabelW);
@@ -3327,14 +3327,14 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             // that silently dropped a line they had typed would be the worst
             // kind of convenience -- and going first means anything they typed
             // still wins, because buildops' parser takes the LAST assignment
-            // of a key. So `N64LLE_GFX_HLE_DRIVE=0` in the box turns the drive
-            // back off with the checkbox still ticked, which is what someone
+            // of a key. So `N64LLE_GFX_HLE_DRIVE=1` in the box turns the drive
+            // back on with the checkbox still ticked, which is what someone
             // bisecting a difference between the two paths needs.
             std::string env;
-            if (n64 && model.build_n64_hle_gfx) {
-                env = "N64LLE_GFX_HLE=1\n"
-                      "N64LLE_GFX_HLE_DRIVE=1\n"
-                      "N64LLE_GFX_HLE_DRIVE_F3DEX2=1\n";
+            if (n64 && model.build_n64_force_lle) {
+                env = "N64LLE_GFX_HLE=0\n"
+                      "N64LLE_GFX_HLE_DRIVE=0\n"
+                      "N64LLE_GFX_HLE_DRIVE_F3DEX2=0\n";
             }
             env += model.build_env;
             if (!env.empty()) {

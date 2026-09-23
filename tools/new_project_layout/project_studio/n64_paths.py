@@ -3,9 +3,16 @@
 The N64 counterpart to :mod:`snes_paths`, and the search order is the same for
 the same reason: a migration is measured against the framework revision the
 port is actually pinned to, so the project's own ``n64lle/`` submodule outranks
-anything Studio ships. The vendored copy under the toolkit is a last resort
-that only exists so a packaged install can scaffold a *new* project with no
-checkout on disk.
+a checkout found anywhere else.
+
+UNLIKE snes_paths, THERE IS NO VENDORED FALLBACK. Studio used to ship a copy of
+n64lle's ``tools/new_project/`` for a packaged install with no checkout on
+disk, and the copy went stale in the way that matters: n64lle made the HLE
+graphics tier the default (``hle_tier = true``) while the copy still scaffolded
+``false``, so a project cut from it started on the LLE path with nothing saying
+so. A scaffold that cannot inherit a fix is the failure this repo keeps paying
+for (see framework_build_script below), so with no checkout the answer is None
+and every caller says so -- see MISSING_CHECKOUT.
 
 WHAT IS DELIBERATELY NOT HERE. snes_paths carries a second half — "can the
 snesrecomp this port is pinned to run the tools/regen.sh that wizard emits" —
@@ -44,11 +51,11 @@ def _env_root() -> Path | None:
     return p if _is_framework(p) else None
 
 
-def n64lle_root(game_root: Path | str | None = None) -> Path | None:
-    """A real n64lle checkout, or None."""
+def _candidates(game_root: Path | str | None):
+    """Every n64lle checkout Studio may use, in precedence order."""
     env = _env_root()
     if env is not None:
-        return env
+        yield env
     if game_root:
         root = Path(str(game_root)).expanduser()
         try:
@@ -57,47 +64,61 @@ def n64lle_root(game_root: Path | str | None = None) -> Path | None:
             pass
         for cand in (root / "n64lle", root):
             if _is_framework(cand):
-                return cand
+                yield cand
     # …/retcomm-studio/tools/new_project_layout → …/GitHub/n64lle
     base = toolkit_dir()
     for parent in (base.parent.parent, base.parent.parent.parent):
         cand = parent / "n64lle"
         if _is_framework(cand):
-            return cand.resolve()
-    return None
+            yield cand.resolve()
 
 
-def vendored_wizard_dir() -> Path:
-    """The copy shipped with Studio (see n64/VENDOR.md)."""
-    return toolkit_dir() / "n64"
+def n64lle_root(game_root: Path | str | None = None) -> Path | None:
+    """A real n64lle checkout, or None."""
+    return next(_candidates(game_root), None)
 
 
-def wizard_dir(game_root: Path | str | None = None) -> Path:
-    """Directory holding setup_project.sh / probe_rom.py / templates/."""
-    root = n64lle_root(game_root)
-    if root is not None:
+MISSING_CHECKOUT = (
+    "no n64lle checkout found -- Studio drives n64lle's own tools/new_project/, "
+    "and ships no copy of it. Set N64LLE_ROOT to an n64lle checkout, or clone "
+    "n64lle beside retcomm-studio."
+)
+
+
+def wizard_dir(game_root: Path | str | None = None) -> Path | None:
+    """n64lle's ``tools/new_project/`` (setup_project.sh / probe_rom.py /
+    templates/), or None when there is no checkout to take it from."""
+    # The first checkout that HAS one. A port pinned to an n64lle older than
+    # tools/new_project/ is still a framework, but it has no wizard to drive,
+    # so the next checkout down answers rather than nothing.
+    for root in _candidates(game_root):
         live = root / _WIZARD_REL
         if (live / "setup_project.sh").is_file():
             return live
-    return vendored_wizard_dir()
+    return None
 
 
 def wizard_source(game_root: Path | str | None = None) -> str:
-    """Human-readable provenance for the log — which copy is being driven."""
+    """Human-readable provenance for the log — which checkout is being driven."""
     d = wizard_dir(game_root)
-    return "vendored" if d == vendored_wizard_dir() else f"checkout {d}"
+    return f"checkout {d}" if d is not None else "none (no n64lle checkout)"
 
 
-def templates_dir(game_root: Path | str | None = None) -> Path:
-    return wizard_dir(game_root) / "templates"
+def _in_wizard(game_root: Path | str | None, rel: str) -> Path | None:
+    d = wizard_dir(game_root)
+    return d / rel if d is not None else None
 
 
-def setup_script(game_root: Path | str | None = None) -> Path:
-    return wizard_dir(game_root) / "setup_project.sh"
+def templates_dir(game_root: Path | str | None = None) -> Path | None:
+    return _in_wizard(game_root, "templates")
 
 
-def probe_rom_script(game_root: Path | str | None = None) -> Path:
-    return wizard_dir(game_root) / "probe_rom.py"
+def setup_script(game_root: Path | str | None = None) -> Path | None:
+    return _in_wizard(game_root, "setup_project.sh")
+
+
+def probe_rom_script(game_root: Path | str | None = None) -> Path | None:
+    return _in_wizard(game_root, "probe_rom.py")
 
 
 # ---------------------------------------------------------------------------

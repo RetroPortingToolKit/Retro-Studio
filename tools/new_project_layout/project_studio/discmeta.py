@@ -552,8 +552,9 @@ def lookup_rom(
         hit.region = cat.get("region") or ""
         hit.notes.append("catalog: matched by ROM digest")
 
-    fetcher = snes_paths.wizard_dir(None) / "fetch_metadata.py"
-    if fetcher.is_file():
+    wizard = snes_paths.wizard_dir(None)
+    fetcher = wizard / "fetch_metadata.py" if wizard is not None else None
+    if fetcher is not None and fetcher.is_file():
         try:
             spec = importlib.util.spec_from_file_location("snes_fetch_metadata", fetcher)
             mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]

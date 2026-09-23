@@ -514,6 +514,14 @@ def test_refusals() -> None:
 def main() -> int:
     import tempfile
 
+    # The migration and New Project checks render n64lle's own wizard
+    # templates. Without a checkout they fail one by one, far from the cause;
+    # say it once.
+    from project_studio import n64_paths
+    if n64_paths.wizard_dir(None) is None:
+        print(f"error: {n64_paths.MISSING_CHECKOUT}", file=sys.stderr)
+        return 1
+
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         root = tmp / "ZedRecomp"

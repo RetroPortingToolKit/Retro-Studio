@@ -1050,17 +1050,16 @@ struct StudioModel {
     // Deliberately not a compile-time split — PRINCIPLES.md requires the
     // faithful floor to stay forceable in the shipped binary.
     int  build_exec_mode = 0;
-    // N64 only: launch with n64lle's HLE graphics executor driving the RDP
-    // instead of the RSP running the graphics microcode. Injected as env on
+    // N64 only: launch with n64lle's HLE graphics executor switched OFF, so
+    // the RSP runs the graphics microcode (the LLE path). Injected as env on
     // Launch, so it needs no rebuild and cannot change what was built.
     //
-    // NOT a default, and deliberately labelled experimental in the UI: the
-    // executor is byte-exact per vertex but its triangle stream is not yet
-    // (n64lle KI-96/KI-97), so a driven frame can differ from the faithful
-    // one. The third variable is what lets it take F3DEX2 titles at all --
-    // without it the drive path refuses any microcode outside its allowlist,
-    // which is the guard KI-95 exists for.
-    bool build_n64_hle_gfx = false;
+    // HLE is the default now: n64lle resolves the tier from the title's
+    // `[runtime] hle_tier`, and the scaffold ships it true. The environment
+    // wins per knob (host_core_config.c), so zeroing all three knobs forces
+    // LLE for one run whatever game.toml declares. That is the reference to
+    // compare against when the executor's frame is in doubt.
+    bool build_n64_force_lle = false;
     char build_env[4096] =
         "# KEY=VALUE pairs (space or newline separated)\n"
         "# Example:\n"

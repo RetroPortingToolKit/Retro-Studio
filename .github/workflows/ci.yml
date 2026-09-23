@@ -35,10 +35,19 @@ jobs:
     name: windows-x64 (MSVC)
     runs-on: windows-2022
     env:
+      SNESRECOMP_ROOT: ${{ github.workspace }}/.ci/snesrecomp
       RETCOMM_VCPKG: ${{ github.workspace }}/retcomm-vcpkg
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-cache
     steps:
       - uses: actions/checkout@v4
+
+      # snes_platform_test drives snesrecomp's own tools/new_project/. Studio
+      # ships no copy of it any more (a vendored copy cannot inherit a fix), so
+      # the job checks out the framework beside the tree and names it.
+      - uses: actions/checkout@v4
+        with:
+          repository: RetroPortingToolKit/snesrecomp
+          path: .ci/snesrecomp
 
       - uses: actions/setup-python@v5
         with:
@@ -129,8 +138,18 @@ jobs:
   linux:
     name: linux-x64 (gcc)
     runs-on: ubuntu-22.04
+    env:
+      SNESRECOMP_ROOT: ${{ github.workspace }}/.ci/snesrecomp
     steps:
       - uses: actions/checkout@v4
+
+      # snes_platform_test drives snesrecomp's own tools/new_project/. Studio
+      # ships no copy of it any more (a vendored copy cannot inherit a fix), so
+      # the job checks out the framework beside the tree and names it.
+      - uses: actions/checkout@v4
+        with:
+          repository: RetroPortingToolKit/snesrecomp
+          path: .ci/snesrecomp
 
       - uses: actions/setup-python@v5
         with:

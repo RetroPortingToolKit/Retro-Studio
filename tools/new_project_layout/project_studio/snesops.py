@@ -151,6 +151,8 @@ _IDENTITY_OPS: dict[str, str] = {
 def identity_layout(game_root: Path | str | None = None) -> str:
     """``"file"``, ``"codegen"``, or ``""`` when the wizard offers neither."""
     tdir = snes_paths.templates_dir(game_root)
+    if tdir is None:
+        return ""
     if (tdir / "rom_identity.txt.in").is_file():
         return "file"
     if (tdir / "codegen_setup.c.in").is_file():
@@ -319,7 +321,7 @@ def rom_identity(root: Path, rom: str | None = None) -> dict[str, str]:
     if rom:
         probe = snes_paths.probe_rom_script(root)
         rom_path = Path(rom).expanduser()
-        if probe.is_file() and rom_path.is_file():
+        if probe is not None and probe.is_file() and rom_path.is_file():
             code, text = _run_probe(probe, rom_path)
             if code == 0 and text:
                 import json
@@ -804,10 +806,13 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
 
     # --- which wizard is being driven ----------------------------------------
     # Provenance, because every emitted file inherits it. Silent until now, and
-    # a fallback to the vendored copy is precisely what lets Studio write files
+    # a fallback to another checkout is precisely what lets Studio write files
     # the port's own framework has never heard of.
     own_wizard = root / FRAMEWORK / "tools" / "new_project" / "setup_project.sh"
-    if not own_wizard.is_file():
+    if snes_paths.wizard_dir(root) is None:
+        add("wizard_source", "Scaffold templates in use", CheckStatus.WARN,
+            Severity.INFO, snes_paths.MISSING_CHECKOUT)
+    elif not own_wizard.is_file():
         add("wizard_source", "Scaffold templates in use", CheckStatus.WARN,
             Severity.INFO,
             f"{FRAMEWORK}/tools/new_project is absent, so Studio is driving "
@@ -841,7 +846,7 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
         # beats emitting a FAIL whose fix op would die on a missing template.
         add("identity_carrier", "ROM identity carrier", CheckStatus.WARN,
             Severity.REQUIRED,
-            f"{snes_paths.templates_dir(root)} has neither rom_identity.txt.in "
+            f"{snes_paths.templates_label(root)} has neither rom_identity.txt.in "
             "nor codegen_setup.c.in — cannot tell which carrier this framework "
             "revision wants.")
     else:
@@ -1371,7 +1376,10 @@ def _scaffolder_game_id(root: Path, ident: dict[str, str]) -> tuple[str, str]:
         return "", ""
     import sys as _sys
 
-    wizard = str(snes_paths.wizard_dir(root))
+    wizard_path = snes_paths.wizard_dir(root)
+    if wizard_path is None:
+        return "", ""
+    wizard = str(wizard_path)
     added = wizard not in _sys.path
     if added:
         _sys.path.insert(0, wizard)
@@ -1452,7 +1460,10 @@ def _render(text: str, values: dict[str, str]) -> tuple[str, list[str]]:
 def _fill_template(
     root: Path, opts: MigrateOptions, op: str, template: str, rel: str
 ) -> ApplyResult:
-    src = snes_paths.templates_dir(root) / template
+    tdir = snes_paths.templates_dir(root)
+    if tdir is None:
+        return ApplyResult(op, False, snes_paths.MISSING_CHECKOUT)
+    src = tdir / template
     if not src.is_file():
         return ApplyResult(op, False, f"Template not found: {src}")
     dst = root / rel
@@ -1552,10 +1563,13 @@ def _rendered_regen_template(root: Path, opts: MigrateOptions) -> str:
 
     Rendered, not raw: the comparison is against the file that would actually
     replace the port's, and against the template generation this port's own
-    framework checkout carries — the vendored copy is a different vintage and
+    framework checkout carries — another checkout is a different vintage and
     diffing against it invents losses that are not there.
     """
-    src = snes_paths.templates_dir(root) / "regen.sh.in"
+    tdir = snes_paths.templates_dir(root)
+    if tdir is None:
+        return ""
+    src = tdir / "regen.sh.in"
     if not src.is_file():
         return ""
     try:
@@ -1601,7 +1615,7 @@ def regen_adoption_report(
     rendered = _rendered_regen_template(root, opts)
     if not rendered:
         return RegenAdoption("port", blocker=(
-            f"no regen.sh.in in {snes_paths.templates_dir(root)} — there is no "
+            f"no regen.sh.in in {snes_paths.templates_label(root)} — there is no "
             "framework script to adopt"
         ))
     lost, notes = snes_paths.regen_capability_delta(existing, rendered)
@@ -1816,8 +1830,9 @@ def _fill_regen(root: Path, opts: MigrateOptions, op: str) -> ApplyResult:
                 "it would drop whatever it adds; re-emit deliberately with "
                 "Emit tools/regen.sh if that is really what you want.",
             )
-    src = snes_paths.templates_dir(root) / "regen.sh.in"
-    if src.is_file():
+    tdir = snes_paths.templates_dir(root)
+    src = tdir / "regen.sh.in" if tdir is not None else None
+    if src is not None and src.is_file():
         try:
             rendered, _ = _render(src.read_text(encoding="utf-8"),
                                   _template_values(root, opts))
@@ -2545,7 +2560,7 @@ def _emit_identity(root: Path, opts: MigrateOptions, op: str) -> ApplyResult:
     if not carriers:
         return ApplyResult(
             op, False,
-            f"No identity template in {snes_paths.templates_dir(root)} — "
+            f"No identity template in {snes_paths.templates_label(root)} — "
             "neither rom_identity.txt.in nor codegen_setup.c.in")
     results = [_fill_template(root, opts, op, tpl, rel) for tpl, rel in carriers]
     changed = [pth for r in results for pth in r.changed_paths]
@@ -2579,7 +2594,7 @@ def _op_probe_rom_refresh(root: Path, opts: MigrateOptions) -> ApplyResult:
     if not carriers:
         return ApplyResult(
             op, False,
-            f"No identity template in {snes_paths.templates_dir(root)} — "
+            f"No identity template in {snes_paths.templates_label(root)} — "
             "neither rom_identity.txt.in nor codegen_setup.c.in")
     results = [_fill_template(root, forced, op, tpl, rel) for tpl, rel in carriers]
     results.append(_fill_regen(root, forced, op))

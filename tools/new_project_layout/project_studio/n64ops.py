@@ -880,8 +880,9 @@ def build_framework_option_drift(root: Path, opts: MigrateOptions) -> list[str]:
     # -DN64LLE_RSP_CENSUS=1 went missing from seven ports without this check
     # ever having anything to compare against.
     canon = n64_paths.framework_owned_build_script(root)
+    tdir = n64_paths.templates_dir(root)
     src = canon if canon is not None else (
-        n64_paths.templates_dir(root) / "build_framework.sh.in")
+        tdir / "build_framework.sh.in" if tdir is not None else None)
     if src is None or not Path(src).is_file():
         return []
     try:
@@ -1033,7 +1034,10 @@ def _template_values(root: Path, opts: MigrateOptions) -> dict[str, str]:
 def _fill_template(
     root: Path, opts: MigrateOptions, op: str, template: str, rel: str
 ) -> ApplyResult:
-    src = n64_paths.templates_dir(root) / template
+    tdir = n64_paths.templates_dir(root)
+    if tdir is None:
+        return ApplyResult(op, False, n64_paths.MISSING_CHECKOUT)
+    src = tdir / template
     if not src.is_file():
         return ApplyResult(op, False, f"Template not found: {src}")
     dst = root / rel

@@ -696,6 +696,9 @@ def _probe_rom_n64(args: argparse.Namespace) -> int:
         print(f"error: ROM not found: {rom}", file=sys.stderr)
         return 2
     probe = n64_paths.probe_rom_script(getattr(args, "root", None) or None)
+    if probe is None:
+        print(f"error: {n64_paths.MISSING_CHECKOUT}", file=sys.stderr)
+        return 2
     if not probe.is_file():
         print(f"error: probe_rom.py not found ({probe})", file=sys.stderr)
         return 2
@@ -776,6 +779,9 @@ def cmd_probe_rom(args: argparse.Namespace) -> int:
         print(f"error: ROM not found: {rom}", file=sys.stderr)
         return 2
     probe = snes_paths.probe_rom_script(getattr(args, "root", None) or None)
+    if probe is None:
+        print(f"error: {snes_paths.MISSING_CHECKOUT}", file=sys.stderr)
+        return 2
     if not probe.is_file():
         print(f"error: probe_rom.py not found ({probe})", file=sys.stderr)
         return 2

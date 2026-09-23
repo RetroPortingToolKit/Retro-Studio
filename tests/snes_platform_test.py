@@ -402,7 +402,7 @@ def test_probe_rom(root: Path) -> None:
     from project_studio import snes_paths, snesops
 
     probe = snes_paths.probe_rom_script(root)
-    if not probe.is_file():
+    if probe is None or not probe.is_file():
         print("  skip  no probe_rom.py available")
         return
     # A minimal LoROM image the probe can read: 32 KiB with a header at $7FC0.
@@ -870,8 +870,8 @@ def test_regen_framework_skew() -> None:
 
     This is the defect behind the Generate failure, not just its symptom. A
     fork carries whatever snesrecomp gitlink its parent recorded; Studio drives
-    whichever wizard it can find, which on such a fork is a sibling or the
-    vendored copy. Emitting that wizard's regen.sh into the fork bakes in calls
+    whichever wizard it can find, which on such a fork is a sibling checkout.
+    Emitting that wizard's regen.sh into the fork bakes in calls
     the pinned CLI has never heard of, and nothing notices until somebody
     presses Generate. Refusing to write the file is the fix — writing it anyway
     only moves the failure somewhere less legible.
@@ -879,7 +879,15 @@ def test_regen_framework_skew() -> None:
     print("regen.sh vs pinned framework")
     from project_studio import buildops, snes_paths, snesops
 
+    # regen.sh honours $SNESRECOMP_ROOT, so it has to be unset for the fork's
+    # own pinned framework to be the one measured. But the WIZARD still has to
+    # come from somewhere else -- that is the scenario -- and on CI the only
+    # checkout is the one that variable names. So the wizard lookup keeps
+    # seeing it while regen.sh's rule does not.
     prev = os.environ.get("SNESRECOMP_ROOT")
+    wizard_env = snes_paths._env_root()
+    real_env_root = snes_paths._env_root
+    snes_paths._env_root = lambda: wizard_env
     os.environ.pop("SNESRECOMP_ROOT", None)
     try:
         # Read out of the script's own call sites: prose naming a command is
@@ -941,6 +949,7 @@ def test_regen_framework_skew() -> None:
             check(ok_ids["regen_framework"].status.value == "pass",
                   "and the audit row passes")
     finally:
+        snes_paths._env_root = real_env_root
         if prev is not None:
             os.environ["SNESRECOMP_ROOT"] = prev
 
@@ -2033,7 +2042,8 @@ def test_probe_rom_cli() -> None:
 
     from project_studio import snes_paths
 
-    if not snes_paths.probe_rom_script(None).is_file():
+    probe = snes_paths.probe_rom_script(None)
+    if probe is None or not probe.is_file():
         print("  skip  no probe_rom.py available")
         return
     with tempfile.TemporaryDirectory() as td:
@@ -2075,13 +2085,14 @@ def test_dispatch_inputs() -> None:
 
     toolkit = _REPO / "tools" / "new_project_layout"
     psx_wf = toolkit / "ci_templates" / "setup-release.yml"
-    snes_wf = snes_paths.vendored_wizard_dir() / "templates" / "release.yml.in"
+    snes_tdir = snes_paths.templates_dir(None)
+    snes_wf = snes_tdir / "release.yml.in" if snes_tdir is not None else None
     if psx_wf.is_file():
         psx_inputs = declared_dispatch_inputs(psx_wf)
         check("version" in psx_inputs and "bump" in psx_inputs,
               f"PSX workflow declares version/bump ({sorted(psx_inputs)})")
         check("publish" in psx_inputs, "PSX workflow declares publish")
-    if snes_wf.is_file():
+    if snes_wf is not None and snes_wf.is_file():
         snes_inputs = declared_dispatch_inputs(snes_wf)
         check("version" in snes_inputs and "bump" in snes_inputs,
               f"SNES workflow declares version/bump ({sorted(snes_inputs)})")
@@ -2708,6 +2719,12 @@ def main() -> int:
     if not subprocess.run(["git", "--version"], capture_output=True).returncode == 0:
         print("git not available — skipping")
         return 0
+    # Most of this suite renders snesrecomp's own wizard templates. Without a
+    # checkout those checks fail one by one, far from the cause; say it once.
+    from project_studio import snes_paths
+    if snes_paths.wizard_dir(None) is None:
+        print(f"error: {snes_paths.MISSING_CHECKOUT}", file=sys.stderr)
+        return 1
     test_platform_defaults()
     test_index_separation()
     with tempfile.TemporaryDirectory() as td:

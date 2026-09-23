@@ -72,8 +72,10 @@ rather than at each of the ~90 call sites.
 cartridge, lay out the repo, wire the `n64lle` + `recomp-ui` submodules, write
 `game.toml`, then generate / build / run the gates. Studio prefers a live
 n64lle checkout (`$N64LLE_ROOT`, the selected project's own submodule, or a
-sibling checkout) and falls back to the copy vendored under
-`tools/new_project_layout/n64/`. The dump is probed where it lies and
+sibling checkout) and ships no copy of its own — with no checkout, New Project
+refuses and says so, because a vendored copy cannot inherit n64lle's fixes (one
+kept scaffolding `hle_tier = false` after n64lle made HLE the default). The
+dump is probed where it lies and
 **symlinked** into `roms/` — Copy ROM (`--copy-rom`) is for a dump on removable
 media, and is off by default because the framework says a link "makes it
 impossible to do by accident" to commit ROM bytes.
@@ -141,9 +143,8 @@ user's `settings.toml` or `input.cfg`.
 probe the ROM, lay out the repo, wire the submodules, seed `recomp/*.cfg`, then
 generate / build / publish. Studio prefers a live snesrecomp checkout
 (`$SNESRECOMP_ROOT`, the selected project's own submodule, or a sibling
-checkout) and falls back to the copy vendored under
-`tools/new_project_layout/snes/` so a packaged install works with no framework
-on disk. The ROM is probed where it lies and never enters the repository.
+checkout) and, as for the N64, ships no copy of its own: with no checkout, New
+Project refuses and says so. The ROM is probed where it lies and never enters the repository.
 Fields the SNES scaffolder has no flag for (BIOS, boot EXE, lobby, boxart) are
 named in the log rather than silently dropped.
 
@@ -484,7 +485,6 @@ retcomm-studio/
       snesops.py             #   SNES audit / plan / apply
       snes_paths.py          #   locate the snesrecomp wizard
     templates/               # PSX scaffold templates
-    snes/                    # vendored snesrecomp wizard (see snes/VENDOR.md)
     ci_templates/
   tests/
     snes_platform_test.py    # platform split + SNES migration, no GPU needed

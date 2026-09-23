@@ -170,7 +170,7 @@ def script_supports(script: Path, flag: str) -> bool:
 
     Studio drives whichever copy of a scaffolder it found on disk, and that
     copy can be OLDER than Studio — a port's pinned submodule, a sibling
-    checkout, or the vendored fallback. setup_project.sh answers an unknown
+    checkout. setup_project.sh answers an unknown
     option with `exit 2` before it probes anything, so a flag sent hopefully is
     a dead scaffold rather than a degraded one.
 
@@ -254,8 +254,10 @@ def snes_project_name(opts: "NewProjectOptions") -> str:
     """<Title>SNESRecomp, from the wizard's own probe_rom.project_name()."""
     import importlib.util
 
-    probe = snes_paths.wizard_dir(None) / "probe_rom.py"
+    probe = snes_paths.probe_rom_script(None)
     try:
+        if probe is None:
+            raise FileNotFoundError(snes_paths.MISSING_CHECKOUT)
         spec = importlib.util.spec_from_file_location("snes_probe_rom", probe)
         mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
         assert spec and spec.loader
@@ -354,14 +356,14 @@ def validate_options(opts: NewProjectOptions) -> list[str]:
         ):
             if value < 0:
                 errs.append(f"{label} cannot be negative")
-        if not n64_paths.setup_script(None).is_file():
-            errs.append("n64lle setup_project.sh not found (no checkout, no vendored copy)")
+        if n64_paths.setup_script(None) is None:
+            errs.append(n64_paths.MISSING_CHECKOUT)
     if snes:
         tap = (opts.multitap or "").strip().lower()
         if tap and tap not in ("port1", "port2", "both", "off"):
             errs.append("Multitap must be port1 / port2 / both / off")
-        if not snes_paths.setup_script(None).is_file():
-            errs.append("snesrecomp setup_project.sh not found (no checkout, no vendored copy)")
+        if snes_paths.setup_script(None) is None:
+            errs.append(snes_paths.MISSING_CHECKOUT)
     if opts.do_build and not opts.do_generate and not n64:
         errs.append("Build requires Generate")
     # Wizard/netplay without UI (and 1P netplay) are auto-corrected at run time.
@@ -384,8 +386,8 @@ def build_snes_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, st
     unknown flag, so they are dropped here and the caller is told which ones.
     """
     script = snes_paths.setup_script(None)
-    if not script.is_file():
-        raise FileNotFoundError(f"Missing setup script: {script}")
+    if script is None:
+        raise FileNotFoundError(snes_paths.MISSING_CHECKOUT)
 
     env = os.environ.copy()
     env["SNESRECOMP_SETUP_YES"] = "1"
@@ -471,16 +473,16 @@ def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str
     other two consoles have a concept of.
 
     --n64lle-ref / --recomp-ui-ref are sent only when the script ON DISK
-    declares them. Studio drives whichever copy it found — `$N64LLE_ROOT`, the
-    port's own submodule, a sibling checkout, or the vendored fallback — and an
-    unknown option is `exit 2` there, so an older wizard would die on the flag
-    instead of scaffolding. Without them the script does what it always did:
+    declares them. Studio drives whichever checkout it found — `$N64LLE_ROOT`,
+    the port's own submodule, or a sibling checkout — and an unknown option is
+    `exit 2` there, so an older wizard would die on the flag instead of
+    scaffolding. Without them the script does what it always did:
     branch `main`, pinned at the HEAD of the checkout it was run from, "the SHA
     this scaffold was cut against".
     """
     script = n64_paths.setup_script(None)
-    if not script.is_file():
-        raise FileNotFoundError(f"Missing setup script: {script}")
+    if script is None:
+        raise FileNotFoundError(n64_paths.MISSING_CHECKOUT)
 
     env = os.environ.copy()
 
@@ -887,18 +889,7 @@ def run_new_project(
             src = n64_paths.wizard_source(None)
             on_line(f"Using n64lle wizard: {src}")
             script = n64_paths.setup_script(None)
-            can_ref = script_supports(script, "--n64lle-ref")
-            if src == "vendored" and not (opts.n64lle_ref or "").strip():
-                on_line(
-                    "note: no n64lle checkout to read a pin from — the new "
-                    "project's n64lle submodule is left at the branch tip. "
-                    + (
-                        "Name a revision with --n64lle-ref, or pin it by hand"
-                        if can_ref
-                        else "Pin it by hand"
-                    )
-                    + " (see tools/new_project_layout/n64/VENDOR.md)."
-                )
+            can_ref = script is not None and script_supports(script, "--n64lle-ref")
             if (opts.n64lle_ref or "").strip() and not can_ref:
                 # Said here rather than swallowed in build_n64_command: the ref
                 # is on screen, and a scaffold that ignored it without a word
@@ -906,8 +897,8 @@ def run_new_project(
                 on_line(
                     f"note: this wizard has no --n64lle-ref, so "
                     f"'{opts.n64lle_ref.strip()}' is NOT being used — the "
-                    "project will be pinned the way that copy pins. Update the "
-                    "n64lle checkout Studio is reading, or re-vendor."
+                    "project will be pinned the way that checkout pins. Update "
+                    "the n64lle checkout Studio is reading."
                 )
             ignored = n64_ignored_fields(opts)
             if ignored:

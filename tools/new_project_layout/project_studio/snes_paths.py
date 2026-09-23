@@ -2,9 +2,11 @@
 
 Order matters, and it is not arbitrary. A migration is measured against the
 framework revision the port is actually pinned to, so the project's own
-``snesrecomp/`` submodule outranks anything Studio ships. The vendored copy
-under the toolkit is a last resort that only exists so a packaged install can
-scaffold a *new* project with no checkout on disk.
+``snesrecomp/`` submodule outranks a checkout found anywhere else.
+
+THERE IS NO VENDORED FALLBACK, for the reason n64_paths gives: a copy of the
+wizard shipped inside Studio cannot inherit a fix to it. With no checkout the
+answer is None and every caller says so -- see MISSING_CHECKOUT.
 """
 
 from __future__ import annotations
@@ -37,11 +39,11 @@ def _env_root() -> Path | None:
     return p if _is_framework(p) else None
 
 
-def snesrecomp_root(game_root: Path | str | None = None) -> Path | None:
-    """A real snesrecomp checkout, or None."""
+def _candidates(game_root: Path | str | None):
+    """Every snesrecomp checkout Studio may use, in precedence order."""
     env = _env_root()
     if env is not None:
-        return env
+        yield env
     if game_root:
         root = Path(str(game_root)).expanduser()
         try:
@@ -50,63 +52,77 @@ def snesrecomp_root(game_root: Path | str | None = None) -> Path | None:
             pass
         for cand in (root / "snesrecomp", root):
             if _is_framework(cand):
-                return cand
+                yield cand
     # …/retcomm-studio/tools/new_project_layout → …/GitHub/snesrecomp
     base = toolkit_dir()
     for parent in (base.parent.parent, base.parent.parent.parent):
         cand = parent / "snesrecomp"
         if _is_framework(cand):
-            return cand.resolve()
-    return None
+            yield cand.resolve()
 
 
-def vendored_wizard_dir() -> Path:
-    """The copy shipped with Studio (see snes/VENDOR.md)."""
-    return toolkit_dir() / "snes"
+def snesrecomp_root(game_root: Path | str | None = None) -> Path | None:
+    """A real snesrecomp checkout, or None."""
+    return next(_candidates(game_root), None)
 
 
-def wizard_dir(game_root: Path | str | None = None) -> Path:
-    """Directory holding setup_project.sh / probe_rom.py / templates/.
+MISSING_CHECKOUT = (
+    "no snesrecomp checkout found -- Studio drives snesrecomp's own "
+    "tools/new_project/, and ships no copy of it. Set SNESRECOMP_ROOT to a "
+    "snesrecomp checkout, or clone snesrecomp beside retcomm-studio."
+)
 
-    With a project, its own submodule (or $SNESRECOMP_ROOT) is the framework
-    to measure against. WITHOUT one -- a new project -- only $SNESRECOMP_ROOT
-    outranks the vendored copy. The sibling checkout beside retcomm-studio
-    used to win here too, and it sat on a months-old branch: a Super Metroid
-    scaffold pinned the framework's current main but was rendered from that
-    checkout's old templates, built, and did not boot. The wizard now renders
-    from the framework it pins regardless, but only a copy of the wizard that
-    HAS that fix can do so, and the vendored copy is the one this tree keeps
-    current (snes/VENDOR.md).
+
+def wizard_dir(game_root: Path | str | None = None) -> Path | None:
+    """snesrecomp's ``tools/new_project/`` (setup_project.sh / probe_rom.py /
+    templates/), or None when there is no checkout to take it from.
+
+    The first checkout in precedence order that HAS one: a port pinned to a
+    snesrecomp older than tools/new_project/ is still a framework, but it has
+    no wizard to drive.
+
+    The sibling checkout counts for a NEW project too. It used to be skipped
+    there in favour of the vendored copy: it once sat on a months-old branch,
+    and a Super Metroid scaffold pinned the framework's current main but was
+    rendered from that checkout's old templates, built, and did not boot. That
+    is fixed where it belongs -- setup_project.sh now re-renders from the
+    PINNED framework's templates once the submodule is added -- so which
+    checkout starts the wizard no longer decides what it writes.
     """
-    if game_root is None or str(game_root) == "":
-        env = _env_root()
-        if env is not None and (env / _WIZARD_REL / "setup_project.sh").is_file():
-            return env / _WIZARD_REL
-        return vendored_wizard_dir()
-    root = snesrecomp_root(game_root)
-    if root is not None:
+    for root in _candidates(game_root):
         live = root / _WIZARD_REL
         if (live / "setup_project.sh").is_file():
             return live
-    return vendored_wizard_dir()
+    return None
 
 
 def wizard_source(game_root: Path | str | None = None) -> str:
-    """Human-readable provenance for the log — which copy is being driven."""
+    """Human-readable provenance for the log — which checkout is being driven."""
     d = wizard_dir(game_root)
-    return "vendored" if d == vendored_wizard_dir() else f"checkout {d}"
+    return f"checkout {d}" if d is not None else "none (no snesrecomp checkout)"
 
 
-def templates_dir(game_root: Path | str | None = None) -> Path:
-    return wizard_dir(game_root) / "templates"
+def _in_wizard(game_root: Path | str | None, rel: str) -> Path | None:
+    d = wizard_dir(game_root)
+    return d / rel if d is not None else None
 
 
-def setup_script(game_root: Path | str | None = None) -> Path:
-    return wizard_dir(game_root) / "setup_project.sh"
+def templates_dir(game_root: Path | str | None = None) -> Path | None:
+    return _in_wizard(game_root, "templates")
 
 
-def probe_rom_script(game_root: Path | str | None = None) -> Path:
-    return wizard_dir(game_root) / "probe_rom.py"
+def templates_label(game_root: Path | str | None = None) -> str:
+    """templates_dir for a message, which has to say something when it is None."""
+    d = templates_dir(game_root)
+    return str(d) if d is not None else "(no snesrecomp checkout)"
+
+
+def setup_script(game_root: Path | str | None = None) -> Path | None:
+    return _in_wizard(game_root, "setup_project.sh")
+
+
+def probe_rom_script(game_root: Path | str | None = None) -> Path | None:
+    return _in_wizard(game_root, "probe_rom.py")
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +130,7 @@ def probe_rom_script(game_root: Path | str | None = None) -> Path:
 # ---------------------------------------------------------------------------
 # Locating the wizard is not the same question as "can the snesrecomp this port
 # is *pinned* to run the script that wizard emits". On a fork those two come
-# apart: the wizard falls back to a sibling or the vendored copy while the
+# apart: the wizard falls back to a sibling checkout while the
 # submodule stays at whatever ancient gitlink the fork recorded, and the
 # emitted tools/regen.sh then calls subcommands the pinned CLI has never heard
 # of. Both halves of that comparison live here so nobody answers it twice.
