@@ -1,4 +1,5 @@
 #include "studio/studio_model.hpp"
+#include "studio/studio_bulk_recomp.hpp"
 #include "studio/studio_runner.hpp"
 #include "studio/studio_frames.hpp"
 #include "studio/studio_n64.hpp"
@@ -4121,6 +4122,10 @@ int main(int argc, char** argv) {
                 draw_build(model, th, window);
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("Bulk Recomp")) {
+                retcomm::studio::draw_bulk_recomp(model, th, window);
+                ImGui::EndTabItem();
+            }
             // Same two tabs on the two consoles that have them, in the same
             // order — find the functions, then diagnose what they do — but
             // each backed by its own toolset. PSX reads psxrecomp's analysis
@@ -4226,6 +4231,9 @@ int main(int argc, char** argv) {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);
     }
+
+    // A batch left running would keep compiling with nobody watching it.
+    retcomm::studio::bulk_recomp_shutdown();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();

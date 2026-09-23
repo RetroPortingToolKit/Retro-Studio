@@ -21,7 +21,7 @@ answer.
 | Game image | Redump `.cue` | `.sfc` / `.smc` ROM | `.z64` / `.n64` / `.v64` ROM |
 | Generate | `psxrecomp_cli generate` (ROM + BIOS C) | the project's own `tools/regen.sh` | the project's own `<slug>-generate` CMake target |
 | Build target | `psx-runtime` | the repo's CMake `project()` name | the repo's `n64lle_add_runtime_target()` name |
-| Tabs | Migrate · New Project · Git · Bulk · Build · Functions · Diagnostics | Migrate · New Project · Git · Bulk · Build · Functions · Diagnostics | Migrate · New Project · Git · Bulk · Build · Diagnostics |
+| Tabs | Migrate · New Project · Git · Bulk · Build · Bulk Recomp · Functions · Diagnostics | Migrate · New Project · Git · Bulk · Build · Bulk Recomp · Functions · Diagnostics | Migrate · New Project · Git · Bulk · Build · Bulk Recomp · Diagnostics |
 
 **Change** in the header returns to the picker. Each console keeps its own repo
 list, so switching loses nothing.
@@ -257,6 +257,65 @@ skew that otherwise arrives as `invalid choice: 'verify-rom'` attributed to the
 Generate button. It refuses the same way when `rom_identity.txt` is missing or
 carries empty digests, since `--verify` would then be checking the ROM against
 nothing.
+
+## Bulk Recomp — many images, one folder, for testing
+
+**Bulk Recomp** takes a multi-selection of game images and runs every one of
+them through the whole pipeline into one output folder, to answer "which of
+these dumps get through today?". It is a test harness, not a way to make ports.
+
+| Console | Stages, per image |
+|---|---|
+| PlayStation | probe (`lookup-disc-meta`) → scaffold → generate → configure → compile |
+| Super Nintendo | probe (`probe-rom`) → scaffold → generate → configure → compile |
+| Nintendo 64 | probe (`probe-rom`) → scaffold → framework → generate → compile |
+
+Each stage is the same CLI subcommand the New Project and Build tabs run for
+one project, so a batch tests what the buttons do. The orchestration lives in
+the toolkit (`project_studio bulk-recomp`), and the tab only starts it and draws
+what it reports, so a batch also runs headless:
+
+```bash
+cd tools/new_project_layout
+python3 -m project_studio --platform snes bulk-recomp --out ~/BulkTest \
+    --rom a.sfc --rom b.sfc --parallel 2
+```
+
+Everything a batch writes is under the output folder:
+
+| Path | What |
+|---|---|
+| `<out>/<Project>/` | each scaffolded port |
+| `<out>/Log Output/<NN-image>/<n>-<stage>.log` | the full output of every stage |
+| `<out>/Log Output/summary.txt` | PASSED / FAILED per image, with the failing stage and its log |
+| `<out>/Log Output/bulk_status.json` | live state; the tab polls it |
+
+Stage output goes to those files, **not** the Activity log — several builds'
+output interleaved in one pane is not readable. The table shows one row per
+image with a progress bar (stage *n*/*N*, and inside configure / compile the
+build tool's own `[n/m]` count), then PASSED or FAILED; hover a bar for every
+stage's state, and **Log** opens the stage log.
+
+Defaults, and why:
+
+* **No GitHub repos, no CI, no boxart.** Each reaches outside the output folder,
+  and a test batch that created forty private repos is a cleanup job. The
+  checkboxes are there if you want them.
+* **Not added to the repo index.** Throwaway scaffolds would bury the ports in
+  the dropdown. Tick *Add to repo index* to keep them.
+* **Parallel = 1.** Raise it to run projects at once. *Build jobs* on auto
+  divides the cores between them (`cores / parallel` per compile), since each
+  cmake build otherwise takes every core.
+* **An existing project folder FAILS** that image rather than rebuilding an old
+  scaffold and calling it a pass. *Reuse existing projects* rebuilds it instead
+  and marks the scaffold `skipped`.
+* **Two images that probe to one project** (two revisions of the same game)
+  are not both scaffolded into it: the second is FAILED with the reason. Run it
+  in another output folder.
+
+**Stop** kills the running stages' whole process trees and marks the rest
+stopped; closing Studio does the same. On PSX each `.cue` is its own project —
+multi-disc sets are not grouped.
 
 ## Setup
 

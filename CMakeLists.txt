@@ -141,6 +141,7 @@ endif()
 
 set(RETCOMM_STUDIO_SOURCES
     src/studio/studio_main.cpp
+    src/studio/studio_bulk_recomp.cpp
     src/studio/studio_model.cpp
     src/studio/studio_runner.cpp
     src/studio/studio_functions.cpp
@@ -352,6 +353,7 @@ target_link_libraries(json_null_test PRIVATE nlohmann_json::nlohmann_json)
 # migration ops. They need no GPU and no game — only git and a temp dir:
 #   python3 tests/snes_platform_test.py
 #   python3 tests/n64_platform_test.py
+#   python3 tests/bulk_recomp_test.py
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_custom_target(snes_platform_test
@@ -365,6 +367,12 @@ if(Python3_Interpreter_FOUND)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/n64_platform_test.py"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         COMMENT "Running N64 platform-split test"
+        VERBATIM)
+    add_custom_target(bulk_recomp_test
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/bulk_recomp_test.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Running Bulk Recomp orchestration test"
         VERBATIM)
 endif()
 

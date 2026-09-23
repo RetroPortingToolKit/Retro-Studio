@@ -627,9 +627,53 @@ def cmd_new_project(args: argparse.Namespace) -> int:
     if opts.dry_run:
         return 0
     root = project_root_for(opts)
+    if bool(getattr(args, "no_index", False)):
+        # Bulk Recomp's test batches: forty throwaway scaffolds in the repo
+        # dropdown would bury the ports somebody is actually working on.
+        print(f"[OK] Not indexed (--no-index): {root}")
+        return 0
     ir = index_new_project(root, name=opts.name, cue=opts.disc)
     print(f"[{'OK' if ir.ok else 'FAIL'}] {ir.message}")
     return 0 if ir.ok else 1
+
+
+def cmd_bulk_recomp(args: argparse.Namespace) -> int:
+    from project_studio.bulkrecomp import BulkRecompOptions, BulkRun, read_image_list, validate
+
+    images = [i.strip() for i in (args.images or []) if (i or "").strip()]
+    if (args.rom_list or "").strip():
+        try:
+            images += read_image_list(args.rom_list)
+        except OSError as exc:
+            print(f"error: cannot read --rom-list: {exc}", file=sys.stderr)
+            return 2
+    opts = BulkRecompOptions(
+        images=images,
+        out_dir=(args.out or "").strip(),
+        parallel=int(args.parallel or 1),
+        build_jobs=int(args.build_jobs or 0),
+        build_type=(args.build_type or "Release").strip(),
+        create_github=bool(args.create_github),
+        enable_ci=bool(args.ci),
+        fetch_boxart=bool(args.boxart),
+        reuse_existing=bool(args.reuse_existing),
+        add_to_index=bool(args.index),
+    )
+    errs = validate(opts)
+    if errs:
+        for e in errs:
+            print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    run = BulkRun(opts, on_event=lambda m: print(m, flush=True))
+    print(f"Bulk Recomp: {len(opts.images)} image(s) → {run.out} "
+          f"(parallel {opts.parallel}); logs in {run.log_dir}", flush=True)
+    ok = run.run()
+    passed = sum(1 for it in run.items if it.state == "passed")
+    print(f"[{'OK' if ok else 'FAIL'}] {passed}/{len(run.items)} passed"
+          + (" (cancelled)" if run.cancelled else "")
+          + f" — {run.log_dir / 'summary.txt'}", flush=True)
+    return 0 if ok else 1
 
 
 def _probe_rom_n64(args: argparse.Namespace) -> int:
@@ -2679,7 +2723,41 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fill empty players/description/publisher/year/region from disc digests",
     )
+    p_np.add_argument(
+        "--no-index",
+        action="store_true",
+        help="Do not add the new repo to Studio's repo index (Bulk Recomp)",
+    )
     p_np.set_defaults(func=cmd_new_project)
+
+    p_brc = sub.add_parser(
+        "bulk-recomp",
+        help="Probe, scaffold, generate and build many images into one folder "
+             "(testing). Logs and live status go to <out>/Log Output/.",
+    )
+    p_brc.add_argument("--out", required=True,
+                       help="Folder every project is scaffolded into")
+    p_brc.add_argument("--rom", "--disc", dest="images", action="append", default=[],
+                       metavar="IMAGE", help="Game image (repeatable)")
+    p_brc.add_argument("--rom-list", default="",
+                       help="File with one image path per line (added to --rom)")
+    p_brc.add_argument("--parallel", type=int, default=1,
+                       help="Projects run at once (default 1: one after another)")
+    p_brc.add_argument("--build-jobs", type=int, default=0,
+                       help="--jobs for each compile (0 = cmake's default)")
+    p_brc.add_argument("--build-type", default="Release")
+    p_brc.add_argument("--create-github", action="store_true",
+                       help="Create a GitHub repo per project (off by default)")
+    p_brc.add_argument("--ci", action="store_true",
+                       help="Write CI workflows into each scaffold (off by default)")
+    p_brc.add_argument("--boxart", action="store_true",
+                       help="Fetch boxart per project (off by default)")
+    p_brc.add_argument("--reuse-existing", action="store_true",
+                       help="Skip the scaffold for a project folder that already "
+                            "exists and rebuild it, instead of failing it")
+    p_brc.add_argument("--index", action="store_true",
+                       help="Add each new project to Studio's repo index")
+    p_brc.set_defaults(func=cmd_bulk_recomp)
 
     p_pr = sub.add_parser(
         "probe-rom",
