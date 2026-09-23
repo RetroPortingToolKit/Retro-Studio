@@ -109,6 +109,51 @@ def _in_wizard(game_root: Path | str | None, rel: str) -> Path | None:
     return d / rel if d is not None else None
 
 
+# n64lle's own template-drift tool (tools/new_project/port_drift.py, 2026-09-23).
+# The port's scaffold is rendered once and nothing brings it forward; this is
+# what measures how far it has moved, with the port's own values, so Studio
+# does not carry a second copy of "what the scaffold should look like".
+DRIFT_TOOL_REL = _WIZARD_REL / "port_drift.py"
+
+
+def drift_tools(game_root: Path | str):
+    """Every ``(script, checkout, is_the_ports_own_pin)``, best first.
+
+    A DIFFERENT precedence from wizard_dir, on purpose. The port's own
+    ``n64lle/`` comes first even over $N64LLE_ROOT: measured against the
+    framework the port pins, the answer is the one the port's own
+    ``<slug>_template_drift`` ctest gives, and applying it is safe. Any other
+    checkout only PREVIEWS what a bump would bring -- its templates can name
+    framework files the pinned n64lle does not have (the build shim execs
+    n64lle/tools/build_framework.sh, which ports pinned before 2026-09-15 lack).
+
+    All of them, not the first: a pinned copy can be too old to speak --json,
+    and the caller then falls through to a preview instead of to nothing.
+    """
+    root = Path(str(game_root)).expanduser()
+    try:
+        root = root.resolve()
+    except OSError:
+        pass
+    own = root / "n64lle"
+    seen: set[Path] = set()
+    order = ([own] if _is_framework(own) else []) + list(_candidates(root))
+    for cand in order:
+        try:
+            key = cand.resolve()
+        except OSError:
+            key = cand
+        if key in seen or not (cand / DRIFT_TOOL_REL).is_file():
+            continue
+        seen.add(key)
+        yield cand / DRIFT_TOOL_REL, cand, key == own.resolve()
+
+
+def drift_tool(game_root: Path | str) -> tuple[Path, Path, bool] | None:
+    """The best of drift_tools(), or None."""
+    return next(drift_tools(game_root), None)
+
+
 def templates_dir(game_root: Path | str | None = None) -> Path | None:
     return _in_wizard(game_root, "templates")
 

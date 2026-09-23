@@ -282,6 +282,134 @@ def test_audit_plan_apply(root: Path) -> None:
         check(r.ok, f"re-apply {r.op_id}: {r.message[:60]}")
 
 
+# A stand-in for n64lle's tools/new_project/port_drift.py that speaks its --json
+# contract. Studio's side is what is under test -- which checkout answers, which
+# rows the verdict becomes, which hand-kept checks stand down, and what apply
+# may write -- so the fake keeps the one rule that matters to those: .gitignore
+# drifts until it carries the overlays rule, CMakeLists.txt until it is taken.
+FAKE_DRIFT = r"""#!/usr/bin/env python3
+import json, os, sys
+root, args = sys.argv[1], sys.argv[2:]
+if "--json" not in args:
+    sys.exit("port_drift.py: error: unrecognized arguments")
+def vals(flag):
+    return [args[i + 1] for i, a in enumerate(args) if a == flag]
+apply, only, take = "--apply" in args, vals("--only"), vals("--take")
+gi, cm = os.path.join(root, ".gitignore"), os.path.join(root, "CMakeLists.txt")
+wrote = []
+def ok_gi():
+    return os.path.exists(gi) and "overlays/*" in open(gi).read()
+def ok_cm():
+    return "# taken" in open(cm).read()
+if apply and not ok_gi() and (not only or ".gitignore" in only):
+    with open(gi, "a") as f: f.write("overlays/*\n")
+    wrote.append(".gitignore")
+if apply and "CMakeLists.txt" in take and not ok_cm() and (not only or "CMakeLists.txt" in only):
+    with open(cm, "a") as f: f.write("# taken\n")
+    wrote.append("CMakeLists.txt")
+items = [
+    {"class": "owned", "path": ".gitignore", "state": "ok" if ok_gi() else "drift", "plus": 1, "minus": 0},
+    {"class": "review", "path": "CMakeLists.txt", "state": "ok" if ok_cm() else "drift", "plus": 1, "minus": 0},
+    {"class": "contract", "path": "game.toml", "section": "cosim", "key": "savestate_fields",
+     "state": "missing", "paste": "savestate_fields  = 200"},
+]
+json.dump({"templates_rev": "feedf00d", "pin_rev": "feedf00d", "pin_matches": True,
+           "items": items, "notes": [], "wrote": wrote, "skipped": [],
+           "drifted": sum(i["state"] != "ok" for i in items)}, sys.stdout)
+"""
+
+
+def _give_drift_tool(fw: Path, text: str = FAKE_DRIFT) -> None:
+    d = fw / "tools" / "new_project"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "port_drift.py").write_text(text, encoding="utf-8")
+
+
+def test_template_drift(tmp: Path) -> None:
+    print("template drift (n64lle port_drift.py)")
+    from project_studio import n64ops
+
+    platforms.set_current("n64")
+    old_env = os.environ.pop("N64LLE_ROOT", None)
+    try:
+        # --- measured against the port's own pin -----------------------------
+        root = tmp / "DriftRecomp"
+        make_repo(root)
+        _give_drift_tool(root / "n64lle")
+        rep = n64ops.audit_project(root)
+        ids = {c.id: c for c in rep.checks}
+        check(ids["drift_source"].status.value == "pass", "own pin: measured, not previewed")
+        check("gitignore" not in ids,
+              "the hand-kept .gitignore rule list stands down once port_drift ran")
+        gi = ids.get("drift:.gitignore")
+        check(gi is not None and gi.status.value == "fail" and gi.fix_op == "n64_template_sync",
+              ".gitignore drift is a failure with the sync op")
+        cm = ids.get("drift:CMakeLists.txt")
+        check(cm is not None and cm.fix_op == "n64_template_take_cmakelists",
+              "CMakeLists.txt drift offers the take op")
+        gt = ids.get("drift:game.toml:[cosim] savestate_fields")
+        check(gt is not None and gt.fix_op is None and "savestate_fields  = 200" in gt.detail,
+              "a missing game.toml key is reported with its paste text and NO fix op")
+
+        plan = n64ops.build_plan(root, MigrateOptions())
+        steps = [s.op_id for s in plan.steps]
+        check("n64_template_sync" in steps and "n64_template_take_cmakelists" in steps,
+              "plans both drift ops")
+        res = {r.op_id: r for r in n64ops.apply_plan(plan)}
+        check(res["n64_template_sync"].ok, "sync applies without Force")
+        check(not res["n64_template_take_cmakelists"].ok
+              and "Force" in res["n64_template_take_cmakelists"].message,
+              "CMakeLists.txt is refused without Force")
+        check("# taken" not in (root / "CMakeLists.txt").read_text(),
+              "and nothing was written to it")
+        res = {r.op_id: r for r in n64ops.apply_plan(
+            n64ops.build_plan(root, MigrateOptions(force=True)))}
+        check(res["n64_template_take_cmakelists"].ok, "taken with Force")
+        again = {c.id: c for c in n64ops.audit_project(root).checks}
+        check(again["drift:.gitignore"].status.value == "pass"
+              and again["drift:CMakeLists.txt"].status.value == "pass",
+              "re-audit after apply is clean")
+
+        # --- preview: the pin has no tool, another checkout does ----------------
+        prev = tmp / "PreviewRecomp"
+        make_repo(prev)
+        other = tmp / "n64lle-current"
+        (other / "runtime").mkdir(parents=True)
+        (other / "runtime" / "runtime.cmake").write_text("#\n", encoding="utf-8")
+        _give_drift_tool(other)
+        os.environ["N64LLE_ROOT"] = str(other)
+        rep = n64ops.audit_project(prev)
+        ids = {c.id: c for c in rep.checks}
+        check(ids["drift_source"].status.value == "warn"
+              and "PREVIEW" in ids["drift_source"].title, "another checkout is a preview")
+        check(all(c.fix_op is None for c in rep.checks if c.id.startswith("drift:")),
+              "preview rows carry no fix op")
+        check("gitignore" in ids, "the hand-kept checks stay while only previewing")
+        r = n64ops.apply_plan(n64ops.build_plan(
+            prev, MigrateOptions(only=["n64_template_sync"])))
+        check(len(r) == 1 and not r[0].ok and "Preview" in r[0].message,
+              "sync refuses to apply a preview")
+
+        # --- a pinned copy too old for --json falls through to the preview -----
+        _give_drift_tool(prev / "n64lle", "import sys; sys.exit('unrecognized arguments: --json')\n")
+        ids = {c.id: c for c in n64ops.audit_project(prev).checks}
+        check(ids["drift_source"].status.value == "warn"
+              and any(c.startswith("drift_note") for c in ids),
+              "an old pinned tool is skipped, said so, and the preview answers")
+
+        # --- nothing anywhere: a SKIP row that says why -------------------------
+        os.environ.pop("N64LLE_ROOT", None)
+        (prev / "n64lle" / "tools" / "new_project" / "port_drift.py").unlink()
+        ids = {c.id: c for c in n64ops.audit_project(prev).checks}
+        check(ids["drift_source"].status.value == "skip"
+              and "port_drift.py" in ids["drift_source"].detail,
+              "no tool anywhere is a SKIP naming what is missing")
+    finally:
+        os.environ.pop("N64LLE_ROOT", None)
+        if old_env is not None:
+            os.environ["N64LLE_ROOT"] = old_env
+
+
 def test_refuses_unresolved_tokens(tmp: Path) -> None:
     """A blank is worse than a refusal.
 
@@ -533,6 +661,7 @@ def main() -> int:
         test_build_target(root)
         test_framework_preflight(root)
         test_audit_plan_apply(root)
+        test_template_drift(tmp)
         test_refuses_unresolved_tokens(tmp)
         test_new_project_command(tmp)
         test_failed_scaffold_is_discarded(tmp)

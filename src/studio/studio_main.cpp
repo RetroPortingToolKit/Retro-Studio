@@ -1519,16 +1519,23 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
     const bool snes = model.is_snes();
     if (model.is_n64()) {
         wrapped(th.text_muted,
-                "Brings an N64 port up to the n64lle scaffold: submodules, .gitignore, "
-                "untracked generated C and ROM bytes, the scaffold stubs, and "
-                "framework_pins.txt.");
+                "Brings an N64 port up to the n64lle scaffold: submodules, untracked "
+                "generated C and ROM bytes, and framework_pins.txt -- and TEMPLATE DRIFT, "
+                "measured by n64lle's own tools/new_project/port_drift.py with this port's "
+                "values, so a template fix reaches a port cut before it.");
         ImGui::Spacing();
         wrapped(th.text_muted,
-                "It will NOT rewrite game.toml, CMakeLists.txt, README.md or "
-                "docs/STATUS.md. game.toml is the hand-maintained contract whose "
-                "[MEASURED] tags are only worth something because no program writes it, "
-                "and STATUS.md is the honesty ledger — a fresh one asserts that nothing "
-                "has been measured.");
+                "Drift is measured against the port's own pinned n64lle -- the verdict its "
+                "<slug>_template_drift ctest gives. When that pin predates the tool, a "
+                "newer checkout (N64LLE_ROOT) gives a PREVIEW of what a bump would bring, "
+                "and nothing is applied until the pin is advanced (Git tab).");
+        ImGui::Spacing();
+        wrapped(th.text_muted,
+                "Template-owned files (.gitignore, the build shim, the READMEs, LAYOUT.md) "
+                "are re-rendered by n64_template_sync. CMakeLists.txt is taken only with "
+                "Force. game.toml is NEVER written: a missing key is shown with the text to "
+                "paste, and its value is this title's decision. docs/STATUS.md, README.md "
+                "and CLAUDE.md are the port's own.");
         ImGui::Spacing();
     }
     if (snes) {

@@ -107,10 +107,38 @@ not, names `tools/build_framework.sh` instead of letting cmake die inside
 --target <slug>-generate` — the harvest and emit live in the port's own CMake
 graph, not in a script or a framework CLI.
 
-**Migrate** audits an N64 port against that scaffold — submodules, `.gitignore`,
-untracked generated C *and* ROM bytes, `tools/build_framework.sh`, the contract's
-`[MEASURED]` identity rows, the single `n64lle_add_runtime_target()` call, the
-scaffold stubs and `framework_pins.txt` — and applies the fixes.
+**Migrate** audits an N64 port against that scaffold — submodules, untracked
+generated C *and* ROM bytes, the contract's `[MEASURED]` identity rows, the
+single `n64lle_add_runtime_target()` call and `framework_pins.txt` — and, for
+everything the scaffold templates own, defers to n64lle itself.
+
+**Template drift is n64lle's measurement, not Studio's.** The scaffold is
+rendered once and nothing brought a port forward afterwards; on 2026-09-23 ten
+of eleven N64 ports were missing that week's template work, including the
+`.gitignore` rule that keeps captured overlays (ROM-derived code) out of git —
+while this tab, checking a hand-kept rule list that never learned it, reported
+`.gitignore` as passing. So Migrate now runs n64lle's
+`tools/new_project/port_drift.py --json`, which renders the templates with the
+port's own values and reports by class:
+
+| Class | Files | Migrate row | Fix op |
+|---|---|---|---|
+| owned | `.gitignore`, `tools/build_framework.sh`, the `generated/` `mods/` `overlays/` `roms/` READMEs, `docs/LAYOUT.md` | per file; `.gitignore` drift is a failure | `n64_template_sync` |
+| review | `CMakeLists.txt` (code only; comments are the port's) | per file | `n64_template_take_cmakelists`, **Force only** |
+| contract | `game.toml` sections and keys | per missing key, with the text to paste | **none** |
+| port | `CLAUDE.md`, `README.md`, `docs/STATUS.md`, `VERSION` | not compared | none |
+
+Which n64lle answers matters, and the row says which did. The port's **own
+pinned submodule** comes first — even ahead of `N64LLE_ROOT` — because that is
+the verdict the port's `<slug>_template_drift` ctest gives and the only one it
+is safe to apply. When the pin predates the tool (or its copy is too old to
+speak `--json`), a newer checkout answers as a **preview** of what a bump would
+bring: every row is shown, no row has a fix op, and the ops refuse. A newer
+template can name framework files an older pin lacks — the build shim execs
+`n64lle/tools/build_framework.sh`, which pins before 2026-09-15 do not have —
+so the order is: advance the pin on the Git tab, re-audit, apply. With no
+checkout carrying the tool at all, the drift row is a SKIP that says so, and
+the hand-kept checks it replaces stay on.
 
 What it will **not** write is the point:
 
@@ -118,11 +146,12 @@ What it will **not** write is the point:
   every row `[MEASURED]` / `[DECLARED]` / `[UNKNOWN]`. Its own header says no
   program in the repo writes it, and that is what makes those tags worth
   anything. A migration that regenerated it would launder Studio's guesses into
-  a provenance record.
+  a provenance record. A key the template gained is shown with its text to
+  paste; its value is a decision about this title.
 * `docs/STATUS.md` — the honesty ledger. A freshly cut one asserts that nothing
   has been measured; writing that over a port that *has* measured things would
   replace findings with a claim of ignorance.
-* `CMakeLists.txt` and `README.md` — the port's build graph and its prose.
+* `README.md` — the port's prose. `CMakeLists.txt` only when named, with Force.
 
 Migrate also reports, without a fix op, a port that still carries its own
 `host/`: the scaffolded layout has none, because the launcher, input, audio and

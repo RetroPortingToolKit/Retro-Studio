@@ -33,8 +33,10 @@ as it stands is reported with no fix op rather than guessed at.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
+import sys
 import tomllib
 from datetime import date
 from pathlib import Path
@@ -65,6 +67,8 @@ OP_ORDER: tuple[str, ...] = (
     "n64_merge_gitignore",
     "n64_untrack_generated",
     "n64_untrack_roms",
+    "n64_template_sync",
+    "n64_template_take_cmakelists",
     "n64_emit_version",
     "n64_emit_build_framework",
     "n64_emit_cmakelists",
@@ -81,6 +85,8 @@ OP_TITLES: dict[str, str] = {
     "n64_merge_gitignore": "Merge N64 .gitignore rules (roms, generated, settings)",
     "n64_untrack_generated": "Untrack committed generated C",
     "n64_untrack_roms": "Untrack committed ROM bytes",
+    "n64_template_sync": "Sync template-owned files (n64lle port_drift.py)",
+    "n64_template_take_cmakelists": "Take CMakeLists.txt from the pinned template (needs Force)",
     "n64_emit_version": "Emit VERSION",
     "n64_emit_build_framework": "Emit tools/build_framework.sh",
     "n64_emit_cmakelists": "Re-emit CMakeLists.txt from the pinned template",
@@ -273,6 +279,123 @@ def diagnose_framework_checkout(root: Path) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Template drift: n64lle's port_drift.py is the authority
+# ---------------------------------------------------------------------------
+# The checks below this section used to BE Studio's idea of the scaffold: a
+# hand-kept list of .gitignore rules, a -D option diff for the build script,
+# presence tests for the READMEs. Each was a second copy of the template, and
+# the copies went stale in exactly the way that costs: the rule list never
+# learned `overlays/*`, so a port that captured an overlay would commit ROM-
+# derived code while this tab reported .gitignore as passing.
+#
+# n64lle now measures that itself (tools/new_project/port_drift.py): it renders
+# the templates with the port's own values and reports what differs, by class
+# -- owned files it may rewrite, CMakeLists.txt whose CODE it compares, and
+# game.toml whose sections and keys it compares but NEVER writes. When the tool
+# is reachable this tab reports its verdict and the hand-kept checks it
+# replaces stand down; when it is not, they remain, and a row says why.
+#
+# Files whose verdict the drift tool owns once it has run against the pin.
+_DRIFT_SUPERSEDES = frozenset({"build_framework", "gitignore", "roms_readme",
+                               "generated_readme"})
+_BUMP_HINT = ("Advance the n64lle pin first (Git tab), then re-audit: the "
+              "templates must be the ones the port builds against.")
+
+
+def measure_drift(root: Path, *extra: str) -> tuple[dict | None, str]:
+    """port_drift.py's JSON for this port, and a reason when there is none.
+
+    The returned dict carries two keys of Studio's own: ``_checkout`` (which
+    n64lle rendered the templates) and ``_own`` (True when that is the port's
+    own pinned submodule -- the only case in which applying is safe)."""
+    tried: list[str] = []
+    for script, checkout, own in n64_paths.drift_tools(root):
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script), str(root), "--json", *extra],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            tried.append(f"{checkout}: did not run ({exc})")
+            continue
+        try:
+            data = json.loads(proc.stdout)
+        except ValueError:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or ["no output"]
+            tried.append(f"{checkout}: {tail[0]}")
+            continue
+        data["_checkout"] = str(checkout)
+        data["_own"] = bool(own)
+        data["_tried"] = tried
+        return data, ""
+    if tried:
+        return None, "port_drift.py did not answer: " + "; ".join(tried) + ". " + _BUMP_HINT
+    return None, ("No n64lle checkout carries tools/new_project/port_drift.py "
+                  "(added 2026-09-23). " + _BUMP_HINT + " Or point N64LLE_ROOT "
+                  "at a current n64lle to preview.")
+
+
+def _drift_rows(drift: dict, add) -> None:
+    """One audit row per drift item. Preview rows carry no fix op."""
+    own = drift["_own"]
+    src = f"n64lle {drift.get('templates_rev', '?')} ({drift['_checkout']})"
+    if own:
+        add("drift_source", "Template drift: measured", CheckStatus.PASS, Severity.INFO,
+            f"Against {src}, the port's own pin -- the same verdict its "
+            "<slug>_template_drift ctest gives.")
+    else:
+        add("drift_source", "Template drift: PREVIEW", CheckStatus.WARN, Severity.INFO,
+            f"The pinned n64lle ({drift.get('pin_rev', '?')}) has no port_drift.py, so "
+            f"these rows are measured against {src}: what a bump would bring, not "
+            "this port's state. Nothing below is applied in preview. " + _BUMP_HINT)
+    for t in drift.get("_tried", []):
+        add("drift_note", "Template drift: skipped a checkout", CheckStatus.PASS,
+            Severity.INFO, t)
+    for note in drift.get("notes", []):
+        add("drift_note", "Template drift note", CheckStatus.PASS, Severity.INFO, note)
+
+    prefix = "" if own else "After bump: "
+    for it in drift.get("items", []):
+        cls, path, st = it.get("class"), it.get("path"), it.get("state")
+        if cls == "contract":
+            where = f"[{it.get('section')}]" + (f" {it['key']}" if it.get("key") else "")
+            add(f"drift:game.toml:{where}", f"{prefix}game.toml {where}",
+                CheckStatus.WARN, Severity.RECOMMENDED,
+                "The template has this and game.toml does not. Studio never writes "
+                "game.toml (the hand-maintained contract), so paste it and decide "
+                "the value for THIS title -- a template default is not a measurement:\n"
+                + it.get("paste", ""))
+            continue
+        cid, title = f"drift:{path}", f"{prefix}{path}"
+        if st in ("ok", "comments"):
+            add(cid, title, CheckStatus.PASS, Severity.RECOMMENDED,
+                "comments differ; code matches the template" if st == "comments" else "")
+            continue
+        if st == "unknown":
+            add(cid, title, CheckStatus.WARN, Severity.RECOMMENDED,
+                (it.get("detail") or "cannot render") + ". No fix op: a template "
+                "rendered with a blank would read as drift.")
+            continue
+        size = ("missing" if st == "missing"
+                else f"+{it.get('plus', 0)} -{it.get('minus', 0)} lines")
+        if cls == "owned":
+            # .gitignore is the one owned file whose drift can leak ROM-derived
+            # bytes into git (captured overlays), so it is not a style warning.
+            status = CheckStatus.FAIL if path == ".gitignore" else CheckStatus.WARN
+            sev = Severity.REQUIRED if path == ".gitignore" else Severity.RECOMMENDED
+            add(cid, title, status, sev,
+                f"{size} against the template (template-owned: re-rendered whole).",
+                "n64_template_sync" if own else None)
+        else:
+            add(cid, title, CheckStatus.WARN, Severity.RECOMMENDED,
+                f"{size} of CODE against the template (comments are the port's "
+                "and are not compared). Taking it overwrites the file -- read the "
+                "diff first if this port carries its own build logic; tick Force.",
+                "n64_template_take_cmakelists" if own else None)
+
+
+# ---------------------------------------------------------------------------
 # Audit
 # ---------------------------------------------------------------------------
 def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditReport:
@@ -299,6 +422,10 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
     is_git = _is_git_repo(root)
     if not is_git:
         notes.append("Not a git repository — submodule and untrack ops cannot run.")
+
+    tpl_drift, drift_why = measure_drift(root) if (root / "game.toml").is_file() \
+        else (None, "No game.toml -- not a scaffolded port, nothing to measure.")
+    superseded = _DRIFT_SUPERSEDES if (tpl_drift and tpl_drift["_own"]) else frozenset()
 
     # --- framework ----------------------------------------------------------
     declared, live = _submodule_present(root, FRAMEWORK, FRAMEWORK_MARKER)
@@ -338,7 +465,9 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
     # Not a style check: a port resolves n64lle as a PRE-BUILT tree, so without
     # this script there is no supported way to produce what CMake looks for.
     script = root / n64_paths.FRAMEWORK_BUILD_SCRIPT
-    if script.is_file():
+    if "build_framework" in superseded:
+        pass  # port_drift.py's row for tools/build_framework.sh is the verdict
+    elif script.is_file():
         detail = str(n64_paths.FRAMEWORK_BUILD_SCRIPT)
         drift = build_framework_option_drift(root, options)
         if not script.stat().st_mode & 0o111:
@@ -388,7 +517,7 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
             "was rendered before that. Re-emit it (--force) rather than "
             "editing the game repo — a hand edit cannot inherit the next "
             "template fix.",
-            "n64_emit_cmakelists")
+            "n64_template_take_cmakelists" if superseded else "n64_emit_cmakelists")
     else:
         add("cmake_framework_sources", "CMakeLists.txt framework sources",
             CheckStatus.PASS, Severity.REQUIRED, "")
@@ -502,7 +631,9 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
             have = ""
     existing = {ln.strip() for ln in have.splitlines()}
     missing_rules = [r for r in GITIGNORE_RULES if r not in existing]
-    if not missing_rules:
+    if "gitignore" in superseded:
+        pass  # port_drift.py compares the whole file against the template
+    elif not missing_rules:
         add("gitignore", ".gitignore rules", CheckStatus.PASS, Severity.REQUIRED, "")
     else:
         add("gitignore", ".gitignore rules", CheckStatus.FAIL, Severity.REQUIRED,
@@ -516,6 +647,8 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
          Severity.RECOMMENDED),
         ("claude_md", "CLAUDE.md", "n64_emit_claude_md", Severity.OPTIONAL),
     ):
+        if cid in superseded:
+            continue
         if (root / rel).is_file():
             add(cid, rel, CheckStatus.PASS, sev, "")
         else:
@@ -539,6 +672,13 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
         "n64lle ships no release-workflow or packager template, so there is "
         "nothing to emit. Package a local build from the Build tab; file the "
         "missing template against n64lle rather than hand-writing one here.")
+
+    # --- template drift (n64lle's own measurement) --------------------------
+    if tpl_drift is None:
+        add("drift_source", "Template drift", CheckStatus.SKIP, Severity.RECOMMENDED,
+            drift_why + " The hand-kept checks above stand in until it can run.")
+    else:
+        _drift_rows(tpl_drift, add)
 
     # --- pins ---------------------------------------------------------------
     pins = root / PINS_FILE
@@ -1128,6 +1268,49 @@ def _op_emit_claude_md(root: Path, opts: MigrateOptions) -> ApplyResult:
     return _fill_template(root, opts, "n64_emit_claude_md", "CLAUDE.md.in", "CLAUDE.md")
 
 
+# --- template drift -----------------------------------------------------------
+def _drift_apply(root: Path, opts: MigrateOptions, op: str, extra: tuple[str, ...],
+                 cls: str) -> ApplyResult:
+    drift, why = measure_drift(root)
+    if drift is None:
+        return ApplyResult(op, False, why)
+    if not drift["_own"]:
+        return ApplyResult(op, False, "Preview only -- the templates are not from this "
+                           "port's pinned n64lle. " + _BUMP_HINT)
+    todo = [it["path"] for it in drift.get("items", [])
+            if it.get("class") == cls and it.get("state") in ("missing", "drift")]
+    if not todo:
+        return ApplyResult(op, True, "Nothing to take: already matches the template")
+    if _dry(opts):
+        return ApplyResult(op, True, f"[dry-run] would write {', '.join(todo)} "
+                           f"from n64lle {drift.get('templates_rev', '?')}")
+    after, why = measure_drift(root, "--apply", *extra,
+                               *[a for p in todo for a in ("--only", p)])
+    if after is None:
+        return ApplyResult(op, False, why)
+    wrote = after.get("wrote", [])
+    skipped = [f"{s['path']} ({s['why']})" for s in after.get("skipped", [])]
+    msg = f"Wrote {len(wrote)} file(s) from n64lle {after.get('templates_rev', '?')}"
+    if skipped:
+        msg += "; NOT written: " + ", ".join(skipped)
+    msg += ". Review with git diff, build and run the gates before committing."
+    return ApplyResult(op, not skipped, msg, wrote)
+
+
+def _op_template_sync(root: Path, opts: MigrateOptions) -> ApplyResult:
+    return _drift_apply(root, opts, "n64_template_sync", (), "owned")
+
+
+def _op_template_take_cmakelists(root: Path, opts: MigrateOptions) -> ApplyResult:
+    op = "n64_template_take_cmakelists"
+    # The same bar n64_emit_cmakelists sets: the build graph is overwritten
+    # only when asked for by name.
+    if not opts.force:
+        return ApplyResult(op, False, "CMakeLists.txt is overwritten only with Force "
+                           "ticked -- read the audit row's diff size first.")
+    return _drift_apply(root, opts, op, ("--take", "CMakeLists.txt"), "review")
+
+
 # --- pins ------------------------------------------------------------------
 def _op_record_pins(root: Path, opts: MigrateOptions) -> ApplyResult:
     op = "n64_record_framework_pins"
@@ -1151,6 +1334,8 @@ _OPS = {
     "n64_merge_gitignore": _op_merge_gitignore,
     "n64_untrack_generated": _op_untrack_generated,
     "n64_untrack_roms": _op_untrack_roms,
+    "n64_template_sync": _op_template_sync,
+    "n64_template_take_cmakelists": _op_template_take_cmakelists,
     "n64_emit_version": _op_emit_version,
     "n64_emit_build_framework": _op_emit_build_framework,
     "n64_emit_cmakelists": _op_emit_cmakelists,
