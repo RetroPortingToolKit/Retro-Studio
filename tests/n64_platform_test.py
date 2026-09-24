@@ -376,7 +376,10 @@ def test_template_drift(tmp: Path) -> None:
         other = tmp / "n64lle-current"
         (other / "runtime").mkdir(parents=True)
         (other / "runtime" / "runtime.cmake").write_text("#\n", encoding="utf-8")
-        _give_drift_tool(other)
+        # What the real tool says from a newer checkout: the port pins an
+        # older revision than the templates it rendered.
+        _give_drift_tool(other, FAKE_DRIFT.replace('"pin_rev": "feedf00d", "pin_matches": True',
+                                                   '"pin_rev": "0ld0ld00", "pin_matches": False'))
         os.environ["N64LLE_ROOT"] = str(other)
         rep = n64ops.audit_project(prev)
         ids = {c.id: c for c in rep.checks}
@@ -389,6 +392,24 @@ def test_template_drift(tmp: Path) -> None:
             prev, MigrateOptions(only=["n64_template_sync"])))
         check(len(r) == 1 and not r[0].ok and "Preview" in r[0].message,
               "sync refuses to apply a preview")
+
+        # --- a framework WORKTREE at the port's pin is the pin -----------------
+        # $N64LLE_ROOT is what the port builds against, and the tool says the
+        # port pins exactly that revision (PokemonStadiumRecomp-rust-parity:
+        # submodule not checked out, gitlink == the worktree's HEAD). Its
+        # verdict is the port's own, not a preview of a bump.
+        wt = tmp / "n64lle-worktree-at-pin"
+        (wt / "runtime").mkdir(parents=True)
+        (wt / "runtime" / "runtime.cmake").write_text("#\n", encoding="utf-8")
+        _give_drift_tool(wt)
+        os.environ["N64LLE_ROOT"] = str(wt)
+        ids = {c.id: c for c in n64ops.audit_project(prev).checks}
+        check(ids["drift_source"].status.value == "pass",
+              "a worktree at the port's pin measures, it does not preview")
+        check(ids.get("drift:.gitignore") is not None
+              and ids["drift:.gitignore"].fix_op == "n64_template_sync",
+              "and its rows carry fix ops")
+        os.environ["N64LLE_ROOT"] = str(other)
 
         # --- a pinned copy too old for --json falls through to the preview -----
         _give_drift_tool(prev / "n64lle", "import sys; sys.exit('unrecognized arguments: --json')\n")
@@ -553,6 +574,171 @@ def test_framework_preflight(root: Path) -> None:
         check(argv[-1] == "Release", "the build config is still the last argument")
 
 
+# The shape of n64lle's runtime.cmake after the Rust migration (rust-parity,
+# 2026-09-23): one archive, find_program(N64LLE_CARGO), and a resolve function
+# that no longer sets N64LLE_SUPPORT / N64LLE_ISA_INC. Only the lines the
+# readers look at; the real file is read in the end-to-end run, not here.
+RUST_RUNTIME_CMAKE = """\
+function(n64lle_runtime_resolve_framework ROOT BUILD)
+    set(_libs
+        "${BUILD}/runtime/libn64lle-rt.a")
+    set(_harvest "${BUILD}/bench/n64lle-harvest${CMAKE_EXECUTABLE_SUFFIX}")
+    set(_emit    "${BUILD}/recompiler/emitter/n64emit${CMAKE_EXECUTABLE_SUFFIX}")
+    foreach(_f IN LISTS _libs ITEMS "${_harvest}" "${_emit}")
+    endforeach()
+    set(N64LLE_ROOT     "${ROOT}"    PARENT_SCOPE)
+    set(N64LLE_BUILD    "${BUILD}"   PARENT_SCOPE)
+    set(N64LLE_LIBS     ${_link}     PARENT_SCOPE)
+    set(N64LLE_HARVEST  "${_harvest}" PARENT_SCOPE)
+    set(N64LLE_EMIT     "${_emit}"   PARENT_SCOPE)
+endfunction()
+function(n64lle_add_runtime_target TGT)
+    find_program(N64LLE_CARGO cargo REQUIRED)
+endfunction()
+"""
+
+
+def _rust_framework(fw: Path) -> None:
+    (fw / "runtime").mkdir(parents=True, exist_ok=True)
+    (fw / "runtime" / "runtime.cmake").write_text(RUST_RUNTIME_CMAKE, encoding="utf-8")
+    (fw / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.96.0"\n',
+                                            encoding="utf-8")
+    (fw / "tools").mkdir(exist_ok=True)
+    (fw / "tools" / "build_framework.sh").write_text("#!/usr/bin/env bash\n")
+
+
+def test_framework_root(tmp: Path) -> None:
+    """The framework a port BUILDS against, not always its submodule.
+
+    PokemonStadiumRecomp-rust-parity is built against an n64lle worktree: its
+    submodule is not checked out and build-release/CMakeCache.txt names the
+    worktree. Studio used to ask <port>/n64lle every build question, so it
+    refused to configure that port and would have read the resolve contract of
+    a different framework than the one cmake links.
+    """
+    print("framework root")
+    from project_studio import buildops
+
+    platforms.set_current("n64")
+    port = tmp / "WtRecomp"
+    port.mkdir()
+    (port / "CMakeLists.txt").write_text(CMAKE, encoding="utf-8")
+    wt = tmp / "n64lle-worktree"
+    _rust_framework(wt)
+    saved = {k: os.environ.pop(k, None) for k in ("N64LLE_ROOT", "N64LLE_FRAMEWORK_BUILD_DIR")}
+    try:
+        check(n64_paths.framework_root(port) == port / "n64lle",
+              "default: the submodule")
+        (port / "build-release").mkdir()
+        (port / "build-release" / "CMakeCache.txt").write_text(
+            f"N64LLE_ROOT:PATH={wt}\nN64LLE_BUILD:PATH={tmp / 'fwbuild'}\n",
+            encoding="utf-8")
+        check(n64_paths.framework_root(port) == wt, "a configured tree's N64LLE_ROOT wins")
+        check(n64_paths.framework_build_dir(port) == tmp / "fwbuild",
+              "and its N64LLE_BUILD is where the framework is looked for")
+        check(n64_paths.framework_configure_args(port) == [],
+              "a cached value needs no -D")
+        check(n64_paths.framework_required_artifacts(port) ==
+              ["runtime/libn64lle-rt.a", "bench/n64lle-harvest",
+               "recompiler/emitter/n64emit"],
+              "the resolve contract is read from THAT framework (one Rust archive)")
+        other = tmp / "n64lle-env"
+        _rust_framework(other)
+        os.environ["N64LLE_ROOT"] = str(other)
+        check(n64_paths.framework_root(port) == other, "$N64LLE_ROOT beats the cache")
+        check(n64_paths.framework_configure_args(port) == [f"-DN64LLE_ROOT={other}"],
+              "and is handed to cmake, which would otherwise keep the cache")
+        os.environ["N64LLE_FRAMEWORK_BUILD_DIR"] = "fw-alt"
+        check(n64_paths.framework_build_dir(port) == port / "fw-alt",
+              "a relative N64LLE_FRAMEWORK_BUILD_DIR is taken from the port root")
+        d = buildops.build_n64_framework(port, dry_run=True)
+        check(d.ok and str(other / "tools" / "build_framework.sh") in d.message,
+              "the framework build runs THAT checkout's canonical script")
+        os.environ["N64LLE_ROOT"] = str(tmp / "nowhere")
+        pre = buildops.preflight_n64_framework(port)
+        check(pre is not None and "$N64LLE_ROOT" in pre.message
+              and "submodule is not checked out" not in pre.message,
+              "a bad override is named as the override, not as a missing submodule")
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_rust_toolchain(tmp: Path) -> None:
+    """A Rust-built n64lle needs cargo, for the framework AND the port."""
+    print("rust toolchain")
+    from project_studio import buildops, n64ops
+
+    platforms.set_current("n64")
+    fw = tmp / "rustfw"
+    _rust_framework(fw)
+    c_fw = tmp / "cfw"
+    (c_fw / "runtime").mkdir(parents=True)
+    (c_fw / "runtime" / "runtime.cmake").write_text("# C-era: no cargo\n")
+    check(n64_paths.framework_needs_cargo(fw), "read from runtime.cmake: needs cargo")
+    check(not n64_paths.framework_needs_cargo(c_fw), "a C-era framework does not")
+    check(n64_paths.rust_channel(fw) == "1.96.0", "the pinned channel is read, not assumed")
+
+    saved = {k: os.environ.get(k) for k in ("PATH", "CARGO_HOME", "N64LLE_ROOT")}
+    try:
+        os.environ["PATH"] = str(tmp / "empty-bin")
+        os.environ["CARGO_HOME"] = str(tmp / "no-cargo-home")
+        why = n64_paths.rust_toolchain_problem(fw)
+        check(why is not None and "cargo" in why and "1.96.0" in why,
+              "no cargo: a reason naming cargo and the pinned channel")
+        check(n64_paths.rust_toolchain_problem(c_fw) is None,
+              "and no requirement for a framework that does not use it")
+        os.environ["N64LLE_ROOT"] = str(fw)
+        port = tmp / "RustPort"
+        port.mkdir()
+        (port / "CMakeLists.txt").write_text(CMAKE, encoding="utf-8")
+        pre = buildops.preflight_n64_framework(port)
+        check(pre is not None and "cargo" in pre.message,
+              "configure is refused before cmake's find_program would be")
+        rep = n64ops.audit_project(port)
+        row = next((c for c in rep.checks if c.id == "rust_toolchain"), None)
+        check(row is not None and row.status.value == "fail",
+              "Migrate shows the missing toolchain as a failing row")
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_vanished_variables(tmp: Path) -> None:
+    """${N64LLE_SUPPORT} after the framework stopped setting it."""
+    print("vanished framework variables")
+    from project_studio import n64ops
+
+    port = tmp / "OldPort"
+    port.mkdir()
+    _rust_framework(port / "n64lle")
+    (port / "CMakeLists.txt").write_text(CMAKE + """\
+option(N64LLE_HARVEST_CACHE "port-owned" ON)
+add_executable(zed-cosim
+  "${N64LLE_ROOT}/bench/cosim_gate1_driver.c"
+  "${N64LLE_SUPPORT}/n64emit_support.c")
+target_include_directories(zed-cosim PRIVATE "${N64LLE_ISA_INC}")
+target_link_libraries(zed-cosim PRIVATE ${N64LLE_LIBS} ${N64LLE_HARVEST_CACHE})
+""", encoding="utf-8")
+    saved = os.environ.pop("N64LLE_ROOT", None)
+    try:
+        check(n64ops.vanished_framework_variables(port) == ["N64LLE_SUPPORT", "N64LLE_ISA_INC"],
+              "the two variables rust-parity removed are named; LIBS and the "
+              "port's own option are not")
+        check(n64ops.missing_framework_sources(port) == ["bench/cosim_gate1_driver.c"],
+              "and the C driver the framework no longer has")
+        (port / "CMakeLists.txt").write_text(CMAKE, encoding="utf-8")
+        check(n64ops.vanished_framework_variables(port) == [],
+              "a current CMakeLists reads nothing that vanished")
+    finally:
+        if saved is not None:
+            os.environ["N64LLE_ROOT"] = saved
+
+
 def test_failed_scaffold_is_discarded(tmp: Path) -> None:
     """A scaffold that does not finish leaves nothing behind.
 
@@ -664,6 +850,9 @@ def main() -> int:
         test_template_drift(tmp)
         test_refuses_unresolved_tokens(tmp)
         test_new_project_command(tmp)
+        test_framework_root(tmp)
+        test_rust_toolchain(tmp)
+        test_vanished_variables(tmp)
         test_failed_scaffold_is_discarded(tmp)
         test_refusals()
     print("FAILED" if failures else "PASSED")

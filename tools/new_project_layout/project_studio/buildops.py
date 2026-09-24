@@ -1019,17 +1019,36 @@ def _missing_summary(root: Path) -> str:
     return f"{head} (and {len(missing) - 1} more required artifact(s))"
 
 
-def preflight_n64_framework(root: Path) -> CmdResult | None:
-    """Reasons an n64lle port cannot configure, found before cmake runs."""
-    root = Path(root).expanduser().resolve()
-    fw = root / "n64lle"
-    if not (fw / _n64_paths.MARKER).is_file():
+def _n64_framework_missing(root: Path, fw: Path) -> CmdResult:
+    """The framework the port resolves to is not a checkout."""
+    if fw == root / "n64lle":
         return CmdResult(
             False,
             "The n64lle submodule is not checked out — a port includes "
             "n64lle/runtime/runtime.cmake and cannot configure without it. "
             "Run: git submodule update --init --recursive n64lle",
         )
+    return CmdResult(
+        False,
+        f"This port builds against {fw} (from "
+        f"{_n64_paths.framework_root_source(root)}), which has no "
+        f"{_n64_paths.MARKER}. Point N64LLE_ROOT at an n64lle checkout, or "
+        "unset it to use the port's own submodule.",
+    )
+
+
+def preflight_n64_framework(root: Path) -> CmdResult | None:
+    """Reasons an n64lle port cannot configure, found before cmake runs."""
+    root = Path(root).expanduser().resolve()
+    fw = _n64_paths.framework_root(root)
+    if not (fw / _n64_paths.MARKER).is_file():
+        return _n64_framework_missing(root, fw)
+    # Before the artifact check, and even when the framework IS built: since
+    # n64lle went Rust the PORT's own build runs cargo too (the host staticlib
+    # and the drivers), so a built framework does not mean a buildable port.
+    rust = _n64_paths.rust_toolchain_problem(fw)
+    if rust is not None:
+        return CmdResult(False, rust)
     if _n64_paths.framework_is_built(root):
         return None
     script = _n64_paths.framework_build_script(root)
@@ -1049,6 +1068,43 @@ def preflight_n64_framework(root: Path) -> CmdResult | None:
         "n64lle_runtime_resolve_framework() would fail inside cmake. "
         f"Run: bash {script.relative_to(root).as_posix()} Release",
     )
+
+
+def _n64_rust_versions(fw: Path, *, log: LogFn | None = None) -> CmdResult:
+    """``cargo --version`` and rustc's host triple, asked inside ``fw``."""
+    cargo = _n64_paths.find_cargo() or "cargo"
+    lines: list[str] = []
+    for argv in ([cargo, "--version"], ["rustc", "-vV"]):
+        try:
+            proc = subprocess.run(argv, cwd=str(fw), capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=1800)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return CmdResult(False, f"could not run {argv[0]}: {exc}")
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip()
+            return CmdResult(
+                False,
+                f"`{' '.join(argv)}` failed in {fw}, so the toolchain its "
+                "rust-toolchain.toml pins is not usable here.",
+                tail,
+            )
+        lines.append(proc.stdout.strip())
+    host = next((ln.split(":", 1)[1].strip() for ln in lines[1].splitlines()
+                 if ln.startswith("host:")), "?")
+    channel = _n64_paths.rust_channel(fw)
+    if log:
+        log(f"rust: {lines[0]} (host {host}"
+            + (f"; pinned channel {channel}" if channel else "") + ")")
+        if os.name == "nt" and not host.endswith("-windows-gnu"):
+            # n64lle's CMake runs cargo with no --target and links the result
+            # as lib<name>.a by path, which is the GNU target's spelling. Not
+            # verified on Windows from here -- said, not refused.
+            log("note: n64lle links cargo's output as .a archives from a "
+                "MinGW build; this rustc's host is " + host + ", not a "
+                "*-windows-gnu target. Expect the link to need "
+                "`rustup default stable-x86_64-pc-windows-gnu` (or the "
+                "toolchain rust-toolchain.toml pins, for that target).")
+    return CmdResult(True, lines[0])
 
 
 def build_n64_framework(
@@ -1097,13 +1153,12 @@ def build_n64_framework(
                 "shared n64lle/tools/build_framework.sh instead; fold anything "
                 "that copy still needs upstream."
             )
-    fw = root / "n64lle"
+    fw = _n64_paths.framework_root(root)
     if not (fw / _n64_paths.MARKER).is_file():
-        return CmdResult(
-            False,
-            "The n64lle submodule is not checked out. Run: "
-            "git submodule update --init --recursive n64lle",
-        )
+        return _n64_framework_missing(root, fw)
+    rust = _n64_paths.rust_toolchain_problem(fw)
+    if rust is not None:
+        return CmdResult(False, rust)
     # NOT ``sh``: build_framework.sh is `#!/usr/bin/env bash`, and Windows has
     # no sh on PATH at all — the same resolution tools/regen.sh and
     # package_release.sh already go through.
@@ -1119,11 +1174,29 @@ def build_n64_framework(
     # The shared script writes build-n64lle/ under the PORT, not under n64lle.
     env = dict(os.environ)
     env["N64LLE_PORT_ROOT"] = str(root)
+    # And it builds where the port will LOOK: a tree configured with its own
+    # N64LLE_BUILD (a worktree's framework, kept apart from the submodule's)
+    # has to be rebuilt there, not into build-n64lle/. N64LLE_ROOT is exported
+    # for the fallback case, the port's shim, which reads it; the canonical
+    # script builds the tree it lives in, which framework_root() already chose.
+    fw_build = _n64_paths.framework_build_dir(root)
+    env["N64LLE_FRAMEWORK_BUILD_DIR"] = str(fw_build)
+    env["N64LLE_ROOT"] = str(fw)
+    if log and (fw != root / "n64lle" or fw_build != root / _n64_paths.FRAMEWORK_BUILD_DIR):
+        log(f"n64lle: {fw} (from {_n64_paths.framework_root_source(root)}), "
+            f"built into {fw_build}")
     if dry_run:
         msg = "dry-run: " + " ".join(cmd)
         if log:
             log(msg)
         return CmdResult(True, msg)
+    if _n64_paths.framework_needs_cargo(fw):
+        # Asked in the framework's directory, so rustup answers with the
+        # toolchain rust-toolchain.toml pins (and installs it if it must)
+        # before the build starts, rather than in the middle of a configure.
+        v = _n64_rust_versions(fw, log=log)
+        if not v.ok:
+            return v
     r = _run_stream(cmd, root, log=log, env=env)
     if not r.ok:
         return r
@@ -1717,6 +1790,12 @@ def configure(
             if log:
                 log(pre.message)
             return pre
+        # The framework preflight just checked, not the submodule the
+        # CMakeLists defaults to. Empty unless $N64LLE_ROOT /
+        # $N64LLE_FRAMEWORK_BUILD_DIR override it; a caller's own -D wins.
+        explicit = _explicit_cache_vars(extra_args)
+        extra_args = [a for a in _n64_paths.framework_configure_args(root)
+                      if a[2:].split("=", 1)[0] not in explicit] + list(extra_args or [])
 
     bdir = Path(build_dir)
     if not bdir.is_absolute():

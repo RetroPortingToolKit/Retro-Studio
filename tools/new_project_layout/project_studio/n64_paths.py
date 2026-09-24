@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from pathlib import Path
 
 from .paths import toolkit_dir
@@ -137,7 +138,14 @@ def drift_tools(game_root: Path | str):
         pass
     own = root / "n64lle"
     seen: set[Path] = set()
-    order = ([own] if _is_framework(own) else []) + list(_candidates(root))
+    # Second: the framework the port BUILDS against when that is not its
+    # submodule ($N64LLE_ROOT, or the N64LLE_ROOT its build tree was configured
+    # with -- a framework worktree, the way the family develops framework and
+    # port together). measure_drift decides from the tool's own pin_matches
+    # whether that checkout's verdict may be applied.
+    built = framework_root(root)
+    order = ([own] if _is_framework(own) else []) \
+        + ([built] if _is_framework(built) else []) + list(_candidates(root))
     for cand in order:
         try:
             key = cand.resolve()
@@ -179,9 +187,110 @@ def probe_rom_script(game_root: Path | str | None = None) -> Path | None:
 FRAMEWORK_BUILD_DIR = "build-n64lle"
 FRAMEWORK_BUILD_SCRIPT = Path("tools") / "build_framework.sh"
 
+# The port's own build tree, as n64lle's setup_project.sh names it (BUILD_DIR)
+# and buildops.DEFAULT_BUILD_DIR defaults to. Read here only to find the
+# N64LLE_ROOT / N64LLE_BUILD a port was CONFIGURED with; buildops passes its
+# own build dir whenever it has one.
+PORT_BUILD_DIR = "build-release"
 
-def framework_build_dir(game_root: Path | str) -> Path:
-    return Path(str(game_root)).expanduser().resolve() / FRAMEWORK_BUILD_DIR
+
+def _port(game_root: Path | str) -> Path:
+    return Path(str(game_root)).expanduser().resolve()
+
+
+def _cache_value(build_tree: Path, name: str) -> str:
+    """``name`` from ``<build_tree>/CMakeCache.txt``, or ""."""
+    try:
+        text = (build_tree / "CMakeCache.txt").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    m = re.search(rf"^{re.escape(name)}:[A-Z]+=(.*)$", text, re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _env_path(var: str, port: Path) -> Path | None:
+    raw = (os.environ.get(var) or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    # Relative to the PORT, the rule n64lle's build_framework.sh applies to
+    # N64LLE_FRAMEWORK_BUILD_DIR.
+    return p if p.is_absolute() else port / p
+
+
+def _port_tree(port: Path, build_dir: str | Path | None) -> Path:
+    b = Path(build_dir) if build_dir else Path(PORT_BUILD_DIR)
+    return b if b.is_absolute() else port / b
+
+
+# ---------------------------------------------------------------------------
+# WHICH n64lle a port builds against
+# ---------------------------------------------------------------------------
+# Not always its submodule. The family develops framework and port together in
+# worktrees (the workspace rules; n64lle's rust-parity branch was built exactly
+# so), and the port's own shim says how: `N64LLE_ROOT=<worktree>` points
+# tools/build_framework.sh at it, and the port is then configured with
+# -DN64LLE_ROOT=<worktree>. PokemonStadiumRecomp-rust-parity is such a port --
+# its n64lle/ submodule is not even checked out, and its build-release/
+# CMakeCache.txt names the worktree.
+#
+# Studio used to hard-code <port>/n64lle for every build question, so on that
+# port it reported "submodule not checked out" and refused to configure a tree
+# that builds fine, and it would have read the resolve contract out of a
+# DIFFERENT framework than the one cmake links. The order below is the order
+# cmake itself resolves N64LLE_ROOT in when Studio configures: an explicit
+# -D (Studio passes $N64LLE_ROOT as one, see framework_configure_args), else
+# the cached value, else the CMakeLists default.
+def framework_root(game_root: Path | str, build_dir: str | Path | None = None) -> Path:
+    """The n64lle checkout this port's build uses (may not exist)."""
+    port = _port(game_root)
+    env = _env_path("N64LLE_ROOT", port)
+    if env is not None:
+        return env
+    cached = _cache_value(_port_tree(port, build_dir), "N64LLE_ROOT")
+    if cached:
+        return Path(cached)
+    return port / "n64lle"
+
+
+def framework_root_source(game_root: Path | str, build_dir: str | Path | None = None) -> str:
+    """Where framework_root() got its answer, for a log line."""
+    port = _port(game_root)
+    if _env_path("N64LLE_ROOT", port) is not None:
+        return "$N64LLE_ROOT"
+    if _cache_value(_port_tree(port, build_dir), "N64LLE_ROOT"):
+        return f"{Path(_port_tree(port, build_dir)).name}/CMakeCache.txt"
+    return "the n64lle submodule"
+
+
+def framework_build_dir(game_root: Path | str, build_dir: str | Path | None = None) -> Path:
+    """Where the pre-built framework is (the port's N64LLE_BUILD)."""
+    port = _port(game_root)
+    env = _env_path("N64LLE_FRAMEWORK_BUILD_DIR", port)
+    if env is not None:
+        return env
+    cached = _cache_value(_port_tree(port, build_dir), "N64LLE_BUILD")
+    if cached:
+        return Path(cached)
+    return port / FRAMEWORK_BUILD_DIR
+
+
+def framework_configure_args(game_root: Path | str) -> list[str]:
+    """``-D`` entries that make cmake use the framework Studio resolved.
+
+    Only for an environment override: a cached value needs no -D (cmake keeps
+    it), and passing the submodule default explicitly would write it into a
+    cache that was deliberately pointed elsewhere.
+    """
+    port = _port(game_root)
+    out: list[str] = []
+    env_root = _env_path("N64LLE_ROOT", port)
+    if env_root is not None:
+        out.append(f"-DN64LLE_ROOT={env_root}")
+    env_build = _env_path("N64LLE_FRAMEWORK_BUILD_DIR", port)
+    if env_build is not None:
+        out.append(f"-DN64LLE_BUILD={env_build}")
+    return out
 
 
 FRAMEWORK_OWNED_BUILD_SCRIPT = Path("n64lle") / "tools" / "build_framework.sh"
@@ -211,9 +320,11 @@ def framework_owned_build_script(game_root: Path | str) -> Path | None:
     """The framework's own ``n64lle/tools/build_framework.sh``, or None.
 
     Present only on ports pinned to an n64lle from 2026-09-15 or later. When it
-    is there it is the one to run: it is shared, so a fix lands once.
+    is there it is the one to run: it is shared, so a fix lands once. Taken
+    from framework_root(), so a port built against a worktree runs the
+    worktree's script -- the one its shim would exec.
     """
-    p = Path(str(game_root)).expanduser().resolve() / FRAMEWORK_OWNED_BUILD_SCRIPT
+    p = framework_root(game_root) / "tools" / "build_framework.sh"
     return p if p.is_file() else None
 
 
@@ -237,16 +348,19 @@ def port_script_is_shim(game_root: Path | str) -> bool | None:
 # What "built" means is not Studio's to define: n64lle_runtime_resolve_framework()
 # enumerates the artifacts it will FATAL_ERROR on, and that list is the contract.
 # It is read out of the port's own pinned runtime.cmake rather than copied here,
-# because it grows — libn64lle-runtime-cosim.a and -xxhash.a are both newer than
-# the first port — and a second copy would go stale in the direction that hurts:
-# reporting a tree as built that cmake then rejects.
+# because it changes — it grew archive by archive while the engine was C, and on
+# 2026-09-23 (n64lle rust-parity) it shrank to ONE Rust archive,
+# runtime/libn64lle-rt.a, plus the harvest and n64emit binaries. A second copy
+# would have gone stale in the direction that hurts: reporting a tree as built
+# that cmake then rejects, or as unbuilt for want of archives that no longer
+# exist.
 _RESOLVE_ARTIFACT_RE = re.compile(r'"\$\{BUILD\}/([^"\n]+)"')
 _EXE_SUFFIX_RE = re.compile(r"\$\{CMAKE_EXECUTABLE_SUFFIX\}")
 
 
 def framework_runtime_cmake(game_root: Path | str) -> Path | None:
-    """The port's pinned ``n64lle/runtime/runtime.cmake``, or None."""
-    p = Path(str(game_root)).expanduser().resolve() / "n64lle" / MARKER
+    """The ``runtime/runtime.cmake`` of the framework the port builds against."""
+    p = framework_root(game_root) / MARKER
     return p if p.is_file() else None
 
 
@@ -314,7 +428,8 @@ def framework_is_built(game_root: Path | str) -> bool:
     that dies compiling runtime/src/rsp/rsp.c still leaves n64emit behind. The
     preflight then passed, configure ran, and cmake failed several files away
     naming libn64lle-runtime-devices.a — with Studio having just reported the
-    prerequisite as satisfied.
+    prerequisite as satisfied. (Those archive names are C-era; the list is
+    whatever the pinned runtime.cmake says today.)
     """
     build = framework_build_dir(game_root)
     if not build.is_dir():
@@ -328,3 +443,75 @@ def framework_is_built(game_root: Path | str) -> bool:
         if list(build.rglob(name)):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# The Rust toolchain a Rust-built framework needs
+# ---------------------------------------------------------------------------
+# Since n64lle rust-parity (2026-09-23) the engine, host, recompiler tools and
+# drivers are cargo crates: the framework build runs cargo, and so does the
+# PORT's own build (n64lle_add_runtime_target() builds libn64lle_host.a, and
+# n64lle_add_driver_target() the bench/cosim drivers). Both find cargo with
+# find_program(... REQUIRED), so a machine without it fails several minutes
+# into a configure -- or, from New Project, after the scaffold has been laid
+# out and is then rolled back.
+#
+# WHETHER a framework needs cargo is read from the pin, not assumed: its
+# runtime.cmake either calls find_program(N64LLE_CARGO ...) or it does not (the
+# C-era ones do not). WHICH toolchain is the pin's rust-toolchain.toml; rustup
+# reads that file itself, so Studio only reports it.
+_CARGO_FIND_RE = re.compile(r"find_program\s*\(\s*N64LLE_CARGO\b")
+_CHANNEL_RE = re.compile(r'^\s*channel\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+def framework_needs_cargo(fw: Path) -> bool:
+    try:
+        text = (Path(fw) / MARKER).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(_CARGO_FIND_RE.search(text))
+
+
+def rust_channel(fw: Path) -> str:
+    """The pinned toolchain channel from ``rust-toolchain.toml``, or ""."""
+    try:
+        text = (Path(fw) / "rust-toolchain.toml").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = _CHANNEL_RE.search(text)
+    return m.group(1) if m else ""
+
+
+def find_cargo() -> str | None:
+    """cargo on PATH, else rustup's default install location."""
+    hit = shutil.which("cargo")
+    if hit:
+        return hit
+    home = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo"))
+    for name in ("cargo", "cargo.exe"):
+        p = home / "bin" / name
+        if p.is_file():
+            return str(p)
+    return None
+
+
+def rust_toolchain_problem(fw: Path) -> str | None:
+    """Why this framework cannot be built here, toolchain-wise, or None."""
+    if not framework_needs_cargo(fw):
+        return None
+    channel = rust_channel(fw)
+    pin = f" Its rust-toolchain.toml pins {channel}; rustup installs that itself." \
+        if channel else ""
+    cargo = find_cargo()
+    if cargo is None:
+        return (
+            f"The n64lle at {fw} is built with cargo (its engine, host, "
+            "recompiler tools and drivers are Rust crates), and no cargo was "
+            "found. Install rustup (https://rustup.rs) and re-open Studio." + pin
+        )
+    if shutil.which("cargo") is None:
+        return (
+            f"cargo is installed at {cargo} but not on PATH, and n64lle's CMake "
+            "finds it with find_program(). Add its directory to PATH." + pin
+        )
+    return None

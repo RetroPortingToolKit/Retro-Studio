@@ -326,7 +326,15 @@ def measure_drift(root: Path, *extra: str) -> tuple[dict | None, str]:
             tried.append(f"{checkout}: {tail[0]}")
             continue
         data["_checkout"] = str(checkout)
-        data["_own"] = bool(own)
+        # The port's own submodule is always its pin. Any other checkout is the
+        # pin too when it is the framework the port BUILDS against and the tool
+        # itself says the port's pin is that checkout's revision -- a framework
+        # worktree at the gitlink, which is how the family works on framework
+        # and port together. Anything else stays a preview.
+        pin = str(data.get("pin_rev") or "?")
+        builds_here = _same_dir(checkout, n64_paths.framework_root(root))
+        data["_own"] = bool(own) or (
+            builds_here and pin != "?" and pin == str(data.get("templates_rev") or ""))
         data["_tried"] = tried
         return data, ""
     if tried:
@@ -334,6 +342,13 @@ def measure_drift(root: Path, *extra: str) -> tuple[dict | None, str]:
     return None, ("No n64lle checkout carries tools/new_project/port_drift.py "
                   "(added 2026-09-23). " + _BUMP_HINT + " Or point N64LLE_ROOT "
                   "at a current n64lle to preview.")
+
+
+def _same_dir(a: Path | str, b: Path | str) -> bool:
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
 
 
 def _drift_rows(drift: dict, add) -> None:
@@ -454,6 +469,40 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
             "Declared but not initialised." if ui_declared else "Not present (optional).",
             "n64_ensure_recomp_ui_submodule")
 
+    # Which n64lle the BUILD uses. Usually the submodule above; a port can be
+    # built against a framework worktree instead ($N64LLE_ROOT, or the
+    # N64LLE_ROOT its build tree was configured with), and then the submodule
+    # row is about the committed pin while this one is about the build.
+    fw = n64_paths.framework_root(root)
+    if not _same_dir(fw, root / FRAMEWORK):
+        if (fw / FRAMEWORK_MARKER).is_file():
+            add("framework_build", "n64lle used by the build", CheckStatus.PASS,
+                Severity.INFO,
+                f"{fw} (from {n64_paths.framework_root_source(root)}), not the "
+                "submodule. Framework checks below read this checkout.")
+        else:
+            add("framework_build", "n64lle used by the build", CheckStatus.FAIL,
+                Severity.REQUIRED,
+                f"{fw} (from {n64_paths.framework_root_source(root)}) has no "
+                f"{FRAMEWORK_MARKER}. Point N64LLE_ROOT at an n64lle checkout "
+                "or reconfigure against the submodule.")
+
+    # The Rust toolchain, when the framework is built with cargo (n64lle
+    # rust-parity onwards). The PORT's own build runs cargo too -- the host
+    # staticlib and the bench/cosim drivers -- so this is a port requirement,
+    # not only a framework one.
+    if (fw / FRAMEWORK_MARKER).is_file() and n64_paths.framework_needs_cargo(fw):
+        rust = n64_paths.rust_toolchain_problem(fw)
+        chan = n64_paths.rust_channel(fw)
+        if rust is None:
+            add("rust_toolchain", "Rust toolchain (cargo)", CheckStatus.PASS,
+                Severity.REQUIRED,
+                f"{n64_paths.find_cargo()}" + (f"; the pin asks for {chan}" if chan else ""))
+        else:
+            add("rust_toolchain", "Rust toolchain (cargo)", CheckStatus.FAIL,
+                Severity.REQUIRED, rust + " No fix op: installing a toolchain "
+                "is the machine's owner's call.")
+
     # n64lle vendors ares and rabbitizer, but its own build initialises them
     # and Studio does not manage their pins. Recorded as a passing INFO row so
     # the absence of a "nested libs" line is not read as an oversight.
@@ -507,16 +556,30 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
 
     # --- scaffold vs the framework it is pinned to ---------------------------
     gone = missing_framework_sources(root)
-    if gone:
+    unset = vanished_framework_variables(root)
+    if gone or unset:
+        parts = []
+        if gone:
+            parts.append(
+                "Names " + ", ".join(f"n64lle/{g}" for g in gone) + ", which the "
+                "pinned n64lle does not have. add_executable() on a missing "
+                "source is a CMake generate error, so this port cannot "
+                "configure at all.")
+        if unset:
+            parts.append(
+                "Reads " + ", ".join("${" + v + "}" for v in unset) + ", which "
+                "nothing in the pinned n64lle sets any more, so each expands to "
+                "an empty string: a source path of \"/n64emit_support.c\", an "
+                "include directory of \"\". (n64lle rust-parity removed "
+                "N64LLE_SUPPORT and N64LLE_ISA_INC with the C headers: the "
+                "emitters now write the headers beside the generated C, and "
+                "the drivers come from n64lle_add_driver_target().)")
         add("cmake_framework_sources", "CMakeLists.txt framework sources",
             CheckStatus.FAIL, Severity.REQUIRED,
-            "Names " + ", ".join(f"n64lle/{g}" for g in gone) + ", which the "
-            "pinned n64lle does not have. add_executable() on a missing source "
-            "is a CMake generate error, so this port cannot configure at all. "
-            "The scaffolder's current template already handles it; this copy "
-            "was rendered before that. Re-emit it (--force) rather than "
-            "editing the game repo — a hand edit cannot inherit the next "
-            "template fix.",
+            " ".join(parts) + " The scaffolder's current template already "
+            "handles it; this copy was rendered before that. Re-emit it "
+            "(--force) rather than editing the game repo — a hand edit cannot "
+            "inherit the next template fix.",
             "n64_template_take_cmakelists" if superseded else "n64_emit_cmakelists")
     else:
         add("cmake_framework_sources", "CMakeLists.txt framework sources",
@@ -591,7 +654,8 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
             CheckStatus.WARN, Severity.RECOMMENDED,
             f"{len(srcs)} C file(s) under host/. The scaffolded layout has no "
             "host/ at all: the launcher, input, audio and run loop live in "
-            "n64lle/runtime/host and reach every port on a submodule bump. "
+            "n64lle (crates/n64lle-host since the Rust migration, "
+            "runtime/host before it) and reach every port on a submodule bump. "
             "No fix op — deleting a port's host is a decision with a "
             "measurement behind it, not a mechanical sweep.")
 
@@ -965,7 +1029,7 @@ def missing_framework_sources(root: Path) -> list[str]:
     the ones the port has no control over. A path that resolves through a
     variable this reader cannot expand is skipped rather than guessed at.
     """
-    fw = root / "n64lle"
+    fw = n64_paths.framework_root(root)
     if not (fw / n64_paths.MARKER).is_file():
         return []  # no checkout to check against; the submodule check says so.
     text = _cmake_text(root)
@@ -980,6 +1044,50 @@ def missing_framework_sources(root: Path) -> list[str]:
         if f'if(EXISTS "${{N64LLE_ROOT}}/{rel}")' in text:
             continue
         out.append(rel)
+    return out
+
+
+_N64LLE_VAR_REF_RE = re.compile(r"\$\{(N64LLE_[A-Z0-9_]+)\}")
+_N64LLE_VAR_DEF_RE = re.compile(
+    r"\b(?:set|option|find_program|find_file|find_path|find_library)\s*\(\s*"
+    r"(N64LLE_[A-Z0-9_]+)\b")
+_FRAMEWORK_INCLUDE_RE = re.compile(
+    r'include\s*\(\s*"?\$\{N64LLE_ROOT\}/([A-Za-z0-9_./-]+\.cmake)"?')
+
+
+def vanished_framework_variables(root: Path) -> list[str]:
+    """``${N64LLE_*}`` the port reads and nothing defines any more.
+
+    The sibling of missing_framework_sources for the class that check cannot
+    see: a port's CMakeLists names framework paths through variables the
+    framework sets, and when the framework stops setting one the reference
+    does not fail -- it expands to "". n64lle rust-parity (2026-09-23) removed
+    N64LLE_SUPPORT and N64LLE_ISA_INC from n64lle_runtime_resolve_framework(),
+    so a port cut before it compiles "${N64LLE_SUPPORT}/n64emit_support.c" as
+    "/n64emit_support.c".
+
+    "Defined" is read from the pin, never listed here: every set()/option()/
+    find_*() of an N64LLE_ variable in the pinned runtime.cmake and in each
+    framework .cmake file the port include()s, plus the port's own. Empty when
+    there is no checkout to read.
+    """
+    fw = n64_paths.framework_root(root)
+    if not (fw / n64_paths.MARKER).is_file():
+        return []
+    text = _cmake_text(root)
+    if not text:
+        return []
+    defined = set(_N64LLE_VAR_DEF_RE.findall(text))
+    for rel in {n64_paths.MARKER.as_posix(), *_FRAMEWORK_INCLUDE_RE.findall(text)}:
+        try:
+            src = (fw / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        defined |= set(_N64LLE_VAR_DEF_RE.findall(src))
+    out: list[str] = []
+    for name in _N64LLE_VAR_REF_RE.findall(text):
+        if name not in defined and name not in out:
+            out.append(name)
     return out
 
 

@@ -356,8 +356,17 @@ def validate_options(opts: NewProjectOptions) -> list[str]:
         ):
             if value < 0:
                 errs.append(f"{label} cannot be negative")
-        if n64_paths.setup_script(None) is None:
+        wiz = n64_paths.wizard_dir(None)
+        if wiz is None:
             errs.append(n64_paths.MISSING_CHECKOUT)
+        elif opts.do_generate or opts.do_build:
+            # --generate builds the framework the wizard lives in, and since
+            # n64lle went Rust that build runs cargo. Without it the wizard
+            # fails minutes in, inside cmake, and rolls the scaffold back; say
+            # it before anything is laid out.
+            rust = n64_paths.rust_toolchain_problem(wiz.parent.parent)
+            if rust:
+                errs.append(rust)
     if snes:
         tap = (opts.multitap or "").strip().lower()
         if tap and tap not in ("port1", "port2", "both", "off"):
