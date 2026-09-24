@@ -456,7 +456,20 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
     # --- framework ----------------------------------------------------------
     declared, live = _submodule_present(root, FRAMEWORK, FRAMEWORK_MARKER)
     broken = diagnose_framework_checkout(root) if (root / FRAMEWORK).is_dir() else None
-    if live and broken:
+    # The build may use another checkout (see "n64lle used by the build"
+    # below). When it does and that checkout is real, an uninitialised
+    # submodule does not stop this port building -- it stops it building
+    # WITHOUT the override, which is worth a warning, not a failure.
+    fw_build = n64_paths.framework_root(root)
+    elsewhere = (not _same_dir(fw_build, root / FRAMEWORK)
+                 and (fw_build / FRAMEWORK_MARKER).is_file())
+    if not live and declared and elsewhere:
+        add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.WARN, Severity.RECOMMENDED,
+            f"Declared in .gitmodules but not initialised. The build uses {fw_build} "
+            f"(from {n64_paths.framework_root_source(root)}), so it still "
+            "configures; without that override it would not.",
+            "n64_ensure_framework_submodule")
+    elif live and broken:
         add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.FAIL, Severity.REQUIRED,
             broken + " Repair re-clones it as a real submodule.",
             "n64_repair_framework_submodule")
@@ -768,7 +781,7 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
         else:
             add("pins", PINS_FILE, CheckStatus.PASS, Severity.OPTIONAL, "")
 
-    layout = _classify(checks, live)
+    layout = _classify(checks, live or elsewhere)
     return AuditReport(
         root=str(root),
         layout=layout,

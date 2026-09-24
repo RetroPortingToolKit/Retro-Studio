@@ -656,6 +656,13 @@ def test_framework_root(tmp: Path) -> None:
               ["runtime/libn64lle-rt.a", "bench/n64lle-harvest",
                "recompiler/emitter/n64emit"],
               "the resolve contract is read from THAT framework (one Rust archive)")
+        from project_studio import n64ops
+        (port / ".gitmodules").write_text(
+            '[submodule "n64lle"]\n\tpath = n64lle\n\turl = x\n', encoding="utf-8")
+        rows = {c.id: c for c in n64ops.audit_project(port).checks}
+        check(rows["framework"].status.value == "warn"
+              and rows["framework_build"].status.value == "pass",
+              "an uninitialised submodule is a warning while the build uses a real worktree")
         other = tmp / "n64lle-env"
         _rust_framework(other)
         os.environ["N64LLE_ROOT"] = str(other)
