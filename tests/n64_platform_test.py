@@ -411,12 +411,26 @@ def test_template_drift(tmp: Path) -> None:
               "and its rows carry fix ops")
         os.environ["N64LLE_ROOT"] = str(other)
 
-        # --- a pinned copy too old for --json falls through to the preview -----
-        _give_drift_tool(prev / "n64lle", "import sys; sys.exit('unrecognized arguments: --json')\n")
+        ids = {c.id: c for c in n64ops.audit_project(prev).checks}
+        check("builds against" in ids["drift_source"].detail,
+              "the preview says the port builds against that checkout, not its pin")
+
+        # --- a copy too old for --json is skipped, said so, and the next answers
+        # The build framework ($N64LLE_ROOT) answers first; one too old to
+        # speak --json falls through to the submodule, whose verdict is then a
+        # preview too -- it is not what the build uses.
+        stale = tmp / "n64lle-stale"
+        (stale / "runtime").mkdir(parents=True)
+        (stale / "runtime" / "runtime.cmake").write_text("#\n", encoding="utf-8")
+        _give_drift_tool(stale, "import sys; sys.exit('unrecognized arguments: --json')\n")
+        _give_drift_tool(prev / "n64lle")
+        os.environ["N64LLE_ROOT"] = str(stale)
         ids = {c.id: c for c in n64ops.audit_project(prev).checks}
         check(ids["drift_source"].status.value == "warn"
               and any(c.startswith("drift_note") for c in ids),
-              "an old pinned tool is skipped, said so, and the preview answers")
+              "an old tool is skipped, said so, and the next checkout answers as a preview")
+        check(all(c.fix_op is None for c in ids.values() if c.id.startswith("drift:")),
+              "the submodule's verdict is not applied while the build uses another framework")
 
         # --- nothing anywhere: a SKIP row that says why -------------------------
         os.environ.pop("N64LLE_ROOT", None)

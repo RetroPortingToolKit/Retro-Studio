@@ -120,10 +120,11 @@ DRIFT_TOOL_REL = _WIZARD_REL / "port_drift.py"
 def drift_tools(game_root: Path | str):
     """Every ``(script, checkout, is_the_ports_own_pin)``, best first.
 
-    A DIFFERENT precedence from wizard_dir, on purpose. The port's own
-    ``n64lle/`` comes first even over $N64LLE_ROOT: measured against the
-    framework the port pins, the answer is the one the port's own
-    ``<slug>_template_drift`` ctest gives, and applying it is safe. Any other
+    A DIFFERENT precedence from wizard_dir, on purpose. The framework the
+    port BUILDS against comes first (framework_root: normally its own
+    ``n64lle/`` submodule), because that is the checkout the port's own
+    ``<slug>_template_drift`` ctest runs, and applying it is safe when it is
+    at the port's pin (measure_drift decides). The submodule is next. Any other
     checkout only PREVIEWS what a bump would bring -- its templates can name
     framework files the pinned n64lle does not have (the build shim execs
     n64lle/tools/build_framework.sh, which ports pinned before 2026-09-15 lack).
@@ -138,14 +139,19 @@ def drift_tools(game_root: Path | str):
         pass
     own = root / "n64lle"
     seen: set[Path] = set()
-    # Second: the framework the port BUILDS against when that is not its
+    # FIRST, the framework the port BUILDS against, when that is not its
     # submodule ($N64LLE_ROOT, or the N64LLE_ROOT its build tree was configured
     # with -- a framework worktree, the way the family develops framework and
-    # port together). measure_drift decides from the tool's own pin_matches
-    # whether that checkout's verdict may be applied.
+    # port together). The port's own <slug>_template_drift ctest runs
+    # ${N64LLE_ROOT}/tools/new_project/port_drift.py, i.e. exactly this
+    # checkout, so answering from the submodule instead would contradict it --
+    # and would offer to "take" a CMakeLists.txt from templates the build does
+    # not use (measured: a port built against n64lle rust-parity was offered
+    # the C-era CMakeLists from its main-branch submodule). measure_drift
+    # decides from the tool's own pin_rev whether the verdict may be applied.
     built = framework_root(root)
-    order = ([own] if _is_framework(own) else []) \
-        + ([built] if _is_framework(built) else []) + list(_candidates(root))
+    order = ([built] if _is_framework(built) else []) \
+        + ([own] if _is_framework(own) else []) + list(_candidates(root))
     for cand in order:
         try:
             key = cand.resolve()

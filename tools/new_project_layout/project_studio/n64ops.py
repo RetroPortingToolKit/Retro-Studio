@@ -305,9 +305,11 @@ _BUMP_HINT = ("Advance the n64lle pin first (Git tab), then re-audit: the "
 def measure_drift(root: Path, *extra: str) -> tuple[dict | None, str]:
     """port_drift.py's JSON for this port, and a reason when there is none.
 
-    The returned dict carries two keys of Studio's own: ``_checkout`` (which
-    n64lle rendered the templates) and ``_own`` (True when that is the port's
-    own pinned submodule -- the only case in which applying is safe)."""
+    The returned dict carries keys of Studio's own: ``_checkout`` (which
+    n64lle rendered the templates), ``_builds_here`` (it is the framework the
+    port's build uses) and ``_own`` (True only when it is BOTH that framework
+    and the port's pin -- its submodule, or a worktree at the gitlink -- the
+    only case in which applying is safe)."""
     tried: list[str] = []
     for script, checkout, own in n64_paths.drift_tools(root):
         try:
@@ -333,7 +335,8 @@ def measure_drift(root: Path, *extra: str) -> tuple[dict | None, str]:
         # and port together. Anything else stays a preview.
         pin = str(data.get("pin_rev") or "?")
         builds_here = _same_dir(checkout, n64_paths.framework_root(root))
-        data["_own"] = bool(own) or (
+        data["_builds_here"] = builds_here
+        data["_own"] = (bool(own) and builds_here) or (
             builds_here and pin != "?" and pin == str(data.get("templates_rev") or ""))
         data["_tried"] = tried
         return data, ""
@@ -359,6 +362,14 @@ def _drift_rows(drift: dict, add) -> None:
         add("drift_source", "Template drift: measured", CheckStatus.PASS, Severity.INFO,
             f"Against {src}, the port's own pin -- the same verdict its "
             "<slug>_template_drift ctest gives.")
+    elif drift.get("_builds_here"):
+        add("drift_source", "Template drift: PREVIEW", CheckStatus.WARN, Severity.INFO,
+            f"This port builds against {src} but pins n64lle "
+            f"{drift.get('pin_rev', '?')}. These rows are that framework's "
+            "templates -- what the build uses and the port's drift ctest "
+            "reports -- but the committed pin is a different revision, so "
+            "nothing below is applied. Advance the pin to the framework you "
+            "build against (Git tab), then re-audit.")
     else:
         add("drift_source", "Template drift: PREVIEW", CheckStatus.WARN, Severity.INFO,
             f"The pinned n64lle ({drift.get('pin_rev', '?')}) has no port_drift.py, so "
