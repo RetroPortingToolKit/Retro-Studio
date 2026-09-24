@@ -2677,7 +2677,8 @@ def _stage_n64_local_bundle(
     if not staged_assets:
         return f"assets/fonts + assets/img missing next to {exe.name} — rebuild first"
 
-    # game.toml is the contract the host reads at startup (host_config.c), so a
+    # game.toml is the contract the host reads at startup (n64lle
+    # crates/n64lle-host host_config.rs; host_config.c before 2026-09-23), so a
     # zip without it is a build that cannot resolve its own title. It is the
     # one config file that IS source here.
     contract = root / "game.toml"

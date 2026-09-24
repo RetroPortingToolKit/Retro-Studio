@@ -183,6 +183,22 @@ def submodule_sha(n64lle: Path) -> Optional[str]:
     return out.stdout.strip() if out.returncode == 0 else None
 
 
+_CARGO_FIND_RE = re.compile(r"find_program\s*\(\s*N64LLE_CARGO")
+
+
+def needs_cargo(n64lle: Path) -> bool:
+    """Does configuring this checkout require cargo? Read from its CMake."""
+    for rel in ("runtime/CMakeLists.txt", "recompiler/CMakeLists.txt",
+                "n64ref/CMakeLists.txt"):
+        try:
+            if _CARGO_FIND_RE.search((n64lle / rel).read_text(
+                    encoding="utf-8", errors="replace")):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def patch_list(n64lle: Path) -> list:
     d = n64lle / "n64ref" / "patches"
     if not d.is_dir():
@@ -211,6 +227,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     cxx = shutil.which(os.environ.get("CXX", "") or "g++")
     log(f"{'ok  ' if cxx else 'FAIL'}  {'c++':<15} {cxx or 'not found'}")
     ok = ok and bool(cxx)
+
+    # `setup` configures the whole n64lle tree, and that tree's CMake finds
+    # cargo with find_program(... REQUIRED) -- n64ref's own Rust drivers did
+    # before 2026-09-23, and since the Rust migration the engine and the
+    # recompiler tools do too. Asked of the checkout, not assumed.
+    if needs_cargo(n64lle):
+        cargo = shutil.which("cargo")
+        log(f"{'ok  ' if cargo else 'FAIL'}  {'cargo':<15} "
+            f"{cargo or 'not found — this n64lle configures with cargo; install rustup'}")
+        ok = ok and bool(cargo)
 
     # paraLLEl-RDP renders through Vulkan. Ares' non-pixel surfaces do not need
     # it, so this is a WARN: an oracle without a Vulkan device still answers
@@ -302,6 +328,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
            else ["powershell", "-File", str(script)])
     if run(cmd, cwd=n64lle) != 0:
         log("Ares pre-build failed")
+        return 1
+
+    if needs_cargo(n64lle) and not shutil.which("cargo"):
+        log("this n64lle configures with cargo (find_program REQUIRED) and none "
+            "is on PATH — install rustup; the checkout's rust-toolchain.toml "
+            "names the toolchain")
         return 1
 
     bd = lay.build_dir

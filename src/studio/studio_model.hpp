@@ -1056,7 +1056,8 @@ struct StudioModel {
     //
     // HLE is the default now: n64lle resolves the tier from the title's
     // `[runtime] hle_tier`, and the scaffold ships it true. The environment
-    // wins per knob (host_core_config.c), so zeroing all three knobs forces
+    // wins per knob (n64lle-host host_core_config.rs; .c before the Rust
+    // migration), so zeroing all three knobs forces
     // LLE for one run whatever game.toml declares. That is the reference to
     // compare against when the executor's frame is in doubt.
     bool build_n64_force_lle = false;
