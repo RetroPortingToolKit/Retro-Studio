@@ -99,13 +99,39 @@ There is deliberately **no n64lle ref** to choose: `setup_project.sh` pins the
 new project at the HEAD of the checkout it was run from — "the SHA this scaffold
 was cut against" — and has no flag to override it.
 
-**Build** knows two things this console needs that the others do not. n64lle is
+**Build** knows three things this console needs that the others do not. n64lle is
 resolved as a **pre-built tree** rather than `add_subdirectory()`'d, so
-Configure first checks that `build-n64lle/` actually holds an `n64emit` and, if
-not, names `tools/build_framework.sh` instead of letting cmake die inside
-`n64lle_runtime_resolve_framework()`. And **Generate** is `cmake --build
---target <slug>-generate` — the harvest and emit live in the port's own CMake
-graph, not in a script or a framework CLI.
+Configure first checks that the framework build holds every artifact the pinned
+`runtime/runtime.cmake` will demand (read from that file, never listed here; on
+the Rust framework it is `runtime/libn64lle-rt.a`, `bench/n64lle-harvest` and
+`recompiler/emitter/n64emit`) and, if not, names `tools/build_framework.sh`
+instead of letting cmake die inside `n64lle_runtime_resolve_framework()`. And
+**Generate** is `cmake --build --target <slug>-generate` — the harvest and emit
+live in the port's own CMake graph, not in a script or a framework CLI.
+
+The third is **cargo**. Since n64lle's Rust migration (branch `rust-parity`,
+2026-09-23) the engine, host, recompiler tools and drivers are Rust crates. The
+framework build runs cargo. So does the **port's** build: it builds
+`libn64lle_host.a` and the bench/cosim drivers, and it links no C archive of
+n64lle's at all. Whether a pin needs cargo is read from its `runtime.cmake`, and
+the toolchain from its `rust-toolchain.toml` (rustup honours that file itself).
+Configure, the framework build, New Project's `--generate` and a Migrate row all
+refuse with that reason before anything runs, rather than minutes into a
+configure. The framework build logs the cargo version and rustc host triple it
+resolved inside the checkout.
+
+**Which n64lle a build uses** is resolved the way cmake resolves it, not assumed
+to be the submodule: `$N64LLE_ROOT` (passed to cmake as `-DN64LLE_ROOT`, and
+the same variable the port's own `tools/build_framework.sh` shim reads), else
+the `N64LLE_ROOT` the port's `build-release/` was configured with, else
+`n64lle/`. The framework build directory follows the same order
+(`$N64LLE_FRAMEWORK_BUILD_DIR`, the cached `N64LLE_BUILD`, `build-n64lle/`).
+This is how the family works on framework and port together: a port built
+against an n64lle worktree (PokemonStadiumRecomp-rust-parity has its
+submodule unchecked-out and its cache pointing at the worktree) configures,
+builds and audits against that worktree. Setting `N64LLE_ROOT` therefore
+redirects **builds**, not only the New Project wizard. The Migrate audit and
+every framework build log say which n64lle is in use and why.
 
 **Migrate** audits an N64 port against that scaffold — submodules, untracked
 generated C *and* ROM bytes, the contract's `[MEASURED]` identity rows, the
@@ -128,17 +154,31 @@ port's own values and reports by class:
 | contract | `game.toml` sections and keys | per missing key, with the text to paste | **none** |
 | port | `CLAUDE.md`, `README.md`, `docs/STATUS.md`, `VERSION` | not compared | none |
 
-Which n64lle answers matters, and the row says which did. The port's **own
-pinned submodule** comes first — even ahead of `N64LLE_ROOT` — because that is
-the verdict the port's `<slug>_template_drift` ctest gives and the only one it
-is safe to apply. When the pin predates the tool (or its copy is too old to
-speak `--json`), a newer checkout answers as a **preview** of what a bump would
-bring: every row is shown, no row has a fix op, and the ops refuse. A newer
-template can name framework files an older pin lacks — the build shim execs
+Which n64lle answers matters, and the row says which did. The framework the
+port **builds against** comes first. That is normally its own pinned
+submodule, and it is the checkout the port's `<slug>_template_drift` ctest
+runs. Its verdict is applicable when it is the port's pin: the submodule, or a
+worktree whose revision `port_drift.py` reports as the port's pin. A port that
+builds against one revision and pins another gets a **preview** that says so.
+This case is not hypothetical. A port scaffolded from an unpushed rust-parity
+wizard pins the remote's `main` while building against the worktree, and
+answering from the submodule offered to overwrite its CMakeLists.txt with the
+C-era template. When the pin predates the tool (or its copy is too old to speak
+`--json`), a newer checkout answers as a preview of what a bump would bring:
+every row is shown, no row has a fix op, and the ops refuse. A newer template
+can name framework files an older pin lacks — the build shim execs
 `n64lle/tools/build_framework.sh`, which pins before 2026-09-15 do not have —
 so the order is: advance the pin on the Git tab, re-audit, apply. With no
 checkout carrying the tool at all, the drift row is a SKIP that says so, and
 the hand-kept checks it replaces stay on.
+
+Independently of the drift tool, the audit fails a CMakeLists.txt that names a
+framework source the pin no longer has (the C `bench/*_driver.c` files went
+with the Rust migration). It also fails one that reads an `${N64LLE_*}` variable
+nothing in the pin sets any more. `N64LLE_SUPPORT` and `N64LLE_ISA_INC` left
+`n64lle_runtime_resolve_framework()` with the C headers, and a stale reference
+expands to an empty string rather than failing. The set of defined variables is
+read from the pinned cmake files the port includes.
 
 What it will **not** write is the point:
 
@@ -155,8 +195,9 @@ What it will **not** write is the point:
 
 Migrate also reports, without a fix op, a port that still carries its own
 `host/`: the scaffolded layout has none, because the launcher, input, audio and
-run loop come from one `n64lle_add_runtime_target()` call and reach every port
-on a submodule bump. Deleting a port's host is a decision with a measurement
+run loop come from one `n64lle_add_runtime_target()` call (n64lle's
+`crates/n64lle-host` since the Rust migration) and reach every port on a
+submodule bump. Deleting a port's host is a decision with a measurement
 behind it, not a mechanical sweep.
 
 **Packaging** is a local zip only — n64lle ships no release workflow and no
