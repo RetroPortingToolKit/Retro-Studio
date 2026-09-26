@@ -431,13 +431,23 @@ def _executable(p: str) -> bool:
     return os.access(p, os.X_OK)
 
 
-def _run_version(path: str, key: str, timeout: float = 20.0) -> tuple[str, str]:
-    """(first line of `<tool> --version`, error)."""
+def _run_version(path: str, key: str, timeout: float = 20.0,
+                 cwd: Path | None = None) -> tuple[str, str]:
+    """(first line of `<tool> --version`, error).
+
+    ``cwd`` matters for cargo: a rustup proxy picks its toolchain from the
+    directory it runs in, so the version worth showing is the one asked from
+    inside the n64lle tree (its rust-toolchain.toml), as n64lle's own
+    resolver asks it -- not whatever the default toolchain is where Studio
+    happens to be running.
+    """
     argv = [path, "--version"]
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=300 if key == "cargo" else timeout,
                               encoding="utf-8", errors="replace",
-                              stdin=subprocess.DEVNULL)
+                              stdin=subprocess.DEVNULL,
+                              cwd=str(cwd) if cwd and key == "cargo" else None)
     except subprocess.TimeoutExpired:
         return "", f"`{path} --version` did not finish in {int(timeout)}s"
     except OSError as exc:
@@ -641,7 +651,7 @@ def resolve(
     if gen.path and gen.path != "Ninja" and ninja.source in ("path", "none", ""):
         ninja.warning = f"not used by the {gen.path} generator"
     for t in TOOLS:
-        _validate(t, by[t.key], versions)
+        _validate(t, by[t.key], versions, rust_cwd)
     if gen.path and gen.path != "Ninja" and by["ninja"].error and ninja.source == "none":
         ninja.error = ""  # a missing ninja is not an error when nothing uses it
 
@@ -668,7 +678,7 @@ def _warn(st: ToolState, msg: str) -> None:
     st.warning = f"{st.warning} {msg}".strip()
 
 
-def _validate(t: ToolSpec, st: ToolState, versions: bool) -> None:
+def _validate(t: ToolSpec, st: ToolState, versions: bool, cwd: Path | None = None) -> None:
     if not t.is_path:
         if st.path and _FORBIDDEN.search(st.path):
             st.error = "a generator name cannot contain a quote, backslash, $ or ;"
@@ -694,7 +704,7 @@ def _validate(t: ToolSpec, st: ToolState, versions: bool) -> None:
         return
     if not versions:
         return
-    st.version, err = _run_version(p, t.key)
+    st.version, err = _run_version(p, t.key, cwd=cwd)
     if err:
         st.error = err
         return

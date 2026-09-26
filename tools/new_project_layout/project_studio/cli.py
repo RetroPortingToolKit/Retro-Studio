@@ -591,11 +591,12 @@ def cmd_toolchain(args: argparse.Namespace) -> int:
         project = {**tc.read_project(root), **form} if root is not None else form
     # cargo -vV from inside the framework the port builds against, so rustup
     # answers for the toolchain its rust-toolchain.toml pins.
-    fw = None
-    if root is not None:
-        from project_studio import n64_paths
+    from project_studio import n64_paths
 
-        fw = n64_paths.framework_root(root)
+    # No port (the Studio default / New Project): the n64lle checkout whose
+    # wizard New Project would run, since that tree's pin is what a scaffold
+    # starts from.
+    fw = n64_paths.framework_root(root) if root is not None else n64_paths.n64lle_root(None)
     states = tc.resolve(root, project=project, versions=not args.no_versions,
                         rust_cwd=fw if fw is not None and fw.is_dir() else None)
     data = tc.states_json(states, None if args.studio else root)

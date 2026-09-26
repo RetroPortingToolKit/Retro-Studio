@@ -11,6 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -53,6 +54,7 @@ struct Scope {
     // Detect popup
     int detect_row = -1;
     bool detect_open = false;
+    ImVec2 detect_anchor{0.f, 0.f};  // under the row's field, not at the mouse
     bool detect_loading = false;
     std::vector<std::string> detect_candidates;
     // A request that arrived while another job held `busy` (a `set` must not
@@ -291,6 +293,9 @@ void draw_detect_popup(StudioModel& model, Scope& s, const std::string& root) {
     if (s.detect_open) {
         ImGui::OpenPopup(pid);
         s.detect_open = false;
+        // Anchored to the field it fills: opened at the mouse, the list sits
+        // on the Detect button at the right edge and its paths are clipped.
+        ImGui::SetNextWindowPos(s.detect_anchor, ImGuiCond_Appearing);
     }
     if (!ImGui::BeginPopup(pid)) return;
     if (s.detect_row < 0 || s.detect_row >= static_cast<int>(s.rows.size())) {
@@ -349,6 +354,10 @@ void flush_pending(StudioModel& model, Scope& s) {
 
 void draw_rows(StudioModel& model, const Theme& th, SDL_Window* window, Scope& s,
                const std::string& root, float label_w) {
+    // The tab's label column, widened to the longest tool name so every field
+    // starts at the same x ("C++ compiler" is wider than the Build tab's 100).
+    label_w = std::max(label_w, ImGui::CalcTextSize("C++ compiler").x +
+                                    ImGui::GetStyle().ItemSpacing.x * 2.f);
     const float bw = button_w("…") + button_w("Detect") + button_w("Clear");
     for (size_t i = 0; i < s.rows.size(); ++i) {
         ToolRow& r = s.rows[i];
@@ -364,6 +373,7 @@ void draw_rows(StudioModel& model, const Theme& th, SDL_Window* window, Scope& s
                                           : r.path + "  [" + r.source_label + "]";
         ImGui::InputTextWithHint("##path", hint.c_str(), r.buf, sizeof(r.buf));
         if (ImGui::IsItemDeactivatedAfterEdit()) commit_row(model, s, r, root);
+        const ImVec2 field_anchor(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y);
         ImGui::SameLine();
         ImGui::BeginDisabled(!r.is_path);
         if (ImGui::Button("…")) browse(window, s, r);
@@ -371,7 +381,10 @@ void draw_rows(StudioModel& model, const Theme& th, SDL_Window* window, Scope& s
         if (ImGui::IsItemHovered() && r.is_path)
             ImGui::SetTooltip("Browse for the %s", r.label.c_str());
         ImGui::SameLine();
-        if (ImGui::Button("Detect")) start_detect(model, s, static_cast<int>(i));
+        if (ImGui::Button("Detect")) {
+            s.detect_anchor = field_anchor;
+            start_detect(model, s, static_cast<int>(i));
+        }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(r.is_path ? "List every %s on PATH and pick one"
                                         : "Pick a CMake %s", r.label.c_str());

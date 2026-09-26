@@ -218,6 +218,18 @@ def test_resolve(tmp: Path) -> None:
     check(st["git"].error.startswith("not executable"), "a non-executable file is refused")
     check(st["cargo"].error.startswith("does not exist"), "a missing path is refused")
 
+    # cargo's version is asked from inside the n64lle tree (rustup applies
+    # its rust-toolchain.toml there), as n64lle's own resolver asks it.
+    tree = tmp / "n64lle-tree"
+    tree.mkdir()
+    pwdcargo = alt / "cargo-pwd"
+    pwdcargo.write_text('#!/bin/sh\necho "cargo 1.0.0 in $(basename "$PWD")"\n')
+    pwdcargo.chmod(0o755)
+    st = {s.key: s for s in tc.resolve(None, env=env, studio={}, windows=False,
+                                        project={"cargo": str(pwdcargo)}, rust_cwd=tree)}
+    check(st["cargo"].version == "cargo 1.0.0 in n64lle-tree",
+          "cargo --version runs inside the n64lle tree")
+
     st = {s.key: s for s in tc.resolve(None, env=env, studio={}, windows=False,
                                         project={"python": str(alt / "python3.10")})}
     check("n64lle needs 3.11" in st["python"].error, "Python older than 3.11 is refused")
