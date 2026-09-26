@@ -524,6 +524,95 @@ def cmd_updates_ensure_toolchain(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _parse_tool_pairs(pairs: list[str]) -> dict[str, str]:
+    """``["cc=/usr/bin/clang", ...]`` -> ``{"cc": "/usr/bin/clang"}``.
+
+    Split on the FIRST '=' only: a Windows path never has one, but a value
+    like ``C:/tools/x=y/gcc.exe`` must not lose its tail."""
+    out: dict[str, str] = {}
+    for p in pairs:
+        k, sep, v = (p or "").partition("=")
+        if sep:
+            out[k.strip()] = v.strip()
+    return out
+
+
+def cmd_toolchain(args: argparse.Namespace) -> int:
+    """Show / set / detect the n64lle Toolchain (Build tab), as JSON.
+
+    ``--root`` scopes it to a port (its tools/toolchain.cmake); ``--studio``
+    edits the Studio-wide default for new projects instead.
+    """
+    from project_studio import n64_toolchain as tc
+
+    action = args.toolchain_cmd
+    root = Path(args.root).expanduser().resolve() if getattr(args, "root", "") else None
+    if root is not None and not root.is_dir():
+        print(f"error: not a directory: {root}", file=sys.stderr)
+        return 2
+    if action == "set":
+        values = _parse_tool_pairs(args.tool or [])
+        for k in values:
+            if k not in tc.BY_KEY:
+                print(f"error: unknown tool '{k}' (one of: {', '.join(tc.BY_KEY)})",
+                      file=sys.stderr)
+                return 2
+        if not args.studio and root is None:
+            print("error: set needs --root <port> or --studio", file=sys.stderr)
+            return 2
+        try:
+            where = (tc.write_studio_defaults(values) if args.studio
+                     else tc.write_project(root, values))
+        except tc.UnrecordableValue as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if not args.json:
+            print(f"[OK] {', '.join(f'{k}={v or chr(34)*2}' for k, v in values.items())} -> {where}")
+    if action == "detect":
+        spec = tc.BY_KEY.get(args.tool_key)
+        if spec is None:
+            print(f"error: unknown tool '{args.tool_key}'", file=sys.stderr)
+            return 2
+        found = tc.candidates(spec)
+        if args.json:
+            print(json.dumps({"tool": spec.key, "candidates": found,
+                              "default": tc.discover(spec)}))
+        else:
+            for c in found:
+                print(c)
+        return 0
+    # `show --studio --tool k=v`: validate a form's unsaved rows (New Project)
+    # as the top layer, over the Studio default. `set` already wrote its
+    # values, so for it the layers are read back from disk.
+    form = _parse_tool_pairs(args.tool or []) if action == "show" else {}
+    if args.studio:
+        project = form
+    else:
+        project = {**tc.read_project(root), **form} if root is not None else form
+    # cargo -vV from inside the framework the port builds against, so rustup
+    # answers for the toolchain its rust-toolchain.toml pins.
+    fw = None
+    if root is not None:
+        from project_studio import n64_paths
+
+        fw = n64_paths.framework_root(root)
+    states = tc.resolve(root, project=project, versions=not args.no_versions,
+                        rust_cwd=fw if fw is not None and fw.is_dir() else None)
+    data = tc.states_json(states, None if args.studio else root)
+    data["studio_defaults"] = tc.read_studio_defaults()
+    if args.json:
+        print(json.dumps(data, indent=None if args.compact else 2))
+        return 0
+    for t in data["tools"]:
+        mark = "FAIL" if t["error"] else ("WARN" if t["warning"] else "OK")
+        print(f"[{mark:4}] {t['label']:<13} {t['path'] or '-':<48} "
+              f"({t['source_label']}) {t['version']}")
+        for msg in (t["error"], t["warning"]):
+            if msg:
+                print(f"         {msg}")
+    return 0
+
+
 def cmd_new_project(args: argparse.Namespace) -> int:
     from project_studio.newproject import (
         NewProjectOptions,
@@ -588,6 +677,7 @@ def cmd_new_project(args: argparse.Namespace) -> int:
         n64lle_ref=(getattr(args, "n64lle_ref", None) or "").strip(),
         harvest_frames=int(getattr(args, "frames", 0) or 0),
         harvest_step_cap_m=int(getattr(args, "step_cap", 0) or 0),
+        n64_tools=_parse_tool_pairs(getattr(args, "n64_tools", None) or []),
         dry_run=bool(getattr(args, "dry_run", False)),
     )
 
@@ -2620,6 +2710,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_uet.set_defaults(func=cmd_updates_ensure_toolchain)
 
+    p_tc = sub.add_parser(
+        "toolchain",
+        help="N64: explicit tool paths for n64lle commands (Build tab > Toolchain)",
+    )
+    tc_sub = p_tc.add_subparsers(dest="toolchain_cmd", required=True)
+    for name, hlp in (("show", "Resolve every tool: path, source, version, errors"),
+                      ("set", "Record tool paths (KEY=PATH; empty PATH clears)"),
+                      ("detect", "List every candidate on PATH for one tool")):
+        pt = tc_sub.add_parser(name, help=hlp)
+        pt.add_argument("--root", default="", help="Port root (its tools/toolchain.cmake)")
+        pt.add_argument("--studio", action="store_true",
+                        help="The Studio-wide default for new projects instead")
+        pt.add_argument("--json", action="store_true")
+        pt.add_argument("--compact", action="store_true", help="One-line JSON")
+        pt.add_argument("--no-versions", action="store_true",
+                        help="Do not run each tool for its version")
+        if name in ("set", "show"):
+            pt.add_argument("--tool", action="append", default=[], metavar="KEY=PATH")
+        if name == "detect":
+            pt.add_argument("tool_key", metavar="TOOL")
+        pt.set_defaults(func=cmd_toolchain)
+
     p_np = sub.add_parser(
         "new-project",
         help="Run setup_project.sh/.ps1 (OS-routed) then index the new repo",
@@ -2700,6 +2812,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_np.add_argument(
         "--n64-exe", dest="n64_exe", default="",
         help="N64: executable name (default: the slug)",
+    )
+    p_np.add_argument(
+        "--tool", dest="n64_tools", action="append", default=[], metavar="KEY=PATH",
+        help="N64: an explicit tool path, repeatable (python, cc, cxx, cmake, ninja, "
+             "cargo, git, gh). Passed to the scaffolder and recorded in the new "
+             "port's tools/toolchain.cmake. Unset keys take the Studio default.",
     )
     p_np.add_argument(
         "--frames", type=int, default=0,

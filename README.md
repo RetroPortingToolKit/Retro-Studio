@@ -120,6 +120,58 @@ refuse with that reason before anything runs, rather than minutes into a
 configure. The framework build logs the cargo version and rustc host triple it
 resolved inside the checkout.
 
+### Toolchain — which Python, compiler, CMake and cargo
+
+A machine with several compilers or Pythons picks each tool **by path** in the
+Build tab's **Toolchain** section (N64 only), with no environment variables.
+There is one row per tool: Python, C compiler, C++ compiler, CMake, Generator,
+Ninja, Cargo, Git and GitHub CLI. Each row has a path field, **…** (browse),
+**Detect** (every candidate on PATH, e.g. `gcc-15`, `clang`, a MinGW gcc) and
+**Clear**. Under the field Studio shows the path that will be used, where it
+came from, and the version it printed when Studio ran it. A problem is shown in
+red beside the tool it concerns: the path is missing, is not executable, fails
+`--version`, is below Python 3.11 or CMake 3.20, or (on Windows) the C
+compiler's ABI does not match cargo's Rust host. A warning is shown in amber,
+for example a gcc/clang C/C++ pair, or an environment variable that disagrees
+with the recorded file. What each tool is for, and the rules n64lle applies to
+it, are in n64lle's **`docs/PROJECT-SETUP.md`** ("Choosing tools"). This page
+does not repeat them.
+
+**Where it is stored.** The port's own `tools/toolchain.cmake`. It is the file
+n64lle's `tools/toolchain.sh` defines, which `build_framework.sh` and
+`setup_project.sh` read and update, and which the port's CMakeLists
+`include()`s. A terminal build and a Studio build of the port therefore use the
+same tools. The file records this machine's paths and is gitignored. Studio
+writes it in n64lle's format: one `set(<KEY> "<value>" CACHE FILEPATH|STRING
+…)` per tool, forward slashes, and a value containing `"`, `\`, `$` or `;` is
+refused before the file is touched. **Save as Studio default** stores the
+resolved set in `studio.json` (`n64_toolchain`) under the retcomm config dir.
+That default pre-fills New Project and fills any row a port leaves blank.
+
+**Precedence in Studio:** project file > Studio default > environment > PATH.
+n64lle's own scripts rank the environment above the file, so when `$CC` or
+`$N64LLE_PYTHON` disagrees with the recorded path, the row warns that a terminal
+build would use the environment. A C compiler chosen without a C++ compiler
+brings its sibling (`clang-19` → `clang++-19`), and a chosen or discovered ninja
+implies the Ninja generator. Both rules come from `toolchain.sh`.
+
+**What Studio passes.** Every tool somebody chose is passed explicitly on every
+n64lle command, in the spelling bash and CMake read: forward slashes, never a
+`\\?\` prefix, and one argv element per path, so spaces need no quoting. A tool
+found only on PATH is left to the script's own discovery.
+
+| Step | What is added |
+|---|---|
+| Build framework | `bash n64lle/tools/build_framework.sh Release --python P --cc C --cxx X --cmake M --generator G --ninja N --cargo R` (only the flags that pin's script declares; an older pin gets `CC`/`CXX`/`N64LLE_*` in the environment, and the log names any it cannot read) |
+| Configure | `<chosen cmake> -S … -B … -G <gen> -C tools/toolchain.cmake -DPython3_EXECUTABLE=… -DCMAKE_C_COMPILER=… -DCMAKE_CXX_COMPILER=… -DN64LLE_CARGO=… [-DCMAKE_MAKE_PROGRAM=… under Ninja]`. The recorded generator is used when the Generator combo is Auto. |
+| Build / Generate | `<chosen cmake> --build …` |
+| New Project | `setup_project.sh … --python … --cc … --git-path … --gh-path …` (`--git`/`--gh` keep their "make a repo" meaning). A wizard that records nothing gets the file written by Studio afterwards. |
+| Migrate | n64lle's `port_drift.py` runs under the chosen Python, and repo reads use the chosen git. A **Toolchain** audit row lists any tool that fails. |
+
+Headless, the same thing is `project_studio --platform n64 toolchain
+show|set|detect` (`--root <port>` or `--studio`, `--json`), and
+`new-project --tool KEY=PATH`.
+
 **Which n64lle a build uses** is resolved the way cmake resolves it, not assumed
 to be the submodule: `$N64LLE_ROOT` (passed to cmake as `-DN64LLE_ROOT`, and
 the same variable the port's own `tools/build_framework.sh` shim reads), else
@@ -558,6 +610,7 @@ retcomm-studio/
     ci_templates/
   tests/
     snes_platform_test.py    # platform split + SNES migration, no GPU needed
+    n64_toolchain_test.py    # N64 Toolchain: tools/toolchain.cmake + command construction
     json_null_test.cpp       # null-vs-absent at the toolkit JSON boundary
 ```
 
@@ -565,6 +618,7 @@ retcomm-studio/
 
 ```bash
 cmake --build build --target snes_platform_test   # or: python3 tests/snes_platform_test.py
+python3 tests/n64_toolchain_test.py               # N64 Toolchain: file format, Linux/Windows command lines
 ./build/json_null_test                            # toolkit JSON → model boundary
 ./build/analysis_load_test <repo-root>
 ./build/frames_load_test [analysis/frames]

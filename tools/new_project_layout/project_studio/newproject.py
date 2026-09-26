@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import n64_paths, platforms, snes_paths
+from . import n64_paths, n64_toolchain, platforms, snes_paths
 from .gitops import CmdResult, switch_modules
 from .paths import find_bash, toolkit_dir
 
@@ -96,6 +96,12 @@ class NewProjectOptions:
     # into CMake. 0 = take the scaffolder's default.
     harvest_frames: int = 0
     harvest_step_cap_m: int = 0
+    # Explicit tool paths (n64_toolchain.TOOLS keys -> path). Passed to the
+    # scaffolder as --python/--cc/... and recorded in the new port's
+    # tools/toolchain.cmake, so its first build and every later one -- Studio
+    # or terminal -- use the same tools. Empty = the Studio default, else
+    # the scaffolder's own discovery.
+    n64_tools: dict = field(default_factory=dict)
 
     dry_run: bool = False
 
@@ -364,9 +370,15 @@ def validate_options(opts: NewProjectOptions) -> list[str]:
             # n64lle went Rust that build runs cargo. Without it the wizard
             # fails minutes in, inside cmake, and rolls the scaffold back; say
             # it before anything is laid out.
-            rust = n64_paths.rust_toolchain_problem(wiz.parent.parent)
+            rust = n64_paths.rust_toolchain_problem(
+                wiz.parent.parent, n64_tools_for(opts).get("cargo"))
             if rust:
                 errs.append(rust)
+        for key, path in n64_tools_for(opts).items():
+            if key not in n64_toolchain.BY_KEY:
+                errs.append(f"unknown tool '{key}'")
+            elif not Path(n64_toolchain.strip_extended(path)).is_file():
+                errs.append(f"{n64_toolchain.BY_KEY[key].label}: not found: {path}")
     if snes:
         tap = (opts.multitap or "").strip().lower()
         if tap and tap not in ("port1", "port2", "both", "off"):
@@ -471,6 +483,14 @@ def build_snes_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, st
     return cmd, env
 
 
+def n64_tools_for(opts: NewProjectOptions) -> dict[str, str]:
+    """The tools a new N64 scaffold is cut with: the form's, over the Studio
+    default. Blank rows fall through to the scaffolder's own discovery."""
+    merged = {**n64_toolchain.read_studio_defaults(),
+              **{k: v for k, v in (opts.n64_tools or {}).items() if (v or "").strip()}}
+    return {k: v.strip() for k, v in merged.items() if (v or "").strip()}
+
+
 def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
     """argv + env for n64lle's ``tools/new_project/setup_project.sh``.
 
@@ -547,6 +567,18 @@ def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str
         cmd.append("--gh")
         if (opts.github_visibility or "private").strip().lower() == "public":
             cmd.append("--public")
+    # The chosen tools, as the flags this wizard declares; anything it does
+    # not declare rides in the environment n64lle reads (run_new_project says
+    # which, so a choice the wizard cannot take is not silently dropped).
+    try:
+        supported = n64_toolchain.script_flags(
+            Path(script).read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        supported = set()
+    tc_argv, tc_env, _dropped = n64_toolchain.script_args(
+        n64_tools_for(opts), "setup", supported)
+    cmd.extend(tc_argv)
+    env.update(tc_env)
     return cmd, env
 
 
@@ -912,6 +944,20 @@ def run_new_project(
             ignored = n64_ignored_fields(opts)
             if ignored:
                 on_line("note: not used by the N64 scaffolder — " + ", ".join(ignored))
+            tools = n64_tools_for(opts)
+            if tools:
+                on_line("toolchain: " + ", ".join(f"{k}={v}" for k, v in tools.items()))
+                try:
+                    flags = n64_toolchain.script_flags(
+                        script.read_text(encoding="utf-8", errors="replace")) if script else set()
+                except OSError:
+                    flags = set()
+                _a, _e, dropped = n64_toolchain.script_args(tools, "setup", flags)
+                for k in dropped:
+                    spec = n64_toolchain.BY_KEY[k]
+                    on_line(f"note: this wizard has no {spec.flag}; {spec.label} is "
+                            f"passed as ${spec.env} and recorded in the new port's "
+                            f"{n64_toolchain.PROJECT_FILE.as_posix()} afterwards")
     if is_snes(opts):
         if on_line:
             on_line(f"Using snesrecomp wizard: {snes_paths.wizard_source(None)}")
@@ -984,6 +1030,24 @@ def run_new_project(
         if note:
             detail += "\n" + note
         return CmdResult(False, f"setup_project failed (exit {code})", detail)
+
+    # The N64 toolchain, recorded in the new port (machine-local; the port
+    # gitignores it). A wizard with n64lle's explicit-toolchain change already
+    # wrote the file from the flags above -- every tool it resolved, not only
+    # the chosen ones -- and that answer is left alone. An older wizard wrote
+    # nothing, so Studio records the chosen tools, and says so.
+    if is_n64(opts) and root.is_dir():
+        tools = n64_tools_for(opts)
+        pf = n64_toolchain.project_file(root)
+        if tools and not pf.is_file():
+            try:
+                n64_toolchain.write_project(root, tools)
+                if on_line:
+                    on_line(f"toolchain recorded in {pf} (this wizard does not "
+                            "record one itself)")
+            except n64_toolchain.UnrecordableValue as exc:
+                if on_line:
+                    on_line(f"toolchain NOT recorded: {exc}")
 
     # Optional nested rbengine (and net where the entry point has no ref flag)
     post_notes: list[str] = []

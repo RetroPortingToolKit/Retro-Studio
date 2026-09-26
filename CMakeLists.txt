@@ -154,6 +154,7 @@ set(RETCOMM_STUDIO_SOURCES
     src/studio/studio_snes.cpp
     src/studio/studio_snes_functions.cpp
     src/studio/studio_snes_data.cpp
+    src/studio/studio_toolchain.cpp
 )
 
 # Windows .exe icon (explorer / taskbar) from assets/retcomm-studio.ico
@@ -354,6 +355,7 @@ target_link_libraries(json_null_test PRIVATE nlohmann_json::nlohmann_json)
 #   python3 tests/snes_platform_test.py
 #   python3 tests/n64_platform_test.py
 #   python3 tests/bulk_recomp_test.py
+#   python3 tests/n64_toolchain_test.py
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_custom_target(snes_platform_test
@@ -367,6 +369,12 @@ if(Python3_Interpreter_FOUND)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/n64_platform_test.py"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         COMMENT "Running N64 platform-split test"
+        VERBATIM)
+    add_custom_target(n64_toolchain_test
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/n64_toolchain_test.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Running N64 Toolchain (tool paths) test"
         VERBATIM)
     add_custom_target(bulk_recomp_test
         COMMAND ${Python3_EXECUTABLE}

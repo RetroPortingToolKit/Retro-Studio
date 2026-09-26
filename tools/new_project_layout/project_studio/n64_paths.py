@@ -501,13 +501,24 @@ def find_cargo() -> str | None:
     return None
 
 
-def rust_toolchain_problem(fw: Path) -> str | None:
-    """Why this framework cannot be built here, toolchain-wise, or None."""
+def rust_toolchain_problem(fw: Path, cargo: str | None = None) -> str | None:
+    """Why this framework cannot be built here, toolchain-wise, or None.
+
+    ``cargo`` is an EXPLICIT choice (the Build tab's Toolchain, recorded in the
+    port's tools/toolchain.cmake): it is passed to n64lle as --cargo and to the
+    port's configure as -DN64LLE_CARGO, so it does not have to be on PATH --
+    it only has to exist.
+    """
     if not framework_needs_cargo(fw):
         return None
     channel = rust_channel(fw)
     pin = f" Its rust-toolchain.toml pins {channel}; rustup installs that itself." \
         if channel else ""
+    if cargo:
+        if Path(cargo).is_file():
+            return None
+        return (f"The chosen cargo ({cargo}) does not exist. Fix it in the Build "
+                "tab's Toolchain section, or clear it to use cargo on PATH." + pin)
     cargo = find_cargo()
     if cargo is None:
         return (

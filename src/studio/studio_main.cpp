@@ -6,6 +6,7 @@
 #include "studio/studio_snes.hpp"
 #include "studio/studio_functions.hpp"
 #include "studio/studio_theme.hpp"
+#include "studio/studio_toolchain.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -1980,6 +1981,7 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                 "the HEAD of the n64lle checkout Studio drives. A branch is recorded in "
                 ".gitmodules and tracked; a tag or SHA is pinned detached, with no "
                 "branch= line for `submodule update --remote` to move it off.");
+        retcomm::studio::draw_n64_toolchain_new_project(model, th, window, kLabelW);
     } else if (snes) {
         branch_combo("##np_snes", "snesrecomp ref", model.np_snes_ref,
                      sizeof(model.np_snes_ref), kLabelW, model.branches_psx, kBranchW);
@@ -2177,6 +2179,9 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
             // build step, so either switch asking for work maps onto it.
             if (model.np_generate || model.np_build) args.push_back("--generate");
             if (model.np_github) args.push_back("--create-github");
+            // The Toolchain rows: --tool KEY=PATH for each one filled in.
+            // Blank rows take the Studio default inside the CLI.
+            for (auto& a : retcomm::studio::n64_new_project_tool_args()) args.push_back(a);
             model.append_log("--- New N64 project setup ---");
             retcomm::studio::run_project_studio_async(model, args, [&model](RunResult r) {
                 model.set_status(r.ok() ? "New project created" : "New project failed");
@@ -3452,6 +3457,11 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
         wrapped(th.text_muted,
                 "Bundle + Export zips the build dir as it stands (exe + assets, no ROM) "
                 "into dist/ and opens a save dialog. Build first — it does not rebuild.");
+        // Which python / cc / c++ / cmake / ninja / cargo every button above
+        // hands n64lle. Its own file: the rows, the pickers and the CLI
+        // round-trips are a unit, and none of it is Build-tab layout.
+        ImGui::Spacing();
+        retcomm::studio::draw_n64_toolchain_build(model, th, window, kLabelW);
     } else {
         ImGui::TextColored(th.text_muted,
                            "Bundle + Export zips the build dir as it stands (exe + assets + "

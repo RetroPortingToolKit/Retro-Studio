@@ -41,7 +41,7 @@ import tomllib
 from datetime import date
 from pathlib import Path
 
-from . import n64_paths
+from . import n64_paths, n64_toolchain
 from .models import (
     ApplyResult,
     AuditReport,
@@ -133,9 +133,12 @@ def list_ops() -> list[str]:
 # Reading the repo
 # ---------------------------------------------------------------------------
 def _git(root: Path, *args: str) -> tuple[int, str]:
+    # The Toolchain's git when the port records one (tools/toolchain.cmake),
+    # so Migrate reads the repo with the same git its scaffolder used.
+    git = n64_toolchain.for_root(root).get("git") or "git"
     try:
         proc = subprocess.run(
-            ["git", *args],
+            [git, *args],
             cwd=str(root),
             capture_output=True,
             text=True,
@@ -313,8 +316,12 @@ def measure_drift(root: Path, *extra: str) -> tuple[dict | None, str]:
     tried: list[str] = []
     for script, checkout, own in n64_paths.drift_tools(root):
         try:
+            # port_drift.py is n64lle's, so it runs under the port's chosen
+            # Python -- the one the port's own <slug>_template_drift ctest
+            # runs it with (-DPython3_EXECUTABLE) -- not Studio's interpreter.
             proc = subprocess.run(
-                [sys.executable, str(script), str(root), "--json", *extra],
+                [n64_toolchain.python_exe(n64_toolchain.for_root(root)),
+                 str(script), str(root), "--json", *extra],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=120,
             )
@@ -516,16 +523,34 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
     # staticlib and the bench/cosim drivers -- so this is a port requirement,
     # not only a framework one.
     if (fw / FRAMEWORK_MARKER).is_file() and n64_paths.framework_needs_cargo(fw):
-        rust = n64_paths.rust_toolchain_problem(fw)
+        chosen_cargo = n64_toolchain.for_root(root).get("cargo")
+        rust = n64_paths.rust_toolchain_problem(fw, chosen_cargo)
         chan = n64_paths.rust_channel(fw)
         if rust is None:
             add("rust_toolchain", "Rust toolchain (cargo)", CheckStatus.PASS,
                 Severity.REQUIRED,
-                f"{n64_paths.find_cargo()}" + (f"; the pin asks for {chan}" if chan else ""))
+                f"{chosen_cargo or n64_paths.find_cargo()}"
+                + (f"; the pin asks for {chan}" if chan else ""))
         else:
             add("rust_toolchain", "Rust toolchain (cargo)", CheckStatus.FAIL,
                 Severity.REQUIRED, rust + " No fix op: installing a toolchain "
                 "is the machine's owner's call.")
+
+    # The Build tab's Toolchain: every tool this port's n64lle commands will be
+    # handed, checked the way the Build tab checks it (exists, runs, version).
+    # WARN rather than FAIL: a missing gh or an unrecognised compiler banner
+    # does not stop a migration, and the Build tab is where each is fixed.
+    tc_bad = [f"{s.label}: {s.error}" for s in n64_toolchain.resolve(root)
+              if s.error and s.key != "gh"]
+    if tc_bad:
+        add("toolchain", "Toolchain (Build tab)", CheckStatus.WARN, Severity.RECOMMENDED,
+            "; ".join(tc_bad) + f". Fix them in Build > Toolchain; they are recorded "
+            f"in {n64_toolchain.PROJECT_FILE.as_posix()}.")
+    else:
+        rec = n64_toolchain.read_project(root)
+        add("toolchain", "Toolchain (Build tab)", CheckStatus.PASS, Severity.INFO,
+            (f"{len(rec)} tool(s) recorded in {n64_toolchain.PROJECT_FILE.as_posix()}"
+             if rec else "nothing recorded; n64lle discovers every tool on PATH"))
 
     # n64lle vendors ares and rabbitizer, but its own build initialises them
     # and Studio does not manage their pins. Recorded as a passing INFO row so

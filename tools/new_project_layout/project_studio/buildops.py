@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import platforms
-from . import n64_paths as _n64_paths, snes_paths as _snes_paths
+from . import n64_paths as _n64_paths, n64_toolchain as _n64_tc, snes_paths as _snes_paths
 from .gitops import CmdResult
 from .paths import find_bash
 
@@ -372,6 +372,17 @@ def merged_env(overlay: dict[str, str]) -> dict[str, str] | None:
     env = os.environ.copy()
     env.update(overlay)
     return env
+
+
+def _n64_host(host: BuildHost, tools: dict[str, str]) -> BuildHost:
+    """``host`` with the n64lle Toolchain's cmake / ninja in place of PATH's."""
+    from dataclasses import replace
+
+    return replace(
+        host,
+        cmake=_n64_tc.cmake_exe(tools, host.cmake),
+        ninja=_n64_tc.strip_extended(tools["ninja"]) if tools.get("ninja") else host.ninja,
+    )
 
 
 def default_generator(host: BuildHost | None = None) -> str:
@@ -1046,7 +1057,7 @@ def preflight_n64_framework(root: Path) -> CmdResult | None:
     # Before the artifact check, and even when the framework IS built: since
     # n64lle went Rust the PORT's own build runs cargo too (the host staticlib
     # and the drivers), so a built framework does not mean a buildable port.
-    rust = _n64_paths.rust_toolchain_problem(fw)
+    rust = _n64_paths.rust_toolchain_problem(fw, _n64_tc.for_root(root).get("cargo"))
     if rust is not None:
         return CmdResult(False, rust)
     if _n64_paths.framework_is_built(root):
@@ -1070,11 +1081,23 @@ def preflight_n64_framework(root: Path) -> CmdResult | None:
     )
 
 
-def _n64_rust_versions(fw: Path, *, log: LogFn | None = None) -> CmdResult:
-    """``cargo --version`` and rustc's host triple, asked inside ``fw``."""
-    cargo = _n64_paths.find_cargo() or "cargo"
+def _n64_rust_versions(fw: Path, *, cargo: str | None = None,
+                       log: LogFn | None = None) -> CmdResult:
+    """``cargo --version`` and rustc's host triple, asked inside ``fw``.
+
+    ``cargo`` is the explicit choice when there is one; the rustc asked is the
+    one BESIDE it (a rustup proxy dir, or a standalone toolchain's bin/), not
+    whichever rustc PATH finds first -- asking a different rustc than the cargo
+    that will build is how a host-triple warning ends up describing the wrong
+    toolchain.
+    """
+    cargo = cargo or _n64_paths.find_cargo() or "cargo"
+    rustc = "rustc"
+    sib = Path(cargo).with_name("rustc" + (".exe" if cargo.lower().endswith(".exe") else ""))
+    if sib.is_file():
+        rustc = str(sib)
     lines: list[str] = []
-    for argv in ([cargo, "--version"], ["rustc", "-vV"]):
+    for argv in ([cargo, "--version"], [rustc, "-vV"]):
         try:
             proc = subprocess.run(argv, cwd=str(fw), capture_output=True, text=True,
                                   encoding="utf-8", errors="replace", timeout=1800)
@@ -1105,6 +1128,21 @@ def _n64_rust_versions(fw: Path, *, log: LogFn | None = None) -> CmdResult:
                 "`rustup default stable-x86_64-pc-windows-gnu` (or the "
                 "toolchain rust-toolchain.toml pins, for that target).")
     return CmdResult(True, lines[0])
+
+
+def _log_toolchain(log: LogFn, tools: dict[str, str], env: dict[str, str],
+                   dropped: list[str], script: Path | None = None) -> None:
+    """One line per explicitly chosen tool, and what could not be passed."""
+    if not tools:
+        log("toolchain: nothing chosen -- n64lle discovers every tool on PATH "
+            "(Build tab > Toolchain to pick them)")
+        return
+    log("toolchain: " + ", ".join(f"{k}={v}" for k, v in tools.items()))
+    for k in dropped:
+        spec = _n64_tc.BY_KEY[k]
+        log(f"note: {script.name if script else 'this script'} has no {spec.flag}; "
+            f"{spec.label} passed as ${spec.env}, which an n64lle older than "
+            "the explicit-toolchain change does not read")
 
 
 def build_n64_framework(
@@ -1156,7 +1194,8 @@ def build_n64_framework(
     fw = _n64_paths.framework_root(root)
     if not (fw / _n64_paths.MARKER).is_file():
         return _n64_framework_missing(root, fw)
-    rust = _n64_paths.rust_toolchain_problem(fw)
+    tools = _n64_tc.for_root(root)
+    rust = _n64_paths.rust_toolchain_problem(fw, tools.get("cargo"))
     if rust is not None:
         return CmdResult(False, rust)
     # NOT ``sh``: build_framework.sh is `#!/usr/bin/env bash`, and Windows has
@@ -1170,9 +1209,22 @@ def build_n64_framework(
             "install Git for Windows (it ships bash.exe); on Linux/macOS put "
             "bash on PATH.",
         )
-    cmd = [shell, str(script), config]
+    cmd = [shell, _n64_tc.bash_path(str(script)), config]
+    # The chosen tools, as the flags the script ON DISK declares (bash
+    # spelling: forward slashes, no \\?\ prefix). A pin older than the
+    # flags gets the environment n64lle reads instead, and anything it cannot
+    # take at all is said, not implied.
+    try:
+        supported = _n64_tc.script_flags(script.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        supported = set()
+    tc_argv, tc_env, dropped = _n64_tc.script_args(tools, "framework", supported)
+    cmd += tc_argv
     # The shared script writes build-n64lle/ under the PORT, not under n64lle.
     env = dict(os.environ)
+    env.update(tc_env)
+    if log:
+        _log_toolchain(log, tools, tc_env, dropped, script)
     env["N64LLE_PORT_ROOT"] = str(root)
     # And it builds where the port will LOOK: a tree configured with its own
     # N64LLE_BUILD (a worktree's framework, kept apart from the submodule's)
@@ -1186,7 +1238,7 @@ def build_n64_framework(
         log(f"n64lle: {fw} (from {_n64_paths.framework_root_source(root)}), "
             f"built into {fw_build}")
     if dry_run:
-        msg = "dry-run: " + " ".join(cmd)
+        msg = "dry-run: " + _n64_tc.format_command(cmd, tc_env)
         if log:
             log(msg)
         return CmdResult(True, msg)
@@ -1194,7 +1246,7 @@ def build_n64_framework(
         # Asked in the framework's directory, so rustup answers with the
         # toolchain rust-toolchain.toml pins (and installs it if it must)
         # before the build starts, rather than in the middle of a configure.
-        v = _n64_rust_versions(fw, log=log)
+        v = _n64_rust_versions(fw, cargo=tools.get("cargo"), log=log)
         if not v.ok:
             return v
     r = _run_stream(cmd, root, log=log, env=env)
@@ -1745,12 +1797,17 @@ def configure(
 ) -> CmdResult:
     root = root.expanduser().resolve()
     host = detect_host()
+    profile = platforms.current()
+    # n64lle: the Build tab's Toolchain. Resolved once here and used for every
+    # tool this configure touches -- the cmake that runs, the generator's make
+    # program, and the -D entries the port's own find_program()s read.
+    n64_tools = _n64_tc.for_root(root) if profile.key == "n64" else {}
+    if n64_tools:
+        host = _n64_host(host, n64_tools)
     if not host.cmake:
         return CmdResult(False, "cmake not found on PATH")
     if not (root / "CMakeLists.txt").is_file():
         return CmdResult(False, f"No CMakeLists.txt in {root}")
-
-    profile = platforms.current()
 
     # The BIOS backend step is a PSX concept: a cartridge boots from its own
     # reset vector and there is nothing to stage. Asked as has_bios rather than
@@ -1801,10 +1858,30 @@ def configure(
     if not bdir.is_absolute():
         bdir = root / bdir
     gen = resolve_configure_generator(host, bdir, generator)
+    if n64_tools.get("generator") and normalize_generator_request(generator) is None:
+        # The port's recorded generator outranks the build tree's cache, as
+        # it does in n64lle's own scripts; a Generator picked on the Build
+        # tab still outranks both. A tree configured with another one then
+        # fails in CMake's words and diagnose_configure_failure() names it.
+        gen = n64_tools["generator"]
     cmd = [host.cmake, "-S", str(root), "-B", str(bdir)]
     if gen:
         cmd.extend(["-G", gen])
     cmd.append(f"-DCMAKE_BUILD_TYPE={build_type}")
+    if profile.key == "n64":
+        # -C <the port's recorded toolchain file>, then each tool as a -D. A
+        # caller's own -D for the same variable wins (it comes later AND is
+        # filtered out here, so the log does not show two values).
+        explicit = _explicit_cache_vars(extra_args)
+        pf = _n64_tc.project_file(root)
+        tc_defs = _n64_tc.configure_defines(
+            n64_tools, generator=gen,
+            project_file_path=str(pf) if pf.is_file() else "")
+        cmd.extend(a for a in tc_defs
+                   if not (a.startswith("-D") and a[2:].split("=", 1)[0].split(":", 1)[0]
+                           in explicit))
+        if log:
+            _log_toolchain(log, n64_tools, {}, [])
     # Bundled deps before caller overrides: a caller's explicit -D wins.
     repairs = toolchain_cache_repairs(bdir, extra_args, host)
     cmd.extend(repairs)
@@ -1813,7 +1890,7 @@ def configure(
     tc_env = toolchain_env(host)
 
     if dry_run:
-        msg = "dry-run: " + " ".join(cmd)
+        msg = "dry-run: " + _n64_tc.format_command(cmd)
         if log:
             log(msg)
         return CmdResult(True, msg)
@@ -1902,6 +1979,10 @@ def build(
 ) -> CmdResult:
     root = root.expanduser().resolve()
     host = detect_host()
+    if platforms.current().key == "n64":
+        # The same cmake the configure ran: a tree configured by CMake 4.x and
+        # built by a 3.2x on PATH fails on the cache, not on the code.
+        host = _n64_host(host, _n64_tc.for_root(root))
     if not host.cmake:
         return CmdResult(False, "cmake not found on PATH")
     bdir = Path(build_dir)
