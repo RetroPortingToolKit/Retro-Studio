@@ -432,22 +432,15 @@ def _executable(p: str) -> bool:
 
 
 def _run_version(path: str, key: str, timeout: float = 20.0,
-                 cwd: Path | None = None) -> tuple[str, str]:
-    """(first line of `<tool> --version`, error).
-
-    ``cwd`` matters for cargo: a rustup proxy picks its toolchain from the
-    directory it runs in, so the version worth showing is the one asked from
-    inside the n64lle tree (its rust-toolchain.toml), as n64lle's own
-    resolver asks it -- not whatever the default toolchain is where Studio
-    happens to be running.
-    """
+                 cwd: Path | str | None = None) -> tuple[str, str]:
+    """(first line of `<tool> --version`, error), run in ``cwd``."""
     argv = [path, "--version"]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True,
                               timeout=300 if key == "cargo" else timeout,
                               encoding="utf-8", errors="replace",
                               stdin=subprocess.DEVNULL,
-                              cwd=str(cwd) if cwd and key == "cargo" else None)
+                              cwd=str(cwd) if cwd else None)
     except subprocess.TimeoutExpired:
         return "", f"`{path} --version` did not finish in {int(timeout)}s"
     except OSError as exc:
@@ -457,6 +450,31 @@ def _run_version(path: str, key: str, timeout: float = 20.0,
     if proc.returncode != 0:
         return first, f"`--version` exited {proc.returncode}" + (f": {first}" if first else "")
     return first, ""
+
+
+def _neutral_dir() -> str:
+    """A directory with no rust-toolchain.toml above it (the temp dir)."""
+    import tempfile
+
+    return tempfile.gettempdir()
+
+
+def _cargo_versions(path: str, tree: Path | None) -> tuple[str, str, str]:
+    """(version the BUILD gets, version the pin gives, error) for cargo.
+
+    A rustup proxy picks its toolchain from the directory it runs in. n64lle's
+    CMake runs cargo from the BUILD tree, where rust-toolchain.toml is not
+    visible, so the build gets rustup's default toolchain -- n64lle's own
+    resolver (tools/toolchain.sh _tc_cargo) asks from outside the tree for
+    exactly that reason, and so does this (measured 2026-09-25: a 1.96.0 pin,
+    a 1.93.1 build). Asked inside the tree too, when there is one, so the row
+    can say when the two differ instead of showing either number alone.
+    """
+    built, err = _run_version(path, "cargo", cwd=_neutral_dir())
+    if err or tree is None or not Path(tree).is_dir():
+        return built, "", err
+    pinned, perr = _run_version(path, "cargo", cwd=tree)
+    return built, ("" if perr else pinned), ""
 
 
 def parse_version(text: str) -> tuple[int, ...]:
@@ -553,8 +571,7 @@ def cxx_beside(cc: str) -> str:
 
 
 def rust_host(cargo: str, cwd: Path | None = None) -> str:
-    """``cargo -vV``'s host triple, asked from ``cwd`` (the n64lle tree, so
-    rustup applies rust-toolchain.toml -- the triple the build will use)."""
+    """``cargo -vV``'s host triple, asked from ``cwd``."""
     if not cargo:
         return ""
     try:
@@ -668,7 +685,9 @@ def resolve(
     if windows and versions and cc.path and not cc.error and carg.path and not carg.error:
         fam = compiler_family(cc.path, cc.version)
         abi = compiler_abi(fam, "" if fam == "msvc" else _dumpmachine(cc.path))
-        msg = rust_abi_mismatch(abi, rust_host(carg.path, rust_cwd), cc.path)
+        # From outside the tree, as n64lle's CMake check asks it (from the
+        # build tree): the Rust host the build's cargo actually targets.
+        msg = rust_abi_mismatch(abi, rust_host(carg.path, Path(_neutral_dir())), cc.path)
         if msg:
             carg.error = msg  # where n64lle files it: TC_ERR[CARGO]
     return [by[t.key] for t in TOOLS]
@@ -704,7 +723,15 @@ def _validate(t: ToolSpec, st: ToolState, versions: bool, cwd: Path | None = Non
         return
     if not versions:
         return
-    st.version, err = _run_version(p, t.key, cwd=cwd)
+    if t.key == "cargo":
+        st.version, pinned, err = _cargo_versions(p, cwd)
+        if pinned and parse_version(pinned) != parse_version(st.version):
+            _warn(st, f"the build runs cargo from its build tree, where rustup uses its "
+                      f"default toolchain ({st.version}), not the rust-toolchain.toml pin "
+                      f"({pinned}). `rustup default {'.'.join(map(str, parse_version(pinned)))}`"
+                      " makes them agree.")
+    else:
+        st.version, err = _run_version(p, t.key)
     if err:
         st.error = err
         return

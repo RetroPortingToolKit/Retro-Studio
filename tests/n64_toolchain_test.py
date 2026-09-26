@@ -218,17 +218,24 @@ def test_resolve(tmp: Path) -> None:
     check(st["git"].error.startswith("not executable"), "a non-executable file is refused")
     check(st["cargo"].error.startswith("does not exist"), "a missing path is refused")
 
-    # cargo's version is asked from inside the n64lle tree (rustup applies
-    # its rust-toolchain.toml there), as n64lle's own resolver asks it.
+    # cargo's version: the one the build gets (asked outside the tree, as
+    # n64lle's resolver asks), plus a warning when the pin inside differs.
     tree = tmp / "n64lle-tree"
     tree.mkdir()
-    pwdcargo = alt / "cargo-pwd"
-    pwdcargo.write_text('#!/bin/sh\necho "cargo 1.0.0 in $(basename "$PWD")"\n')
+    pwdcargo = alt / "cargo-pwd"   # a rustup proxy: its toolchain depends on $PWD
+    pwdcargo.write_text('#!/bin/sh\n[ "$(basename "$PWD")" = n64lle-tree ] '
+                        '&& echo "cargo 1.96.0 (pin)" || echo "cargo 1.93.1 (default)"\n')
     pwdcargo.chmod(0o755)
     st = {s.key: s for s in tc.resolve(None, env=env, studio={}, windows=False,
                                         project={"cargo": str(pwdcargo)}, rust_cwd=tree)}
-    check(st["cargo"].version == "cargo 1.0.0 in n64lle-tree",
-          "cargo --version runs inside the n64lle tree")
+    check(st["cargo"].version == "cargo 1.93.1 (default)",
+          "cargo's version is the one the BUILD gets (asked outside the n64lle tree)")
+    check("rust-toolchain.toml pin (cargo 1.96.0 (pin))" in st["cargo"].warning
+          and "rustup default 1.96.0" in st["cargo"].warning,
+          "a pin that differs from the build's toolchain is named, with the fix")
+    st = {s.key: s for s in tc.resolve(None, env=env, studio={}, windows=False,
+                                        project={"cargo": str(bind / "cargo")}, rust_cwd=tree)}
+    check(not st["cargo"].warning, "no warning when the pin and the build agree")
 
     st = {s.key: s for s in tc.resolve(None, env=env, studio={}, windows=False,
                                         project={"python": str(alt / "python3.10")})}

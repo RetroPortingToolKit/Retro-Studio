@@ -1118,6 +1118,17 @@ def _n64_rust_versions(fw: Path, *, cargo: str | None = None,
     if log:
         log(f"rust: {lines[0]} (host {host}"
             + (f"; pinned channel {channel}" if channel else "") + ")")
+        # That answer is the PIN's (asked inside fw). n64lle's CMake runs cargo
+        # from the build tree, where rustup cannot see rust-toolchain.toml and
+        # uses its default toolchain -- say so when that one differs, rather
+        # than log a version the build then does not use (2026-09-25: this
+        # line said 1.96.0 and the build ran 1.93.1).
+        built = _n64_tc._cargo_versions(cargo, None)[0]
+        if built and _n64_tc.parse_version(built) != _n64_tc.parse_version(lines[0]):
+            log(f"note: the build runs cargo from its build tree and gets {built} "
+                f"(rustup's default), not the pin's {lines[0]}. `rustup default "
+                f"{channel or '.'.join(map(str, _n64_tc.parse_version(lines[0])))}` "
+                "makes them agree.")
         if os.name == "nt" and not host.endswith("-windows-gnu"):
             # n64lle's CMake runs cargo with no --target and links the result
             # as lib<name>.a by path, which is the GNU target's spelling. Not

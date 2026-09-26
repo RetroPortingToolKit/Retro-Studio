@@ -132,8 +132,12 @@ came from, and the version it printed when Studio ran it. A problem is shown in
 red beside the tool it concerns: the path is missing, is not executable, fails
 `--version`, is below Python 3.11 or CMake 3.20, or (on Windows) the C
 compiler's ABI does not match cargo's Rust host. A warning is shown in amber,
-for example a gcc/clang C/C++ pair, or an environment variable that disagrees
-with the recorded file. What each tool is for, and the rules n64lle applies to
+for example a gcc/clang C/C++ pair, an environment variable that disagrees with
+the recorded file, or cargo resolving to a different toolchain than
+`rust-toolchain.toml` pins. Cargo's version is the one the **build** gets: n64lle
+runs cargo from its build tree, where rustup cannot see the pin and uses its
+default toolchain, so Studio asks from outside the tree, as n64lle's
+`toolchain.sh` does, and names the pin when it differs. What each tool is for, and the rules n64lle applies to
 it, are in n64lle's **`docs/PROJECT-SETUP.md`** ("Choosing tools"). This page
 does not repeat them.
 
