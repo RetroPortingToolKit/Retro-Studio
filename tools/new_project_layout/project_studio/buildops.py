@@ -524,6 +524,12 @@ _PROJECT_RE = re.compile(r"^\s*project\s*\(\s*([A-Za-z0-9_.+-]+)", re.MULTILINE)
 _N64_RUNTIME_TARGET_RE = re.compile(
     r"^\s*n64lle_add_runtime_target\s*\(\s*([A-Za-z0-9_.+-]+)", re.MULTILINE
 )
+# `n64lle_add_game_shim(glover-game` — a game-package port's product (n64lle,
+# 2026-09-26 on). The SDL runtime target above is an opt-in dev harness there,
+# usually absent, so the package is what names the slug.
+_N64_GAME_TARGET_RE = re.compile(
+    r"^\s*n64lle_add_game_shim\s*\(\s*([A-Za-z0-9_.+-]+)", re.MULTILINE
+)
 
 
 def default_target(root: Path) -> str:
@@ -554,7 +560,7 @@ def default_target(root: Path) -> str:
         except OSError:
             text = ""
     if profile.key == "n64":
-        m = _N64_RUNTIME_TARGET_RE.search(text)
+        m = _N64_GAME_TARGET_RE.search(text) or _N64_RUNTIME_TARGET_RE.search(text)
         if m:
             return m.group(1)
         # No runtime target: either <SLUG>_BUILD_UI is off or this is not a
@@ -594,9 +600,13 @@ def default_build_target(root: Path) -> str:
 
 
 def n64_project_slug(root: Path) -> str:
-    """The port's target prefix, derived from its runtime target name."""
+    """The port's target prefix, derived from its product target's name:
+    ``<slug>-game`` on a game-package port, ``<slug>-runtime`` before."""
     tgt = default_target(root)
-    return tgt[: -len("-runtime")] if tgt.endswith("-runtime") else ""
+    for suffix in ("-game", "-runtime"):
+        if tgt.endswith(suffix):
+            return tgt[: -len(suffix)]
+    return ""
 
 
 def n64_generate_target(root: Path) -> str:
@@ -1013,7 +1023,7 @@ def _missing_summary(root: Path) -> str:
     missing = _n64_paths.framework_missing_artifacts(root)
     if not missing:
         return "framework artifacts"
-    head = f"{_n64_paths.FRAMEWORK_BUILD_DIR}/{missing[0]}"
+    head = f"{_n64_paths.framework_build_dir(root)}/{missing[0]}"
     if len(missing) == 1:
         return head
     return f"{head} (and {len(missing) - 1} more required artifact(s))"
@@ -1022,8 +1032,9 @@ def _missing_summary(root: Path) -> str:
 def preflight_n64_framework(root: Path) -> CmdResult | None:
     """Reasons an n64lle port cannot configure, found before cmake runs."""
     root = Path(root).expanduser().resolve()
-    fw = root / "n64lle"
-    if not (fw / _n64_paths.MARKER).is_file():
+    if _n64_paths.port_framework(root) is None:
+        if _n64_paths.is_package_port(root):
+            return CmdResult(False, "Cannot configure: " + _n64_paths.MISSING_PORT_CHECKOUT)
         return CmdResult(
             False,
             "The n64lle submodule is not checked out — a port includes "
@@ -1032,6 +1043,13 @@ def preflight_n64_framework(root: Path) -> CmdResult | None:
         )
     if _n64_paths.framework_is_built(root):
         return None
+    if _n64_paths.is_package_port(root):
+        return CmdResult(
+            False,
+            f"n64lle is not built yet — missing {_missing_summary(root)}, so "
+            "n64lle_runtime_resolve_framework() would fail inside cmake. "
+            "Build game builds it first (the port's tools/build_framework.sh).",
+        )
     script = _n64_paths.framework_build_script(root)
     if script is None:
         return CmdResult(
@@ -1097,8 +1115,11 @@ def build_n64_framework(
                 "shared n64lle/tools/build_framework.sh instead; fold anything "
                 "that copy still needs upstream."
             )
-    fw = root / "n64lle"
-    if not (fw / _n64_paths.MARKER).is_file():
+    package = _n64_paths.is_package_port(root)
+    fw_pair = _n64_paths.port_framework(root)
+    if fw_pair is None:
+        if package:
+            return CmdResult(False, _n64_paths.MISSING_PORT_CHECKOUT)
         return CmdResult(
             False,
             "The n64lle submodule is not checked out. Run: "
@@ -1116,9 +1137,16 @@ def build_n64_framework(
             "bash on PATH.",
         )
     cmd = [shell, str(script), config]
-    # The shared script writes build-n64lle/ under the PORT, not under n64lle.
     env = dict(os.environ)
     env["N64LLE_PORT_ROOT"] = str(root)
+    if package:
+        # A game-package port builds against a CHECKOUT's framework tree, named
+        # in .n64lle/local.env -- exactly what the port's shim exports before it
+        # execs this same script. Said here too so a port whose shim has not
+        # been brought forward yet still builds the tree it configures against.
+        env["N64LLE_ROOT"] = str(fw_pair[0])
+        env["N64LLE_FRAMEWORK_BUILD_DIR"] = str(fw_pair[1])
+    # else: the shared script writes build-n64lle/ under the PORT (submodule).
     if dry_run:
         msg = "dry-run: " + " ".join(cmd)
         if log:
@@ -1138,7 +1166,7 @@ def build_n64_framework(
             "before building the port.",
             r.detail,
         )
-    return CmdResult(True, f"Built n64lle into {_n64_paths.FRAMEWORK_BUILD_DIR}/", r.detail)
+    return CmdResult(True, f"Built n64lle into {_n64_paths.framework_build_dir(root)}", r.detail)
 
 
 def generate_n64_c(
@@ -1214,6 +1242,102 @@ def generate_n64_c(
     gen = root / "generated"
     n = len(list(gen.glob("*.c"))) if gen.is_dir() else 0
     return CmdResult(True, f"Generated {n} C file(s) into generated/", r.detail)
+
+
+def build_n64_game(
+    root: Path,
+    *,
+    build_dir: str = DEFAULT_BUILD_DIR,
+    build_type: str = DEFAULT_BUILD_TYPE,
+    generator: str = "",
+    extra_args: list[str] | None = None,
+    target: str = "",
+    jobs: int | None = None,
+    dry_run: bool = False,
+    log: LogFn | None = None,
+) -> CmdResult:
+    """Build the game package: framework tools, configure, ``cmake --build``.
+
+    One button for what a game-package port needs in order, because each step
+    is the next one's prerequisite and none of them is the user's to sequence:
+
+    1. the n64lle framework tree the port builds against (the harvester,
+       n64emit, rspemit, rcore_probe, and the core the package LINKS) -- always,
+       incrementally. Build core rebuilds only the core target in that same
+       tree, so an emitter left behind it would emit for a different module ABI
+       than the core it then runs on; an up-to-date tree costs seconds.
+    2. configure, which reads .n64lle/local.env;
+    3. the build -- ``all`` unless a target is named, so the gates' drivers are
+       built with the package (see default_build_target).
+    """
+    root = Path(root).expanduser().resolve()
+    fw = build_n64_framework(root, config=build_type or DEFAULT_BUILD_TYPE,
+                             dry_run=dry_run, log=log)
+    if not fw.ok:
+        return fw
+    cfg = configure(root, build_dir=build_dir, build_type=build_type or DEFAULT_BUILD_TYPE,
+                    generator=generator, extra_args=extra_args, ensure_bios=False,
+                    dry_run=dry_run, log=log)
+    if not cfg.ok:
+        return cfg
+    tgt = (target or "").strip() or default_build_target(root)
+    if dry_run:
+        msg = f"dry-run: cmake --build {build_dir} --target {tgt}"
+        if log:
+            log(msg)
+        return CmdResult(True, msg)
+    r = build(root, build_dir=build_dir, target=tgt, jobs=jobs, log=log)
+    if not r.ok:
+        return r
+    pkg = _read_n64_run_env(resolve_build_dir(root, build_dir)).get("GAME_PACKAGE", "")
+    if pkg and Path(pkg).is_file():
+        return CmdResult(True, f"Built the game package: {pkg}", r.detail)
+    return CmdResult(True, f"Built {tgt} in {build_dir}", r.detail)
+
+
+def _read_n64_run_env(bdir: Path) -> dict[str, str]:
+    from .n64_components import read_run_game_env
+
+    return read_run_game_env(bdir)
+
+
+def build_n64_app(
+    root: Path,
+    *,
+    build_dir: str = DEFAULT_BUILD_DIR,
+    dry_run: bool = False,
+    log: LogFn | None = None,
+) -> CmdResult:
+    """The port's own ``tools/build_app.sh``: the title app, no ROM inside.
+
+    It bundles the core, runner and hub the build tree resolved (local.env,
+    unless a -D says otherwise). No component flag is sent: build_app.sh keeps
+    --core/--runner/--hub as sticky -D values, and a Studio button that quietly
+    re-pointed every later build and launch of this tree would be a surprise.
+    """
+    root = Path(root).expanduser().resolve()
+    script = root / "tools" / "build_app.sh"
+    if not script.is_file():
+        return CmdResult(False, f"{root.name} has no tools/build_app.sh — it predates the "
+                                "title app; take it with n64lle's port_drift.py --apply.")
+    bash = find_bash()
+    if bash is None:
+        return CmdResult(False, "No bash found to run tools/build_app.sh.")
+    cmd = [bash, str(script)]
+    env = dict(os.environ)
+    env["N64LLE_PORT_BUILD"] = str(resolve_build_dir(root, build_dir))
+    if dry_run:
+        msg = "dry-run: " + " ".join(cmd)
+        if log:
+            log(msg)
+        return CmdResult(True, msg)
+    r = _run_stream(cmd, root, log=log, env=env)
+    if not r.ok:
+        return r
+    for line in reversed((r.detail or "").splitlines()):
+        if line.startswith("app "):
+            return CmdResult(True, f"Built the title app: {line[4:].strip()}", r.detail)
+    return CmdResult(True, "tools/build_app.sh finished", r.detail)
 
 
 _MAX_PLAYERS_CMAKE_RE = re.compile(
@@ -1992,7 +2116,6 @@ def launch(
     process exits (Studio Launch → activity log). Pass ``wait=False`` to
     detach immediately (legacy fire-and-forget).
     """
-    global _active_launch
     root = root.expanduser().resolve()
     bdir = resolve_build_dir(root, build_dir)
     if exe:
@@ -2005,10 +2128,25 @@ def launch(
         return CmdResult(False, f"Executable missing: {exe_path}")
 
     overlay = parse_env_text(env_text)
-    env = os.environ.copy()
-    env.update(overlay)
     # Run from game root so relative game.toml / disc / saves resolve.
     cmd = [str(exe_path), *(extra_args or [])]
+    return _spawn_launch(root, exe_path, cmd, overlay, dry_run=dry_run, log=log, wait=wait)
+
+
+def _spawn_launch(
+    root: Path,
+    exe_path: Path,
+    cmd: list[str],
+    overlay: dict[str, str],
+    *,
+    dry_run: bool,
+    log: LogFn | None,
+    wait: bool,
+) -> CmdResult:
+    """Start ``cmd`` as THE launch: one at a time, Stop-able, streamed to log."""
+    global _active_launch
+    env = os.environ.copy()
+    env.update(overlay)
     # Prefer line-buffered stdio so fprintf diagnostics show up live when piped.
     if sys.platform != "win32" and shutil.which("stdbuf"):
         cmd = ["stdbuf", "-oL", "-eL", *cmd]
@@ -2098,6 +2236,92 @@ def launch(
     if code != 0:
         return CmdResult(False, f"{exe_path.name} exited {code}", msg)
     return CmdResult(True, f"{exe_path.name} exited 0")
+
+
+N64_LAUNCH_CHOICES = ("default", "dev")
+
+
+def launch_n64_game(
+    root: Path,
+    *,
+    build_dir: str = DEFAULT_BUILD_DIR,
+    core: str = "default",
+    runner: str = "default",
+    hub: str = "default",
+    env_text: str = "",
+    extra_args: list[str] | None = None,
+    dry_run: bool = False,
+    log: LogFn | None = None,
+    wait: bool = True,
+) -> CmdResult:
+    """Play a game-package port through its own ``tools/run_game.sh``.
+
+    The script is the port's contract for playing (it checks the runner for
+    ``game_package 1`` and the hub for ``--package``, and names a half-updated
+    NVIDIA driver instead of dying on a GLX error), so Studio runs it rather
+    than re-deriving the hub command line. It launches what is BUILT
+    (N64LLE_NO_BUILD=1): building is the Build game button's job.
+
+    ``core`` / ``runner`` / ``hub`` are ``default`` -- what the build tree
+    resolved from .n64lle/local.env, normally the fetched releases -- or
+    ``dev``, the build in that component's checkout (n64_components). The
+    runner and hub are swapped the way run_game.sh documents, through
+    RETRO_CORE_RUNNER / RETRO_HUB in its environment. The script re-reads the
+    core from run_game.env, so a dev core is passed to the hub as a trailing
+    ``--run-core``: retro-hub takes the LAST one (hub_main.cpp's direct-mode
+    parse, v0.7.0 and main alike), and the argument is visible in the log.
+    """
+    from . import n64_components as comps
+
+    root = Path(root).expanduser().resolve()
+    script = root / "tools" / "run_game.sh"
+    if not script.is_file():
+        return CmdResult(
+            False,
+            f"{root.name} has no tools/run_game.sh — it is not a game-package port "
+            "(n64lle 2026-09-26 on). Migrate it, or launch its SDL runtime with "
+            "an explicit Exe.",
+        )
+    bdir = resolve_build_dir(root, build_dir)
+    rge = comps.read_run_game_env(bdir)
+    if not rge:
+        return CmdResult(False, f"{bdir}/run_game.env is missing — press Build game first.")
+    pkg = rge.get("GAME_PACKAGE", "")
+    if not pkg or not Path(pkg).is_file():
+        return CmdResult(False, f"The game package is not built ({pkg or 'unknown'}) — "
+                                "press Build game first.")
+
+    overlay = parse_env_text(env_text)
+    overlay["N64LLE_PORT_BUILD"] = str(bdir)
+    overlay["N64LLE_NO_BUILD"] = "1"
+    tail: list[str] = []
+    for which, choice in (("core", core), ("runner", runner), ("hub", hub)):
+        comp = comps.COMPONENTS[which]
+        choice = (choice or "default").strip().lower()
+        if choice not in N64_LAUNCH_CHOICES:
+            return CmdResult(False, f"{which}: want default or dev, got {choice!r}")
+        if choice == "default":
+            path, frm = comps.default_for(which, root, bdir)
+            _flush_log(log, f"{comp.label}: {path or '(none)'}"
+                            + (f"  [{frm}]" if frm else ""))
+            continue
+        dev = comps.dev_path(which, root)
+        if dev is None:
+            src = comps.checkout(which, root)
+            where = f" in {src}" if src else f" (no {comp.repo} checkout found)"
+            return CmdResult(False, f"No dev {comp.label} is built{where} — press "
+                                    f"Build {which} first.")
+        _flush_log(log, f"{comp.label}: {dev}  [dev]")
+        if which == "core":
+            tail += ["--run-core", str(dev)]
+        else:
+            overlay[comp.env_key] = str(dev)
+
+    bash = find_bash()
+    if bash is None:
+        return CmdResult(False, "No bash found to run tools/run_game.sh.")
+    cmd = [bash, str(script), *(extra_args or []), *tail]
+    return _spawn_launch(root, script, cmd, overlay, dry_run=dry_run, log=log, wait=wait)
 
 
 def stop_launch() -> CmdResult:

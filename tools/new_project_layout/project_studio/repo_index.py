@@ -496,6 +496,12 @@ def looks_like_game_repo(root: Path) -> bool:
             return False
         if (root / profile.framework).exists():
             return True
+        # A game-package port (2026-09-26 on) has no submodule at all: its
+        # .n64lle/local.env, or the game-shim call in its CMakeLists, says so.
+        from . import n64_paths
+
+        if n64_paths.is_package_port(root):
+            return True
         mods = root / ".gitmodules"
         if mods.is_file():
             try:
@@ -523,6 +529,13 @@ def looks_like_game_repo(root: Path) -> bool:
 
 def _names_foreign_framework(root: Path, profile) -> bool:
     """Does this tree carry another console's framework rather than ours?"""
+    if profile.key != "n64":
+        # An n64lle game-package port carries no n64lle/ to be spotted by, and
+        # a game.toml like a PSX port's.
+        from . import n64_paths
+
+        if n64_paths.is_package_port(root):
+            return True
     for other in platforms.PROFILES.values():
         if other.key == profile.key:
             continue

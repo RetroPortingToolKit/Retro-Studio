@@ -450,13 +450,12 @@ def test_new_project_command(tmp: Path) -> None:
     check(npj.validate_options(opts) == [], "valid options pass validation")
     check(npj.n64_project_name(opts) == "ZedAdventureRecomp", "project = <Pascal>Recomp")
     check(npj.n64_slug(opts) == "zedadventure", "slug = lowercased, stripped")
-    check(npj.n64_exe(opts) == "zedadventure", "exe defaults to the slug")
     check(npj.project_root_for(opts).name == "ZedAdventureRecomp",
           "the folder created is $DIR/$PROJECT, not an install_dir slug")
 
     cmd, _ = npj.build_command(opts)
     joined = " ".join(cmd)
-    for flag in ("--yes", "--rom", "--project", "--slug", "--exe", "--players", "--dir"):
+    for flag in ("--yes", "--rom", "--project", "--slug", "--players", "--dir", "--core"):
         check(flag in cmd, f"sends {flag}")
     # argv[0] is a RESOLVED shell, not the word "sh". Windows has no sh on
     # PATH, so a literal one never reached the wizard at all; and n64lle's
@@ -473,22 +472,41 @@ def test_new_project_command(tmp: Path) -> None:
                  "--enable-ci", "--no-ci", "--fetch-boxart", "--enable-build",
                  "--netplay", "--recomp-ui"):
         check(flag not in joined, f"never sends {flag} (n64lle has no such flag)")
-    # --n64lle-ref / --recomp-ui-ref exist on wizards from 2026-09-12 on, and
-    # are sent ONLY to a copy whose parser declares them: Studio drives
-    # whichever setup_project.sh it found, and that copy can be older than
-    # Studio. A blank ref is never sent at all — blank means "keep the
-    # scaffolder's own pin", which is not the same as naming main.
-    check("--n64lle-ref" not in joined, "a blank n64lle ref sends no flag")
-    script = n64_paths.setup_script(None)
-    opts.n64lle_ref = "fix/some-branch"
-    ref_cmd = " ".join(npj.build_command(opts)[0])
-    if npj.script_supports(script, "--n64lle-ref"):
-        check("--n64lle-ref fix/some-branch" in ref_cmd,
-              "forwards --n64lle-ref to a wizard that declares it")
-    else:
-        check("--n64lle-ref" not in ref_cmd,
-              "withholds --n64lle-ref from a wizard that would exit 2 on it")
-    opts.n64lle_ref = ""
+    # The game-package scaffold REFUSES the submodule scaffold's flags
+    # (`removed --exe ...`), so sending any of them kills the run.
+    for flag in ("--exe", "--n64lle-ref", "--recomp-ui-ref", "--source", "--release"):
+        check(flag not in cmd, f"never sends {flag} (the game-package scaffold refuses it)")
+
+    # The three binaries. Release is the scaffolder's default and is sent as
+    # the keyword; the runner and hub are then fetched (no flag).
+    check(cmd[cmd.index("--core") + 1] == "release", "core defaults to release")
+    check("--runner" not in cmd and "--hub" not in cmd and "--hub-src" not in cmd,
+          "release runner and hub send no flag (the scaffolder fetches them)")
+    check("--no-app" in cmd, "no title app without --generate")
+    check("--no-transfer-pak" in cmd, "Transfer Pak is said, not left to a prompt")
+
+    opts.n64_core = "generate"
+    opts.n64_hub = "dev"
+    opts.n64_runner = "/opt/rr/retro-core-runner"
+    opts.do_generate = True
+    dev_cmd = npj.build_command(opts)[0]
+    check(dev_cmd[dev_cmd.index("--core") + 1] == "generate", "dev core = --core generate")
+    check(dev_cmd[dev_cmd.index("--runner") + 1] == "/opt/rr/retro-core-runner",
+          "a runner path is passed through")
+    from project_studio import n64_components
+    if n64_components.checkout("hub", None) is not None:
+        check("--hub-src" in dev_cmd, "a dev hub is built by the scaffolder (--hub-src)")
+    check("--generate" in dev_cmd and "--app" in dev_cmd, "generate builds the title app")
+    opts.n64_skip_player = True
+    skip_cmd = npj.build_command(opts)[0]
+    check("--skip-player" in skip_cmd and "--runner" not in skip_cmd
+          and "--no-app" in skip_cmd, "skip player: no runner/hub, no app")
+    opts.n64_core = "/no/such/n64lle_core.so"
+    check(any("Core not found" in e for e in npj.validate_options(opts)),
+          "a core path that does not exist is refused before the scaffold")
+    opts.n64_core, opts.n64_runner, opts.n64_hub = "release", "release", "release"
+    opts.n64_skip_player = False
+    opts.do_generate = False
 
     # Five seats is a PSX/SNES notion; the N64 has four ports and the script
     # rejects anything else outright.
@@ -521,6 +539,135 @@ def test_build_target(root: Path) -> None:
     platforms.set_current("psx")
     check(buildops.default_target(root) == "psx-runtime", "PSX still uses its constant")
     platforms.set_current("n64")
+
+
+def test_game_package_port(tmp: Path) -> None:
+    """A game-package port: no submodule, .n64lle/local.env names everything."""
+    print("game-package port")
+    from project_studio import buildops, n64_components
+
+    platforms.set_current("n64")
+    port = tmp / "PkgRecomp"
+    (port / "tools").mkdir(parents=True)
+    (port / ".n64lle").mkdir()
+    (port / "CMakeLists.txt").write_text(
+        "project(PkgRecomp)\n"
+        "add_custom_target(pkg-generate DEPENDS x)\n"
+        "n64lle_add_game_shim(pkg-game\n  GAME_TOML game.toml)\n",
+        encoding="utf-8")
+    fw = tmp / "fake-n64lle"
+    (fw / "runtime").mkdir(parents=True)
+    (fw / "runtime" / "runtime.cmake").write_text("", encoding="utf-8")
+    (fw / "tools").mkdir()
+    (fw / "tools" / "build_framework.sh").write_text("#!/usr/bin/env bash\n")
+    (port / ".n64lle" / "local.env").write_text(
+        f"# comment\nN64LLE_ROOT='{fw}'\nN64LLE_BUILD='{fw}/build-x'\n"
+        f"RETRO_HUB='/opt/hub/retro-hub'\nRETRO_HUB_FROM='release'\n",
+        encoding="utf-8")
+    old_env = os.environ.pop("N64LLE_ROOT", None)
+    try:
+        check(n64_paths.is_package_port(port), "local.env marks a game-package port")
+        pf = n64_paths.port_framework(port)
+        check(pf is not None and pf[0] == fw and pf[1] == fw / "build-x",
+              "the framework is the checkout local.env names, not a submodule")
+        check(buildops.default_target(port) == "pkg-game", "product target is the game shim")
+        check(buildops.n64_generate_target(port) == "pkg-generate", "generate target derived")
+        d = buildops.build_n64_framework(port, dry_run=True)
+        check(d.ok and str(fw / "tools" / "build_framework.sh") in d.message,
+              "the framework build runs the CHECKOUT's script")
+        path, frm = n64_components.default_for("hub", port, port / "build-release")
+        check(path == "/opt/hub/retro-hub" and frm == "release",
+              "the default hub is local.env's, with its provenance")
+        # No package built yet: Launch says to build, rather than starting a hub
+        # on nothing.
+        (port / "tools" / "run_game.sh").write_text("#!/usr/bin/env bash\n")
+        r = buildops.launch_n64_game(port, dry_run=True)
+        check(not r.ok and "Build game" in r.message, "launch before a build names Build game")
+        bdir = port / "build-release"
+        (bdir / "package").mkdir(parents=True)
+        pkg = bdir / "package" / "pkg_game.so"
+        pkg.write_bytes(b"")
+        (bdir / "run_game.env").write_text(
+            f"N64LLE_CORE_LIB='/c/n64lle_core.so'\nGAME_PACKAGE='{pkg}'\n", encoding="utf-8")
+        r = buildops.launch_n64_game(port, dry_run=True)
+        check(r.ok and "N64LLE_NO_BUILD=1" in r.message and "run_game.sh" in r.message,
+              "launch runs the port's run_game.sh on what is built")
+        check("--run-core" not in r.message and "RETRO_HUB=" not in r.message,
+              "default launch overrides nothing")
+        r = buildops.launch_n64_game(port, hub="dev", dry_run=True)
+        dev_hub = n64_components.dev_path("hub", port)
+        if dev_hub is None:
+            check(not r.ok and "Build hub" in r.message, "a dev hub not built names Build hub")
+        else:
+            check(r.ok and f"RETRO_HUB={dev_hub}" in r.message,
+                  "a dev hub is handed to run_game.sh through RETRO_HUB")
+        # --- Migrate -------------------------------------------------------
+        from project_studio import n64ops, repo_index
+        from project_studio.models import MigrateOptions
+
+        check(repo_index.looks_like_game_repo(port),
+              "a game-package port is recognised as an N64 repo")
+        platforms.set_current("psx")
+        check(not repo_index.looks_like_game_repo(port),
+              "and never lands in the PSX list (it has a game.toml too)")
+        platforms.set_current("n64")
+        rep = n64ops.audit_project(port)
+        ops = {c.fix_op for c in rep.checks if c.fix_op}
+        check(not ops & {"n64_ensure_framework_submodule", "n64_ensure_recomp_ui_submodule",
+                         "n64_repair_framework_submodule", "n64_record_framework_pins"},
+              "Migrate never offers a game-package port a submodule op")
+        ids = {c.id: c for c in rep.checks}
+        check(ids.get("local_env") is not None and ids["local_env"].status.name == "PASS",
+              "the checkout local.env names is the port's framework")
+        check(ids.get("cmake") is not None and "pkg-game" in ids["cmake"].detail,
+              "the build graph row reads the game shim")
+        plan = n64ops.build_plan(port, MigrateOptions(only=["n64_ensure_framework_submodule"]))
+        check("n64_ensure_framework_submodule" not in [st.op_id for st in plan.steps],
+              "a submodule op named explicitly is still refused on a game-package port")
+
+        (port / ".n64lle" / "local.env").unlink()
+        rep = n64ops.audit_project(port)
+        row = next((c for c in rep.checks if c.id == "local_env"), None)
+        check(row is not None and row.status.name == "FAIL" and row.fix_op == "n64_attach",
+              "no local.env: FAIL, fixed by Attach")
+        cmd, why = n64ops.attach_command(port)
+        if cmd:
+            check("--attach" in cmd and "--yes" in cmd
+                  and cmd[cmd.index("--core") + 1] == "generate",
+                  "Attach with no previous core asks for generate (release is unpublished)")
+        else:
+            check(bool(why), "Attach says why it cannot run")
+    finally:
+        if old_env is not None:
+            os.environ["N64LLE_ROOT"] = old_env
+
+
+def test_bulk_recomp_n64(tmp: Path) -> None:
+    """Bulk Recomp scaffolds game-package ports with flags the scaffolder takes."""
+    print("bulk recomp (N64)")
+    from project_studio import bulkrecomp
+
+    platforms.set_current("n64")
+    rom = tmp / "Zed (USA).z64"
+    rom.write_bytes(b"\x80\x37\x12\x40" + b"\0" * 64)
+    b = bulkrecomp.BulkRun(bulkrecomp.BulkRecompOptions(images=[str(rom)],
+                                                        out_dir=str(tmp / "bulk")))
+    it = b.items[0]
+    it.name = "Zed"
+    args = b._scaffold_args(it, {"project": "ZedRecomp", "slug": "zed", "exe": "zed"})
+    check("--n64-exe" not in args, "bulk never sends the removed --n64-exe")
+    check(args[args.index("--n64-core") + 1] == "generate",
+          "bulk scaffolds on a generated core (release is unpublished)")
+    check("--n64-skip-player" in args and "--n64-no-app" in args,
+          "bulk fetches no runner/hub and builds no app")
+    parser = __import__("project_studio.cli", fromlist=["build_parser"]).build_parser()
+    ns = parser.parse_args(["--platform", "n64", *args])
+    check(ns.n64_core == "generate" and ns.n64_skip_player,
+          "the CLI accepts every flag bulk sends")
+    check(b._project_root(it, {"project": "ZedRecomp"}).name == "ZedRecomp",
+          "bulk resolves the folder new-project creates")
+    check(b._serial("framework") is b._shared_tree and b._serial("compile") is not b._shared_tree,
+          "stages that build the shared n64lle tree run one item at a time")
 
 
 def test_framework_preflight(root: Path) -> None:
@@ -660,6 +807,8 @@ def main() -> int:
         test_rom_discovery(root, tmp)
         test_build_target(root)
         test_framework_preflight(root)
+        test_game_package_port(tmp)
+        test_bulk_recomp_n64(tmp)
         test_audit_plan_apply(root)
         test_template_drift(tmp)
         test_refuses_unresolved_tokens(tmp)

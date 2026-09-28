@@ -745,6 +745,28 @@ struct MesenStatus {
 // is a THIRD kind from the other two: first-party (n64lle's own n64ref), BUILT
 // from a submodule pinned by n64ref/ORACLE-PIN.md rather than downloaded, and
 // it speaks the runtime's own protocol rather than answering through artifacts.
+// One of the three binaries a game-package port runs on, as
+// `build components --json` reports it.
+struct N64Component {
+    std::string label;
+    std::string checkout;      // source checkout a dev build comes from
+    std::string dev;           // where that checkout's local build puts it
+    bool dev_built = false;
+    std::string def;           // what a plain launch uses
+    std::string def_from;      // release / generate / manual / dev / build …
+    bool def_exists = false;
+};
+
+struct N64Components {
+    bool probed = false;
+    bool package_port = false;
+    N64Component core, runner, hub;
+    std::string package;       // <build>/package/<slug>_game.<ext>
+    bool package_built = false;
+    std::string root;          // the repo + build dir this answer is for
+    std::string error;
+};
+
 struct N64OracleStatus {
     bool        probed = false;
     bool        installed = false;
@@ -952,19 +974,22 @@ struct StudioModel {
     // one field for one game image, so the two can never disagree.
     char np_snes_ref[128] = "main";
     // --- N64 ---------------------------------------------------------------
-    // Three names where the other consoles need one. n64lle's scaffolder asks
-    // for all three because a port has no single string that serves: the CMake
-    // project is GloverRecomp, every target is built from the prefix glover-,
-    // and the executable is glover. Blank means "let the scaffolder derive
-    // it", which is the default a terminal run would have offered.
+    // A game-package port (n64lle, 2026-09-26 on) builds <slug>_game.so and no
+    // executable, so beside the CMake project it needs only a target prefix.
+    // Blank means "let the scaffolder derive it".
     char np_n64_slug[128] = {};
-    char np_n64_exe[128] = {};
-    // The n64lle revision to cut the port against. Blank is NOT "main": it is
-    // "let the scaffolder decide", which means branch main pinned at the HEAD
-    // of the n64lle checkout the wizard was run from. Naming one here
-    // overrides that pin, and an older wizard without the flag says so in the
-    // log rather than silently ignoring it.
-    char np_n64_ref[128] = {};
+    // The three binaries the port runs on. 0 = release (fetched; the
+    // scaffolder's default), 1 = dev (core: built from the n64lle checkout;
+    // runner / hub: built from their source checkouts), 2 = a path.
+    int np_n64_core = 0;
+    int np_n64_runner = 0;
+    int np_n64_hub = 0;
+    char np_n64_core_path[1024] = {};
+    char np_n64_runner_path[1024] = {};
+    char np_n64_hub_path[1024] = {};
+    bool np_n64_skip_player = false;
+    bool np_n64_tpak = false;
+    bool np_n64_app = true;  // title app after Generate (the scaffolder's default)
     // The execution-derived harvest window. n64lle records what actually ran
     // rather than following seeds, so these two ARE the coverage decision for
     // a new port; 0 takes the scaffolder's own defaults (900 / 3000M) rather
@@ -1060,6 +1085,15 @@ struct StudioModel {
     // LLE for one run whatever game.toml declares. That is the reference to
     // compare against when the executor's frame is in doubt.
     bool build_n64_force_lle = false;
+    // Launch picks, per binary: 0 = the port's default (.n64lle/local.env,
+    // normally a fetched release), 1 = the dev build Build core / runner / hub
+    // made. Launch-time only; nothing is rebuilt or re-pointed.
+    int build_n64_launch_core = 0;
+    int build_n64_launch_runner = 0;
+    int build_n64_launch_hub = 0;
+    // `build components --json`: each binary's checkout, dev build and default.
+    N64Components n64_components;
+    bool n64_components_probing = false;
     char build_env[4096] =
         "# KEY=VALUE pairs (space or newline separated)\n"
         "# Example:\n"
@@ -1379,6 +1413,12 @@ struct StudioModel {
     // 0 = this clone only, 1 = commit to .gitmodules. Defaults to the scope
     // that cannot surprise a collaborator.
     int git_url_scope = 0;
+
+    // "Remove" on the Game repo row: captured at click time so the modal acts
+    // on the repo the user saw, even if the selection changes underneath it.
+    bool repo_remove_open = false;
+    std::string repo_remove_path;
+    std::string repo_remove_label;
 
     // Log (ring)
     static constexpr size_t kMaxLogLines = 4000;

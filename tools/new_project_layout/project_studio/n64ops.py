@@ -29,6 +29,16 @@ So the ops here are the mechanical ones: submodules, .gitignore, untracking
 what must never be committed, and the small stub files the scaffolder writes
 that carry no measurements. Anything that cannot be derived from the repository
 as it stands is reported with no fix op rather than guessed at.
+
+TWO PORT MODELS, audited separately. A game-package port (n64lle 2026-09-26
+on) has no submodules: it builds <slug>_game against the checkout its
+gitignored .n64lle/local.env names, and runs on a core, runner and hub that
+file also names. A submodule port (before) pins n64lle/ (+ recomp-ui/) and
+builds its own executable; n64lle still supports it ("this call stays for
+existing ports", docs/RCORE.md). Offering a game-package port the submodule
+ops would pull it back into the old model, so it never sees them. Moving a
+submodule port to a game package is, in n64lle's words, "a migration to
+review, not an --apply": the audit says so and offers no op for it.
 """
 
 from __future__ import annotations
@@ -61,6 +71,7 @@ PINS_FILE = "framework_pins.txt"
 # Ordered for apply: submodules first (later ops read their contents), pins
 # last (they record what everything above settled on).
 OP_ORDER: tuple[str, ...] = (
+    "n64_attach",
     "n64_repair_framework_submodule",
     "n64_ensure_framework_submodule",
     "n64_ensure_recomp_ui_submodule",
@@ -79,6 +90,7 @@ OP_ORDER: tuple[str, ...] = (
 )
 
 OP_TITLES: dict[str, str] = {
+    "n64_attach": "Attach to an n64lle checkout (setup_project.sh --attach)",
     "n64_repair_framework_submodule": "Repair broken n64lle/ git checkout",
     "n64_ensure_framework_submodule": "Add n64lle submodule",
     "n64_ensure_recomp_ui_submodule": "Add recomp-ui submodule",
@@ -186,7 +198,21 @@ def runtime_target(root: Path) -> str:
     return m.group(1) if m else ""
 
 
+_GAME_SHIM_RE = re.compile(
+    r"^\s*n64lle_add_game_shim\s*\(\s*([A-Za-z0-9_.+-]+)", re.MULTILINE
+)
+
+
+def game_target(root: Path) -> str:
+    """``<slug>-game`` — a game-package port's product."""
+    m = _GAME_SHIM_RE.search(_cmake_text(root))
+    return m.group(1) if m else ""
+
+
 def project_slug(root: Path) -> str:
+    tgt = game_target(root)
+    if tgt.endswith("-game"):
+        return tgt[: -len("-game")]
     tgt = runtime_target(root)
     return tgt[: -len("-runtime")] if tgt.endswith("-runtime") else ""
 
@@ -258,6 +284,126 @@ def _submodule_present(root: Path, path: str, marker: str = "") -> tuple[bool, b
     if not marker:
         live = sub.is_dir() and any(sub.iterdir())
     return declared, live
+
+
+def _submodule_framework_rows(root: Path, add) -> bool:
+    """A submodule port's n64lle/ + recomp-ui/; True when n64lle/ is live."""
+    declared, live = _submodule_present(root, FRAMEWORK, FRAMEWORK_MARKER)
+    broken = diagnose_framework_checkout(root) if (root / FRAMEWORK).is_dir() else None
+    add("model", "Port model: submodule", CheckStatus.WARN, Severity.INFO,
+        "This port pins n64lle/ as a submodule and builds its own executable -- the "
+        "model before 2026-09-26. n64lle still supports it. New ports build a game "
+        "package on the generic core instead; n64lle's templates now describe that, so "
+        "drift against a current checkout reads almost everywhere (the model change, "
+        "not noise). Moving this port is a migration to review, not an apply: no op.")
+    if live and broken:
+        add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.FAIL, Severity.REQUIRED,
+            broken + " Repair re-clones it as a real submodule.",
+            "n64_repair_framework_submodule")
+    elif live:
+        add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.PASS, Severity.REQUIRED,
+            str(root / FRAMEWORK))
+    elif declared:
+        add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.FAIL, Severity.REQUIRED,
+            f"Declared in .gitmodules but not initialised (or missing {FRAMEWORK_MARKER}).",
+            "n64_ensure_framework_submodule")
+    else:
+        add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.FAIL, Severity.REQUIRED,
+            "No n64lle submodule — the project cannot generate or build.",
+            "n64_ensure_framework_submodule")
+
+    ui_declared, ui_live = _submodule_present(root, "recomp-ui")
+    if ui_live:
+        add("recomp_ui", "recomp-ui/ checkout", CheckStatus.PASS, Severity.RECOMMENDED, "")
+    else:
+        add("recomp_ui", "recomp-ui/ checkout", CheckStatus.WARN, Severity.RECOMMENDED,
+            "Declared but not initialised." if ui_declared else "Not present (optional).",
+            "n64_ensure_recomp_ui_submodule")
+
+    # n64lle vendors ares and rabbitizer, but its own build initialises them
+    # and Studio does not manage their pins. Recorded as a passing INFO row so
+    # the absence of a "nested libs" line is not read as an oversight.
+    add("nested", "Nested libs inside n64lle", CheckStatus.PASS, Severity.INFO,
+        "n64lle carries no recomp-net / retcomm-rbengine; its own vendored "
+        "submodules (ares, rabbitizer) are the framework build's to initialise.")
+    return live
+
+
+_FROM_KEYS = {"N64LLE_CORE_LIB": "N64LLE_CORE_FROM",
+              "RETRO_CORE_RUNNER": "RETRO_CORE_RUNNER_FROM",
+              "RETRO_HUB": "RETRO_HUB_FROM"}
+
+
+def _package_framework_rows(root: Path, add) -> bool:
+    """A game-package port's checkout, framework build, core, runner and hub.
+
+    True when the port names an n64lle checkout that exists."""
+    add("model", "Port model: game package", CheckStatus.PASS, Severity.INFO,
+        "No submodules and no host: <slug>_game runs on n64lle's generic core inside "
+        "retro-hub, through retro-core-runner. Which ones is .n64lle/local.env "
+        "(gitignored, this machine's).")
+    env_file = root / n64_paths.LOCAL_ENV_REL
+    pf = n64_paths.port_framework(root)
+    attach = ("Attach re-runs the checkout's setup_project.sh --attach, which rewrites it "
+              "and keeps the core / runner / hub choices it finds there.")
+    if not env_file.is_file() and pf is None:
+        add("local_env", ".n64lle/local.env", CheckStatus.FAIL, Severity.REQUIRED,
+            "Missing -- a fresh clone, or never attached. The port's CMakeLists refuses "
+            "to configure without an n64lle checkout. " + attach, "n64_attach")
+        return False
+    if pf is None:
+        raw, where = n64_paths.port_setting(root, "N64LLE_ROOT")
+        add("local_env", ".n64lle/local.env", CheckStatus.FAIL, Severity.REQUIRED,
+            f"N64LLE_ROOT={raw or '(unset)'} ({where or 'nowhere'}) is not an n64lle "
+            "checkout. " + attach, "n64_attach")
+        return False
+    _, where = n64_paths.port_setting(root, "N64LLE_ROOT")
+    add("local_env", "n64lle checkout", CheckStatus.PASS, Severity.REQUIRED,
+        f"{pf[0]} (from {where or 'local.env'}); framework build {pf[1]}")
+    if n64_paths.framework_is_built(root):
+        add("framework_build", "Framework build", CheckStatus.PASS, Severity.RECOMMENDED,
+            str(pf[1]))
+    else:
+        add("framework_build", "Framework build", CheckStatus.WARN, Severity.RECOMMENDED,
+            f"{pf[1]} is not built, so the port cannot configure yet. Build game (Build "
+            "tab) builds it first; no op here -- it is a build, not a repo change.")
+
+    # Stale submodules are a half-finished move to this model: the build no
+    # longer reads them, and a later `submodule update` would bring them back.
+    stale = [p for p in (FRAMEWORK, "recomp-ui") if _submodule_present(root, p)[0]]
+    if stale:
+        add("stale_submodules", "Leftover submodules", CheckStatus.WARN, Severity.RECOMMENDED,
+            f".gitmodules still declares {', '.join(stale)}, which a game-package port "
+            "does not use. Remove them by hand (git rm <path>) once nothing reads them; "
+            "no op, because removing a submodule is not reversible from here.")
+
+    local = n64_paths.read_local_env(root)
+    for key, label in (("N64LLE_CORE_LIB", "Core"), ("RETRO_CORE_RUNNER", "Runner"),
+                       ("RETRO_HUB", "Hub")):
+        val, where = n64_paths.port_setting(root, key)
+        frm = local.get(_FROM_KEYS[key], "")
+        cid = f"bin_{label.lower()}"
+        if key == "N64LLE_CORE_LIB" and not val:
+            # Unset core = the framework build's own (the CMakeLists default).
+            from .n64_components import binary_name
+            val, frm = str(pf[1] / "runtime" / binary_name("core")), "framework build"
+        if not val or frm == "none":
+            # No op: Attach keeps a deliberate skip, so offering it here would
+            # be a fix that changes nothing.
+            add(cid, f"{label}: not configured", CheckStatus.WARN, Severity.RECOMMENDED,
+                "local.env names none (--skip-player). The build and gates do not need "
+                "it. To play: Build tab, pick its Dev build for Launch; or rerun "
+                "setup_project.sh --attach without --skip-player to fetch the release.")
+        elif not Path(val).exists():
+            fix = "Build core or Build game (Build tab) produces it." \
+                if frm in ("generate", "framework build") else attach
+            add(cid, f"{label}: missing", CheckStatus.WARN, Severity.RECOMMENDED,
+                f"{val} ({frm or where}) does not exist. {fix}",
+                None if frm in ("generate", "framework build") else "n64_attach")
+        else:
+            add(cid, label, CheckStatus.PASS, Severity.RECOMMENDED,
+                f"{frm or where}: {val}")
+    return True
 
 
 def diagnose_framework_checkout(root: Path) -> str | None:
@@ -342,7 +488,8 @@ def _drift_rows(drift: dict, add) -> None:
     src = f"n64lle {drift.get('templates_rev', '?')} ({drift['_checkout']})"
     if own:
         add("drift_source", "Template drift: measured", CheckStatus.PASS, Severity.INFO,
-            f"Against {src}, the port's own pin -- the same verdict its "
+            f"Against {src}, the n64lle this port builds against (its pinned submodule, "
+            "or the checkout .n64lle/local.env names) -- the same verdict its "
             "<slug>_template_drift ctest gives.")
     else:
         add("drift_source", "Template drift: PREVIEW", CheckStatus.WARN, Severity.INFO,
@@ -428,38 +575,11 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
     superseded = _DRIFT_SUPERSEDES if (tpl_drift and tpl_drift["_own"]) else frozenset()
 
     # --- framework ----------------------------------------------------------
-    declared, live = _submodule_present(root, FRAMEWORK, FRAMEWORK_MARKER)
-    broken = diagnose_framework_checkout(root) if (root / FRAMEWORK).is_dir() else None
-    if live and broken:
-        add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.FAIL, Severity.REQUIRED,
-            broken + " Repair re-clones it as a real submodule.",
-            "n64_repair_framework_submodule")
-    elif live:
-        add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.PASS, Severity.REQUIRED,
-            str(root / FRAMEWORK))
-    elif declared:
-        add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.FAIL, Severity.REQUIRED,
-            f"Declared in .gitmodules but not initialised (or missing {FRAMEWORK_MARKER}).",
-            "n64_ensure_framework_submodule")
+    package = n64_paths.is_package_port(root)
+    if package:
+        live = _package_framework_rows(root, add)
     else:
-        add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.FAIL, Severity.REQUIRED,
-            "No n64lle submodule — the project cannot generate or build.",
-            "n64_ensure_framework_submodule")
-
-    ui_declared, ui_live = _submodule_present(root, "recomp-ui")
-    if ui_live:
-        add("recomp_ui", "recomp-ui/ checkout", CheckStatus.PASS, Severity.RECOMMENDED, "")
-    else:
-        add("recomp_ui", "recomp-ui/ checkout", CheckStatus.WARN, Severity.RECOMMENDED,
-            "Declared but not initialised." if ui_declared else "Not present (optional).",
-            "n64_ensure_recomp_ui_submodule")
-
-    # n64lle vendors ares and rabbitizer, but its own build initialises them
-    # and Studio does not manage their pins. Recorded as a passing INFO row so
-    # the absence of a "nested libs" line is not read as an oversight.
-    add("nested", "Nested libs inside n64lle", CheckStatus.PASS, Severity.INFO,
-        "n64lle carries no recomp-net / retcomm-rbengine; its own vendored "
-        "submodules (ares, rabbitizer) are the framework build's to initialise.")
+        live = _submodule_framework_rows(root, add)
 
     # --- the framework build ------------------------------------------------
     # Not a style check: a port resolves n64lle as a PRE-BUILT tree, so without
@@ -500,9 +620,12 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
     else:
         add("build_framework", "tools/build_framework.sh", CheckStatus.FAIL,
             Severity.REQUIRED,
-            "Missing. A port includes n64lle/runtime/runtime.cmake and resolves "
-            "the framework from build-n64lle/, so it cannot configure until "
-            "something builds n64lle out of tree.",
+            ("Missing. It is the shim onto the checkout's tools/build_framework.sh "
+             "(N64LLE_ROOT in .n64lle/local.env) that builds the framework tree the "
+             "port configures against." if package else
+             "Missing. A port includes n64lle/runtime/runtime.cmake and resolves "
+             "the framework from build-n64lle/, so it cannot configure until "
+             "something builds n64lle out of tree."),
             "n64_emit_build_framework")
 
     # --- scaffold vs the framework it is pinned to ---------------------------
@@ -554,6 +677,21 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
     if not text:
         add("cmake", "CMakeLists.txt", CheckStatus.FAIL, Severity.REQUIRED,
             "Missing — this is not a buildable port.")
+    elif package:
+        calls = len(_GAME_SHIM_RE.findall(text))
+        if calls == 1:
+            add("cmake", "n64lle_add_game_shim()", CheckStatus.PASS, Severity.REQUIRED,
+                game_target(root))
+        else:
+            add("cmake", "n64lle_add_game_shim()", CheckStatus.WARN, Severity.REQUIRED,
+                f"Called {calls} times. One port, one game package." if calls else
+                "Not called, so this repo builds no game package. No fix op -- take "
+                "CMakeLists.txt from the template (drift row, Force) if it is stale.")
+        if not _RESOLVE_RE.search(text):
+            add("cmake_resolve", "n64lle_runtime_resolve_framework()",
+                CheckStatus.WARN, Severity.REQUIRED,
+                "Not called. n64lle is included as a pre-built tree; without the "
+                "resolve call the emitter and core paths are unset.")
     else:
         tgt = runtime_target(root)
         calls = len(_RUNTIME_TARGET_RE.findall(text))
@@ -590,8 +728,11 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
         add("host_dir", "host/ carries a private copy of the host",
             CheckStatus.WARN, Severity.RECOMMENDED,
             f"{len(srcs)} C file(s) under host/. The scaffolded layout has no "
-            "host/ at all: the launcher, input, audio and run loop live in "
-            "n64lle/runtime/host and reach every port on a submodule bump. "
+            "host/ at all: " + (
+                "the core, runner and hub are the program, and none of them is the "
+                "port's. " if package else
+                "the launcher, input, audio and run loop live in "
+                "n64lle/runtime/host and reach every port on a submodule bump. ") +
             "No fix op — deleting a port's host is a decision with a "
             "measurement behind it, not a mechanical sweep.")
 
@@ -682,7 +823,11 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
 
     # --- pins ---------------------------------------------------------------
     pins = root / PINS_FILE
-    if not pins.is_file():
+    if package:
+        add("pins", "Pins", CheckStatus.PASS, Severity.INFO,
+            "No submodules to pin. n64lle-release.toml pins the fetched binaries; "
+            ".n64lle/local.env names this machine's checkout and is not committed.")
+    elif not pins.is_file():
         add("pins", PINS_FILE, CheckStatus.WARN, Severity.OPTIONAL,
             "Not recorded.", "n64_record_framework_pins")
     else:
@@ -698,7 +843,7 @@ def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditRep
         root=str(root),
         layout=layout,
         project_name=project_name(root),
-        boot_exe=executable_name(root) or None,
+        boot_exe=None if package else (executable_name(root) or None),
         checks=checks,
         notes=notes,
     )
@@ -767,6 +912,11 @@ def build_plan(
         wanted = {o for o in wanted if o in options.only} | set(options.only)
     if options.skip:
         wanted -= set(options.skip)
+    if n64_paths.is_package_port(root):
+        # Never offered, but also never applied by name: a submodule op on a
+        # game-package port would pull it back into the old model.
+        wanted -= {"n64_ensure_framework_submodule", "n64_ensure_recomp_ui_submodule",
+                   "n64_repair_framework_submodule", "n64_record_framework_pins"}
 
     ordered = [op for op in OP_ORDER if op in wanted]
     ordered.extend(sorted(op for op in wanted if op not in ordered))
@@ -884,6 +1034,69 @@ def _op_repair_framework(root: Path, opts: MigrateOptions) -> ApplyResult:
     return ApplyResult(op, True, msg, [FRAMEWORK])
 
 
+# --- attach (game-package ports) --------------------------------------------
+def attach_command(root: Path) -> tuple[list[str], str]:
+    """argv for ``setup_project.sh --attach <port> --yes``, or ``([], why)``.
+
+    Run from the checkout the port already names when that is valid, else the
+    one Studio would scaffold from. The port's previous choices are kept: the
+    core's keyword (or its manual path), and a dev runner / hub path. With no
+    previous core the answer is ``generate`` -- the scaffolder's own default,
+    ``release``, is refused until n64lle publishes one (its README, 2026-09-26).
+    """
+    from .newproject import script_supports, wizard_shell_argv
+
+    pf = n64_paths.port_framework(root)
+    checkout = pf[0] if pf is not None else n64_paths.n64lle_root(root)
+    if checkout is None:
+        return [], n64_paths.MISSING_CHECKOUT
+    script = checkout / "tools" / "new_project" / "setup_project.sh"
+    if not script.is_file() or not script_supports(script, "--attach"):
+        return [], (f"{checkout} has no setup_project.sh --attach (it predates game "
+                    "packages). Update that checkout, or set N64LLE_ROOT to a current one.")
+    local = n64_paths.read_local_env(root)
+    core_from = local.get("N64LLE_CORE_FROM", "")
+    core_lib = local.get("N64LLE_CORE_LIB", "")
+    if core_from == "release":
+        core = "release"
+    elif core_from == "manual" and core_lib and Path(core_lib).is_file():
+        core = core_lib
+    else:
+        core = "generate"
+    cmd = [*wizard_shell_argv(script, framework="n64lle"), "--attach", str(root),
+           "--yes", "--core", core]
+    runner, hub = local.get("RETRO_CORE_RUNNER", ""), local.get("RETRO_HUB", "")
+    r_from, h_from = local.get("RETRO_CORE_RUNNER_FROM", ""), local.get("RETRO_HUB_FROM", "")
+    if r_from == "none" and h_from == "none":
+        cmd.append("--skip-player")
+    else:
+        if r_from == "dev" and runner and Path(runner).is_file():
+            cmd += ["--runner", runner]
+        if h_from in ("dev", "build") and hub and Path(hub).is_file():
+            cmd += ["--hub", hub]
+    return cmd, ""
+
+
+def _op_attach(root: Path, opts: MigrateOptions) -> ApplyResult:
+    op = "n64_attach"
+    cmd, why = attach_command(root)
+    if not cmd:
+        return ApplyResult(op, False, why)
+    if _dry(opts):
+        return ApplyResult(op, True, "[dry-run] " + " ".join(cmd))
+    try:
+        proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return ApplyResult(op, False, f"setup_project.sh did not start: {exc}")
+    if proc.returncode != 0:
+        tail = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()[-6:]
+        return ApplyResult(op, False, "setup_project.sh --attach failed: " + " | ".join(tail))
+    return ApplyResult(op, True, "Attached: .n64lle/local.env rewritten "
+                       f"(core {cmd[cmd.index('--core') + 1]})",
+                       [str(n64_paths.LOCAL_ENV_REL)])
+
+
 # --- untracking ------------------------------------------------------------
 def _untrack(root: Path, opts: MigrateOptions, op: str, specs: tuple[str, ...],
              label: str) -> ApplyResult:
@@ -965,9 +1178,10 @@ def missing_framework_sources(root: Path) -> list[str]:
     the ones the port has no control over. A path that resolves through a
     variable this reader cannot expand is skipped rather than guessed at.
     """
-    fw = root / "n64lle"
-    if not (fw / n64_paths.MARKER).is_file():
-        return []  # no checkout to check against; the submodule check says so.
+    pf = n64_paths.port_framework(root)
+    if pf is None:
+        return []  # no checkout to check against; the framework row says so.
+    fw = pf[0]
     text = _cmake_text(root)
     out: list[str] = []
     for rel in _FRAMEWORK_SRC_RE.findall(text):
@@ -1328,6 +1542,7 @@ def _op_record_pins(root: Path, opts: MigrateOptions) -> ApplyResult:
 
 
 _OPS = {
+    "n64_attach": _op_attach,
     "n64_repair_framework_submodule": _op_repair_framework,
     "n64_ensure_framework_submodule": _op_ensure_framework,
     "n64_ensure_recomp_ui_submodule": _op_ensure_recomp_ui,

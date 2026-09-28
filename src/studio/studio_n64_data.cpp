@@ -12,6 +12,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -94,8 +95,30 @@ std::string n64lle_root_for(const StudioModel& model) {
         if (ok(fs::path(env))) return fs::path(env).string();
     }
     if (!model.selected_root().empty()) {
+        const std::string named = n64_local_env_value(model.selected_root(), "N64LLE_ROOT");
+        if (!named.empty() && ok(fs::path(named))) return fs::path(named).string();
+    }
+    if (!model.selected_root().empty()) {
         const fs::path sib = fs::path(model.selected_root()).parent_path() / "n64lle";
         if (ok(sib)) return sib.string();
+    }
+    return {};
+}
+
+std::string n64_local_env_value(const std::string& port_root, const std::string& key) {
+    if (port_root.empty() || key.empty()) return {};
+    std::ifstream in(fs::path(port_root) / ".n64lle" / "local.env");
+    if (!in) return {};
+    const std::string prefix = key + "='";
+    std::string line;
+    while (std::getline(in, line)) {
+        line = trim(line);
+        if (line.size() < prefix.size() + 1 || line.compare(0, prefix.size(), prefix) != 0 ||
+            line.back() != '\'')
+            continue;
+        const std::string val = line.substr(prefix.size(), line.size() - prefix.size() - 1);
+        if (val.find('\'') != std::string::npos) continue;  // not ^KEY='[^']*'$
+        return val;
     }
     return {};
 }
@@ -150,6 +173,40 @@ N64OracleStatus parse_n64_oracle_status(const std::string& json_text) {
     else if (st.running_pid)    st.summary = "running on port " + std::to_string(st.running_port);
     else                        st.summary = "built and on-pin; not running";
     return st;
+}
+
+N64Components parse_n64_components(const std::string& json_text) {
+    N64Components c;
+    c.probed = true;
+    if (trim(json_text).empty()) {
+        c.error = "build components produced no output";
+        return c;
+    }
+    try {
+        const json j = json::parse(json_text);
+        c.package_port = j.value("package_port", false);
+        auto one = [&](const char* key, N64Component& out) {
+            if (!j.contains(key) || !j[key].is_object()) return;
+            const json& o = j[key];
+            out.label = o.value("label", "");
+            out.checkout = o.value("checkout", "");
+            out.dev = o.value("dev", "");
+            out.dev_built = o.value("dev_built", false);
+            out.def = o.value("default", "");
+            out.def_from = o.value("default_from", "");
+            out.def_exists = o.value("default_exists", false);
+        };
+        one("core", c.core);
+        one("runner", c.runner);
+        one("hub", c.hub);
+        if (j.contains("game") && j["game"].is_object()) {
+            c.package = j["game"].value("package", "");
+            c.package_built = j["game"].value("built", false);
+        }
+    } catch (const std::exception& e) {
+        c.error = std::string("could not parse components: ") + e.what();
+    }
+    return c;
 }
 
 const std::vector<N64Gate>& n64_gates() { return kGates; }

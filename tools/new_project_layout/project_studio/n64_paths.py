@@ -65,6 +65,11 @@ def _candidates(game_root: Path | str | None):
         for cand in (root / "n64lle", root):
             if _is_framework(cand):
                 yield cand
+        # A game-package port has no submodule: its checkout is the one its
+        # .n64lle/local.env names.
+        raw = read_local_env(root).get("N64LLE_ROOT", "")
+        if raw and _is_framework(Path(raw).expanduser()):
+            yield Path(raw).expanduser()
     # …/retcomm-studio/tools/new_project_layout → …/GitHub/n64lle
     base = toolkit_dir()
     for parent in (base.parent.parent, base.parent.parent.parent):
@@ -119,9 +124,11 @@ DRIFT_TOOL_REL = _WIZARD_REL / "port_drift.py"
 def drift_tools(game_root: Path | str):
     """Every ``(script, checkout, is_the_ports_own_pin)``, best first.
 
-    A DIFFERENT precedence from wizard_dir, on purpose. The port's own
-    ``n64lle/`` comes first even over $N64LLE_ROOT: measured against the
-    framework the port pins, the answer is the one the port's own
+    A DIFFERENT precedence from wizard_dir, on purpose. The port's OWN n64lle
+    comes first: its ``n64lle/`` submodule (even over $N64LLE_ROOT), or, on a
+    game-package port, the checkout it builds against (port_framework: the
+    environment, then .n64lle/local.env -- the same one its CMakeLists uses).
+    Measured against that, the answer is the one the port's own
     ``<slug>_template_drift`` ctest gives, and applying it is safe. Any other
     checkout only PREVIEWS what a bump would bring -- its templates can name
     framework files the pinned n64lle does not have (the build shim execs
@@ -135,7 +142,8 @@ def drift_tools(game_root: Path | str):
         root = root.resolve()
     except OSError:
         pass
-    own = root / "n64lle"
+    pf = port_framework(root)
+    own = pf[0] if pf is not None else root / "n64lle"
     seen: set[Path] = set()
     order = ([own] if _is_framework(own) else []) + list(_candidates(root))
     for cand in order:
@@ -167,6 +175,101 @@ def probe_rom_script(game_root: Path | str | None = None) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
+# Which n64lle a port builds against
+# ---------------------------------------------------------------------------
+# Two layouts exist, and a port says which it is by what it carries.
+#
+#   game package (2026-09-26 on) -- NO submodule. The port's gitignored
+#     .n64lle/local.env names this machine's n64lle checkout (N64LLE_ROOT),
+#     its framework build (N64LLE_BUILD, default <checkout>/build-n64lle), and
+#     the core / runner / hub the port runs on. The port's CMakeLists reads it,
+#     with a -D or an environment variable of the same name winning.
+#   submodule (before) -- n64lle/ inside the port, built into
+#     <port>/build-n64lle/.
+#
+# Everything below that used to assume the second asks port_framework() now.
+LOCAL_ENV_REL = Path(".n64lle") / "local.env"
+_LOCAL_LINE_RE = re.compile(r"^([A-Z0-9_]+)='([^']*)'\s*$")
+
+
+def read_local_env(game_root: Path | str) -> dict[str, str]:
+    """``.n64lle/local.env`` as a dict; empty when the port has none.
+
+    Parsed with the port CMakeLists' own rule (``^[A-Z0-9_]+='[^']*'$``) rather
+    than sourced, so a line CMake would ignore is ignored here too.
+    """
+    p = Path(str(game_root)).expanduser() / LOCAL_ENV_REL
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        m = _LOCAL_LINE_RE.match(line.strip())
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def port_setting(game_root: Path | str, var: str) -> tuple[str, str]:
+    """``(value, where)`` for one port setting: environment, then local.env.
+
+    The port's CMakeLists puts a -D cache value first; Studio has no cache to
+    read before configure, so it starts at the environment. ``where`` is
+    ``"environment"``, ``".n64lle/local.env"`` or ``""`` when unset.
+    """
+    env = (os.environ.get(var) or "").strip()
+    if env:
+        return env, "environment"
+    val = read_local_env(game_root).get(var, "")
+    return (val, ".n64lle/local.env") if val else ("", "")
+
+
+def is_package_port(game_root: Path | str) -> bool:
+    """A game-package port: local.env, or the template's game-shim call."""
+    root = Path(str(game_root)).expanduser()
+    if (root / LOCAL_ENV_REL).is_file():
+        return True
+    try:
+        text = (root / "CMakeLists.txt").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "n64lle_add_game_shim(" in text
+
+
+def port_framework(game_root: Path | str) -> tuple[Path, Path] | None:
+    """``(n64lle checkout, its framework build)`` this port builds against.
+
+    None when the port names no checkout that exists -- a fresh clone of a
+    game-package port before ``setup_project.sh --attach``.
+    """
+    root = Path(str(game_root)).expanduser()
+    try:
+        root = root.resolve()
+    except OSError:
+        pass
+    sub = root / "n64lle"
+    if not is_package_port(root) and _is_framework(sub):
+        return sub, root / FRAMEWORK_BUILD_DIR
+    fw_raw, _ = port_setting(root, "N64LLE_ROOT")
+    if not fw_raw:
+        return None
+    fw = Path(fw_raw).expanduser()
+    if not _is_framework(fw):
+        return None
+    build_raw, _ = port_setting(root, "N64LLE_BUILD")
+    build = Path(build_raw).expanduser() if build_raw else fw / FRAMEWORK_BUILD_DIR
+    return fw, build
+
+
+MISSING_PORT_CHECKOUT = (
+    "this port names no n64lle checkout (.n64lle/local.env is missing, or its "
+    "N64LLE_ROOT is not a checkout). From your n64lle checkout run "
+    "`sh tools/new_project/setup_project.sh --attach <port>`, or set N64LLE_ROOT."
+)
+
+
+# ---------------------------------------------------------------------------
 # The out-of-tree framework build every n64lle port needs before it configures
 # ---------------------------------------------------------------------------
 # n64lle is NOT add_subdirectory()'d: a port's CMakeLists includes
@@ -181,6 +284,9 @@ FRAMEWORK_BUILD_SCRIPT = Path("tools") / "build_framework.sh"
 
 
 def framework_build_dir(game_root: Path | str) -> Path:
+    fw = port_framework(game_root)
+    if fw is not None:
+        return fw[1]
     return Path(str(game_root)).expanduser().resolve() / FRAMEWORK_BUILD_DIR
 
 
@@ -211,9 +317,13 @@ def framework_owned_build_script(game_root: Path | str) -> Path | None:
     """The framework's own ``n64lle/tools/build_framework.sh``, or None.
 
     Present only on ports pinned to an n64lle from 2026-09-15 or later. When it
-    is there it is the one to run: it is shared, so a fix lands once.
+    is there it is the one to run: it is shared, so a fix lands once. On a
+    game-package port it is the checkout's, found through port_framework().
     """
-    p = Path(str(game_root)).expanduser().resolve() / FRAMEWORK_OWNED_BUILD_SCRIPT
+    fw = port_framework(game_root)
+    if fw is None:
+        return None
+    p = fw[0] / FRAMEWORK_BUILD_SCRIPT
     return p if p.is_file() else None
 
 
@@ -231,7 +341,12 @@ def port_script_is_shim(game_root: Path | str) -> bool | None:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    return "n64lle/tools/build_framework.sh" in text and "exec" in text
+    # Submodule ports exec n64lle/tools/build_framework.sh; game-package ports
+    # exec "$N64LLE_ROOT/tools/build_framework.sh" (the checkout local.env names).
+    return "exec" in text and (
+        "n64lle/tools/build_framework.sh" in text
+        or "$N64LLE_ROOT/tools/build_framework.sh" in text
+    )
 
 
 # What "built" means is not Studio's to define: n64lle_runtime_resolve_framework()
@@ -245,8 +360,11 @@ _EXE_SUFFIX_RE = re.compile(r"\$\{CMAKE_EXECUTABLE_SUFFIX\}")
 
 
 def framework_runtime_cmake(game_root: Path | str) -> Path | None:
-    """The port's pinned ``n64lle/runtime/runtime.cmake``, or None."""
-    p = Path(str(game_root)).expanduser().resolve() / "n64lle" / MARKER
+    """The ``runtime/runtime.cmake`` of the n64lle this port builds against."""
+    fw = port_framework(game_root)
+    if fw is None:
+        return None
+    p = fw[0] / MARKER
     return p if p.is_file() else None
 
 

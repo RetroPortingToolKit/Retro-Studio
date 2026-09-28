@@ -704,6 +704,13 @@ void apply_pending_picks(StudioModel& model) {
                           "%s", file.c_str());
         } else if (target == "np_bios") {
             std::snprintf(model.np_bios, sizeof(model.np_bios), "%s", file.c_str());
+        } else if (target == "np_n64_core") {
+            std::snprintf(model.np_n64_core_path, sizeof(model.np_n64_core_path), "%s", file.c_str());
+        } else if (target == "np_n64_runner") {
+            std::snprintf(model.np_n64_runner_path, sizeof(model.np_n64_runner_path), "%s",
+                          file.c_str());
+        } else if (target == "np_n64_hub") {
+            std::snprintf(model.np_n64_hub_path, sizeof(model.np_n64_hub_path), "%s", file.c_str());
         } else if (target == "build_scph") {
             std::snprintf(model.gen_scph_path, sizeof(model.gen_scph_path), "%s", file.c_str());
             model.gen_bios_mode = 1;
@@ -1372,6 +1379,66 @@ void draw_git_settings_popup(StudioModel& model, const Theme& th) {
     ImGui::EndPopup();
 }
 
+// Unlisting is the common case and is undoable (Add… brings it back), so it
+// is the default button; deleting the folder is offered beside it rather than
+// behind a checkbox, and spelled out because nothing can undo it.
+void draw_repo_remove_popup(StudioModel& model, const Theme& th) {
+    if (model.repo_remove_open) ImGui::OpenPopup("Remove game repo###repo_remove");
+    if (!ImGui::BeginPopupModal("Remove game repo###repo_remove", &model.repo_remove_open,
+                                ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+
+    ImGui::TextUnformatted("Remove this repo from the Game repo list?");
+    ImGui::Spacing();
+    ImGui::TextColored(th.text, "%s", model.repo_remove_label.c_str());
+    ImGui::TextColored(th.text_muted, "%s", model.repo_remove_path.c_str());
+    ImGui::Spacing();
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 520.f);
+    ImGui::TextColored(th.text_muted,
+                       "Would you also like to delete the folder? Deleting removes it from "
+                       "disk permanently, including uncommitted and unpushed work.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+
+    auto run_remove = [&model](bool delete_folder) {
+        std::vector<std::string> args = {"repos", "remove", "--path", model.repo_remove_path};
+        if (delete_folder) args.push_back("--delete-folder");
+        args.push_back("--json");
+        model.append_log(std::string(delete_folder ? "Removing and deleting repo: "
+                                                   : "Removing repo from list: ") +
+                         model.repo_remove_path);
+        retcomm::studio::run_project_studio_async(
+            model, std::move(args),
+            [&model](RunResult r) {
+                if (!r.ok()) {
+                    model.set_status("Remove repo failed: " + retcomm::studio::tool_error(r));
+                    return;
+                }
+                std::string err;
+                retcomm::studio::load_repos_from_json(model, r.stdout_text, &err);
+            },
+            false);
+        model.repo_remove_open = false;
+        ImGui::CloseCurrentPopup();
+    };
+
+    ImGui::BeginDisabled(model.busy.load());
+    accent_button(th);
+    if (ImGui::Button("Remove from list", ImVec2(160.f, 0))) run_remove(false);
+    accent_button_pop();
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, th.bad);
+    if (ImGui::Button("Remove and delete folder", ImVec2(210.f, 0))) run_remove(true);
+    ImGui::PopStyleColor();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(100.f, 0))) {
+        model.repo_remove_open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 88.f;
 
@@ -1479,15 +1546,12 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
         ImGui::SameLine();
         if (ImGui::Button("Add…")) pick_folder(model, window, "repo_add");
         ImGui::SameLine();
-        if (ImGui::Button("Remove") && model.selected_repo >= 0) {
-            const std::string path = model.selected_root();
-            retcomm::studio::run_project_studio_async(
-                model, {"repos", "remove", "--path", path, "--json"},
-                [&model](RunResult r) {
-                    std::string err;
-                    retcomm::studio::load_repos_from_json(model, r.stdout_text, &err);
-                },
-                false);
+        if (ImGui::Button("Remove") && model.selected_repo >= 0 &&
+            model.selected_repo < static_cast<int>(model.repos.size())) {
+            const auto& e = model.repos[static_cast<size_t>(model.selected_repo)];
+            model.repo_remove_path = e.path;
+            model.repo_remove_label = e.label;
+            model.repo_remove_open = true;
         }
         ImGui::SameLine();
                 if (ImGui::Checkbox("Catalog only", &model.catalog_only)) {
@@ -1519,16 +1583,24 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
     const bool snes = model.is_snes();
     if (model.is_n64()) {
         wrapped(th.text_muted,
-                "Brings an N64 port up to the n64lle scaffold: submodules, untracked "
-                "generated C and ROM bytes, and framework_pins.txt -- and TEMPLATE DRIFT, "
-                "measured by n64lle's own tools/new_project/port_drift.py with this port's "
-                "values, so a template fix reaches a port cut before it.");
+                "Brings an N64 port up to the n64lle scaffold: untracked generated C and "
+                "ROM bytes, the checkout it builds against, and TEMPLATE DRIFT, measured "
+                "by n64lle's own tools/new_project/port_drift.py with this port's values, "
+                "so a template fix reaches a port cut before it.");
         ImGui::Spacing();
         wrapped(th.text_muted,
-                "Drift is measured against the port's own pinned n64lle -- the verdict its "
-                "<slug>_template_drift ctest gives. When that pin predates the tool, a "
-                "newer checkout (N64LLE_ROOT) gives a PREVIEW of what a bump would bring, "
-                "and nothing is applied until the pin is advanced (Git tab).");
+                "A game-package port (no submodules) is audited for its .n64lle/local.env: "
+                "the n64lle checkout, and the core, runner and hub it runs on. Attach "
+                "re-runs that checkout's setup_project.sh --attach, keeping the choices "
+                "already recorded. A submodule port (before 2026-09-26) keeps its "
+                "submodule and pin ops; moving it to a game package is a reviewed "
+                "migration, which Studio does not apply.");
+        ImGui::Spacing();
+        wrapped(th.text_muted,
+                "Drift is measured against the n64lle the port builds against -- the "
+                "verdict its <slug>_template_drift ctest gives. When that predates the "
+                "tool, a newer checkout (N64LLE_ROOT) gives a PREVIEW of what a bump "
+                "would bring, and nothing is applied until the pin is advanced.");
         ImGui::Spacing();
         wrapped(th.text_muted,
                 "Template-owned files (.gitignore, the build shim, the READMEs, LAYOUT.md) "
@@ -1709,8 +1781,9 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     const bool snes = model.is_snes();
     const bool n64 = model.is_n64();
     const bool cart = model.is_cartridge();
-    // First visit: load default module branch lists (ls-remote).
-    if (model.branches_psx.empty() && !model.branches_loading)
+    // First visit: load default module branch lists (ls-remote). N64 has no
+    // module refs to pick, so it asks the network for nothing.
+    if (!n64 && model.branches_psx.empty() && !model.branches_loading)
         refresh_branches(model, false);
     ImGui::BeginChild("##np_scroll", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_None);
@@ -1718,14 +1791,15 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     if (n64) {
         wrapped(th.text_muted,
                 "Drives n64lle's tools/new_project/setup_project.sh: probe the cartridge, "
-                "lay out the repo, wire n64lle + recomp-ui, write game.toml, then "
-                "generate / build / publish. The dump is probed where it lies and linked "
+                "lay out the repo, write game.toml, choose the core, then generate the "
+                "game package and its gates. The dump is probed where it lies and linked "
                 "into roms/, never copied into git.");
         ImGui::Spacing();
         wrapped(th.text_muted,
-                "The new repo carries no host/: the launcher, input, audio and run loop "
-                "come from ONE n64lle_add_runtime_target() call, so host fixes reach it "
-                "on a submodule bump.");
+                "The new repo has no submodules and no host: it builds one game package "
+                "(<slug>_game), which n64lle's generic core runs inside retro-hub through "
+                "retro-core-runner. Which core, runner and hub is chosen below and "
+                "written to the port's gitignored .n64lle/local.env.");
         ImGui::Spacing();
     }
     if (snes) {
@@ -1858,13 +1932,7 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
             left_label("", kLabelW);
             ImGui::TextColored(th.text_muted,
                                "Blank = the name, lowercased. Every target is built from "
-                               "it (<slug>-runtime, <slug>-cosim, <slug>-generate).");
-        }
-        field_row("##np_n64_exe", "Executable", model.np_n64_exe, sizeof(model.np_n64_exe),
-                  kLabelW);
-        if (model.np_n64_exe[0] == '\0') {
-            left_label("", kLabelW);
-            ImGui::TextColored(th.text_muted, "Blank = the target prefix.");
+                               "it (<slug>-game, <slug>-generate, <slug>-app).");
         }
         // The harvest window IS the coverage decision on this console:
         // discovery is execution-derived, so what did not run is not emitted.
@@ -1887,6 +1955,58 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                 "therefore the coverage decision — code outside it is never emitted.\n"
                 "0 takes the scaffolder's defaults (900 frames / 3000M steps).");
         }
+        left_label("", kLabelW);
+        ImGui::Checkbox("Transfer Pak##np_tpak", &model.np_n64_tpak);
+        ImGui::SameLine();
+        ImGui::TextColored(th.text_muted, "reads a Game Boy cartridge (Pokemon Stadium, …)");
+
+        // One row per binary the port runs on. Release is the scaffolder's own
+        // default; Dev is built from a source checkout on this machine (the
+        // core from the n64lle checkout Studio drives, the runner and hub from
+        // Retro-Runtime / Retro-Launcher checkouts found beside it).
+        auto bin_row = [&](const char* id, const char* label, int* sel, char* path,
+                           size_t path_n, const char* pick_target, const char* items,
+                           const char* tip) {
+            left_label(label, kLabelW);
+            ImGui::SetNextItemWidth(260.f);
+            ImGui::Combo(id, sel, items);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) ImGui::SetTooltip("%s", tip);
+            if (*sel == 2) {
+                ImGui::SameLine();
+                char pid[64], bid[64];
+                std::snprintf(pid, sizeof(pid), "%s_path", id);
+                std::snprintf(bid, sizeof(bid), "…%s", id);
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 40.f);
+                ImGui::InputTextWithHint(pid, "path", path, path_n);
+                ImGui::SameLine();
+                if (ImGui::Button(bid)) pick_file(model, window, pick_target, "All files", "*");
+            }
+        };
+        bin_row("##np_n64_core", "Core", &model.np_n64_core, model.np_n64_core_path,
+                sizeof(model.np_n64_core_path), "np_n64_core",
+                "Release — fetch n64lle_core\0Dev — build from the n64lle checkout\0Path…\0",
+                "Release: n64lle_core from n64lle's GitHub release (--core release).\n"
+                "Dev: build it from the n64lle checkout Studio drives (--core generate).\n"
+                "Path: a core library you already have; its .rcore.toml must sit beside it.");
+        ImGui::BeginDisabled(model.np_n64_skip_player);
+        bin_row("##np_n64_runner", "Runner", &model.np_n64_runner, model.np_n64_runner_path,
+                sizeof(model.np_n64_runner_path), "np_n64_runner",
+                "Release — fetch retro-core-runner\0Dev — build from Retro-Runtime\0Path…\0",
+                "Release: fetched from Retro-Runtime's release into .n64lle/player/.\n"
+                "Dev: Studio runs Retro-Runtime's scripts/build-local.sh first, then\n"
+                "passes the result as --runner.");
+        bin_row("##np_n64_hub", "Hub", &model.np_n64_hub, model.np_n64_hub_path,
+                sizeof(model.np_n64_hub_path), "np_n64_hub",
+                "Release — fetch retro-hub\0Dev — build from Retro-Launcher\0Path…\0",
+                "Release: fetched from Retro-Launcher's release into .n64lle/player/.\n"
+                "Dev: the scaffolder builds it from a Retro-Launcher checkout (--hub-src).\n"
+                "The title app needs a hub reporting `title_app 1` — a dev hub does.");
+        ImGui::EndDisabled();
+        left_label("", kLabelW);
+        ImGui::Checkbox("Skip runner + hub##np_n64_skip", &model.np_n64_skip_player);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("--skip-player: configure neither. The build and gates do not\n"
+                              "need them; tools/run_game.sh refuses until they are set.");
     }
     // The SNES wizard prompts for these on a terminal, with the probed ROM
     // identity as each default. Studio runs it with --yes, which takes every
@@ -1947,12 +2067,21 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     }
     checkbox_wrapped("Generate", &model.np_generate);
     // n64lle's --generate IS the whole pipeline (framework build, harvest,
-    // emit, compile, ctest); there is no separate build switch to offer.
+    // emit, the game package, its gates); there is no separate build switch.
     if (!n64) checkbox_wrapped("Build##np", &model.np_build);
+    // The title app follows Generate: an AppImage / .dmg / .exe of the game
+    // with the core, runner and hub chosen above, and no ROM inside.
+    if (n64) {
+        ImGui::BeginDisabled(!model.np_generate || model.np_n64_skip_player);
+        checkbox_wrapped("Title app", &model.np_n64_app);
+        ImGui::EndDisabled();
+    }
     checkbox_wrapped("GitHub", &model.np_github);
     end_wrapped_line();
 
-    {
+    // A game-package port pins no module at all, so there is no ref to pick:
+    // it is generated against the n64lle checkout the scaffolder runs from.
+    if (!n64) {
         ImGui::BeginDisabled(model.branches_loading || model.busy.load());
         if (ImGui::Button(model.branches_loading ? "Loading branches…" : "Refresh branches##np"))
             refresh_branches(model, false);
@@ -1965,21 +2094,10 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     // returns it under a stable "framework" key precisely so this widget does
     // not have to know which.
     if (n64) {
-        // n64lle's setup_project.sh grew --n64lle-ref / --recomp-ui-ref on
-        // 2026-09-12. Leaving this blank is not "main": it keeps the
-        // scaffolder's own behaviour, which is branch main pinned at the HEAD
-        // of the checkout it was run from — "the SHA this scaffold was cut
-        // against". A wizard older than the flag is not silently ignored: the
-        // CLI checks the script's own case arms and says so in the log.
-        branch_combo("##np_n64", "n64lle ref", model.np_n64_ref, sizeof(model.np_n64_ref),
-                     kLabelW, model.branches_psx, kBranchW);
-        branch_combo("##np_ui_n64", "recomp-ui ref", model.np_ui_ref, sizeof(model.np_ui_ref),
-                     kLabelW, model.branches_ui, kBranchW);
         wrapped(th.text_muted,
-                "Leave n64lle ref empty to keep the scaffolder's own pin: branch main at "
-                "the HEAD of the n64lle checkout Studio drives. A branch is recorded in "
-                ".gitmodules and tracked; a tag or SHA is pinned detached, with no "
-                "branch= line for `submodule update --remote` to move it off.");
+                "No module refs: the port has no submodules. It is generated against the "
+                "n64lle checkout the scaffolder runs from ($N64LLE_ROOT, else the one beside "
+                "retcomm-studio), and records it in .n64lle/local.env.");
     } else if (snes) {
         branch_combo("##np_snes", "snesrecomp ref", model.np_snes_ref,
                      sizeof(model.np_snes_ref), kLabelW, model.branches_psx, kBranchW);
@@ -2033,7 +2151,6 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                         if (model.is_n64()) {
                             set(model.np_gh_repo, sizeof(model.np_gh_repo), "project");
                             set(model.np_n64_slug, sizeof(model.np_n64_slug), "slug");
-                            set(model.np_n64_exe, sizeof(model.np_n64_exe), "exe");
                             model.np_probe_note =
                                 j.value("cartid", "?") + ", region " +
                                 j.value("region_label", "?") + ", " + j.value("cic", "?") +
@@ -2133,7 +2250,7 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                 "--rom", model.np_disc,
                 "--players", std::to_string(model.np_players),
             };
-            // The three names. Sent only when typed: blank means "let the
+            // The two names. Sent only when typed: blank means "let the
             // scaffolder derive it", and echoing its own rule back would be a
             // second copy of that rule to drift.
             if (model.np_gh_repo[0]) {
@@ -2143,10 +2260,6 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
             if (model.np_n64_slug[0]) {
                 args.push_back("--n64-slug");
                 args.push_back(model.np_n64_slug);
-            }
-            if (model.np_n64_exe[0]) {
-                args.push_back("--n64-exe");
-                args.push_back(model.np_n64_exe);
             }
             if (model.np_n64_frames > 0) {
                 args.push_back("--frames");
@@ -2160,28 +2273,46 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                 args.push_back("--github-owner");
                 args.push_back(model.np_gh_owner);
             }
-            // The submodule revisions. Blank n64lle ref = the scaffolder's own
-            // pin, so it is sent only when the user picked something.
-            if (model.np_n64_ref[0]) {
-                args.push_back("--n64lle-ref");
-                args.push_back(model.np_n64_ref);
+            // The three binaries: a keyword, or the path typed beside "Path…".
+            auto bin = [&](const char* flag, int sel, const char* dev_kw, const char* path) {
+                args.push_back(flag);
+                args.push_back(sel == 1 ? dev_kw : sel == 2 ? path : "release");
+            };
+            bin("--n64-core", model.np_n64_core, "generate", model.np_n64_core_path);
+            if (model.np_n64_skip_player) {
+                args.push_back("--n64-skip-player");
+            } else {
+                bin("--n64-runner", model.np_n64_runner, "dev", model.np_n64_runner_path);
+                bin("--n64-hub", model.np_n64_hub, "dev", model.np_n64_hub_path);
             }
-            if (model.np_ui_ref[0]) {
-                args.push_back("--recomp-ui-ref");
-                args.push_back(model.np_ui_ref);
-            }
+            if (model.np_n64_tpak) args.push_back("--n64-transfer-pak");
+            if (!model.np_n64_app) args.push_back("--n64-no-app");
             // "Copy ROM" — the scaffolder symlinks by default.
             if (model.np_stage) args.push_back("--stage-disc");
             // --generate on this scaffolder is the whole pipeline: framework
-            // build, harvest, emit, compile and ctest. There is no separate
-            // build step, so either switch asking for work maps onto it.
-            if (model.np_generate || model.np_build) args.push_back("--generate");
+            // build, harvest, emit, the game package and its gates. Only the
+            // Generate box asks for it -- Build is not shown on N64, so its
+            // (default-on) state must not start a harvest nobody ticked.
+            if (model.np_generate) args.push_back("--generate");
             if (model.np_github) args.push_back("--create-github");
-            model.append_log("--- New N64 project setup ---");
-            retcomm::studio::run_project_studio_async(model, args, [&model](RunResult r) {
-                model.set_status(r.ok() ? "New project created" : "New project failed");
-                refresh_repos(model);
-            });
+            // "Path…" with nothing typed would reach the CLI as a blank, which
+            // it reads as the default -- a release the user did not choose.
+            const char* blank = nullptr;
+            if (model.np_n64_core == 2 && !model.np_n64_core_path[0]) blank = "Core";
+            if (!model.np_n64_skip_player) {
+                if (model.np_n64_runner == 2 && !model.np_n64_runner_path[0]) blank = "Runner";
+                if (model.np_n64_hub == 2 && !model.np_n64_hub_path[0]) blank = "Hub";
+            }
+            if (blank) {
+                model.append_log(std::string("[FAIL] ") + blank +
+                                 " is set to Path… but no path is given");
+            } else {
+                model.append_log("--- New N64 project setup ---");
+                retcomm::studio::run_project_studio_async(model, args, [&model](RunResult r) {
+                    model.set_status(r.ok() ? "New project created" : "New project failed");
+                    refresh_repos(model);
+                });
+            }
         } else if (snes) {
             std::vector<std::string> args = {
                 "new-project",
@@ -2954,6 +3085,113 @@ void draw_bulk(StudioModel& model, const Theme& th) {
     ImGui::EndDisabled();
 }
 
+// ---- N64: the core, runner and hub a game package runs on -----------------
+// Read, never decided, here: `build components --json` owns where each
+// checkout is, where its local build lands, and what the port defaults to.
+
+void refresh_n64_components(StudioModel& model, const std::string& root) {
+    if (model.n64_components_probing || root.empty()) return;
+    model.n64_components_probing = true;
+    const std::string key = root + "|" + model.build_dir;
+    retcomm::studio::run_project_studio_async(
+        model, {"build", "components", "--root", root, "--build-dir", model.build_dir},
+        [&model, key](RunResult r) {
+            model.n64_components_probing = false;
+            model.n64_components = retcomm::studio::parse_n64_components(r.stdout_text);
+            model.n64_components.root = key;
+            if (!r.ok() && model.n64_components.error.empty())
+                model.n64_components.error = retcomm::studio::tool_error(r);
+        },
+        /*log_stdout=*/false, /*allow_when_busy=*/true);
+}
+
+void draw_n64_components(StudioModel& model, const Theme& th, const std::string& root) {
+    const std::string key = root + "|" + model.build_dir;
+    auto& c = model.n64_components;
+    if ((!c.probed || c.root != key) && !model.n64_components_probing)
+        refresh_n64_components(model, root);
+
+    ImGui::SeparatorText("Runs on");
+    if (c.probed && !c.package_port) {
+        wrapped(th.warn,
+                "This port predates game packages (it pins n64lle as a submodule and "
+                "builds its own executable). Core / runner / hub do not apply until it "
+                "is migrated; Launch runs its executable, or the Exe you name.");
+    }
+    if (ImGui::BeginTable("##n64comp", 4,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                              ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70.f);
+        ImGui::TableSetupColumn("Launch with", ImGuiTableColumnFlags_WidthFixed, 150.f);
+        ImGui::TableSetupColumn("Default (the port's .n64lle/local.env)");
+        ImGui::TableSetupColumn("Dev build");
+        ImGui::TableHeadersRow();
+        auto row = [&](const char* name, const retcomm::studio::N64Component& comp, int* sel) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(name);
+            ImGui::TableNextColumn();
+            // Dev is offered only once it exists: picking a build that is not
+            // there would fail at launch, several clicks from the cause.
+            if (!comp.dev_built && *sel == 1) *sel = 0;
+            ImGui::PushID(name);
+            ImGui::SetNextItemWidth(-1);
+            const char* cur = *sel == 1 ? "Dev" : "Default";
+            if (ImGui::BeginCombo("##launch", cur)) {
+                if (ImGui::Selectable("Default", *sel == 0)) *sel = 0;
+                ImGui::BeginDisabled(!comp.dev_built);
+                if (ImGui::Selectable("Dev", *sel == 1)) *sel = 1;
+                ImGui::EndDisabled();
+                ImGui::EndCombo();
+            }
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            if (comp.def.empty()) {
+                ImGui::TextColored(th.text_muted, "none configured");
+            } else {
+                ImGui::TextColored(comp.def_exists ? th.text : th.bad, "%s",
+                                   comp.def_from.empty() ? "set" : comp.def_from.c_str());
+                ImGui::SameLine();
+                ImGui::TextColored(th.text_muted, "%s%s", comp.def.c_str(),
+                                   comp.def_exists ? "" : "  (missing)");
+            }
+            ImGui::TableNextColumn();
+            if (comp.checkout.empty()) {
+                ImGui::TextColored(th.text_muted, "no checkout found");
+            } else if (comp.dev_built) {
+                ImGui::TextColored(th.good, "built");
+                ImGui::SameLine();
+                ImGui::TextColored(th.text_muted, "%s", comp.checkout.c_str());
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", comp.dev.c_str());
+            } else {
+                ImGui::TextColored(th.text_muted, "not built — %s", comp.checkout.c_str());
+            }
+        };
+        row("Core", c.core, &model.build_n64_launch_core);
+        row("Runner", c.runner, &model.build_n64_launch_runner);
+        row("Hub", c.hub, &model.build_n64_launch_hub);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted("Game");
+        ImGui::TableNextColumn();
+        ImGui::TableNextColumn();
+        if (c.package_built)
+            ImGui::TextColored(th.good, "%s", c.package.c_str());
+        else
+            ImGui::TextColored(th.text_muted, "package not built — Build game");
+        ImGui::TableNextColumn();
+        ImGui::EndTable();
+    }
+    if (!c.error.empty()) ImGui::TextColored(th.bad, "%s", c.error.c_str());
+    ImGui::BeginDisabled(model.n64_components_probing);
+    if (ImGui::SmallButton("Refresh##n64comp")) refresh_n64_components(model, root);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextColored(th.text_muted,
+                       "Default is what the port was scaffolded with (a fetched release "
+                       "unless told otherwise). Dev is Build core / runner / hub's output.");
+}
+
 void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 100.f;
     const bool snes = model.is_snes();
@@ -2979,7 +3217,7 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
         left_label("", kLabelW);
         ImGui::TextColored(
             th.text_muted,
-            n64 ? "Blank = the n64lle_add_runtime_target() name in this repo."
+            n64 ? "Blank = all: the game package and its gates' drivers."
                 : "Blank = the CMake project() name in this repo.");
     }
     generator_combo("##bgen", model.build_generator, sizeof(model.build_generator), kLabelW, root,
@@ -3080,8 +3318,18 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     }
 
     field_row("##bexe", "Exe", model.build_exe, sizeof(model.build_exe), kLabelW);
+    if (n64 && model.build_exe[0] == '\0') {
+        left_label("", kLabelW);
+        ImGui::TextColored(th.text_muted,
+                           "Blank = the port's tools/run_game.sh (retro-hub). An Exe runs "
+                           "that binary instead, e.g. an opt-in SDL runtime harness.");
+    }
     field_row("##bargs", "Launch args", model.build_launch_args, sizeof(model.build_launch_args),
               kLabelW);
+    if (n64) {
+        left_label("", kLabelW);
+        ImGui::TextColored(th.text_muted, "Passed to retro-hub, e.g. --boot to skip its home page.");
+    }
     if (n64) {
         left_label("Graphics", kLabelW);
         ImGui::Checkbox("Disable HLE graphics (force LLE)##blle",
@@ -3108,6 +3356,7 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     left_label("Env", kLabelW);
     ImGui::InputTextMultiline("##benv", model.build_env, sizeof(model.build_env),
                               ImVec2(ImGui::GetContentRegionAvail().x, 100.f));
+    if (n64) draw_n64_components(model, th, root);
 
     auto base = [&](const char* sub) {
         std::vector<std::string> args = {"build", sub, "--root", root, "--build-dir",
@@ -3249,25 +3498,68 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
                 model, {"build", "check-paths", "--root", root, "--fix"}, nullptr);
         }
     } else if (n64) {
-        // Two buttons, and the ORDER is the point: n64lle is not
-        // add_subdirectory()'d, so a port cannot even configure until the
-        // framework has been built out of tree into build-n64lle/. Everything
-        // on this row after that runs inside the port's own CMake graph.
+        // The four things a game-package port is played with, each built by
+        // its OWN script (never a Studio reimplementation of it):
+        //   core    n64lle tools/build_core.sh           (the checkout the port
+        //                                                  builds against)
+        //   runner  Retro-Runtime scripts/build-local.sh
+        //   hub     Retro-Launcher scripts/build-local.sh
+        //   game    the framework tools (incremental), configure, cmake --build
+        // There is no Build framework button: the framework tree is a
+        // prerequisite of the game, so Build game builds it first.
         //
         // What is deliberately absent, and why:
         //   * Ensure BIOS       — a cartridge boots from its own reset vector.
-        //                         There is no BIOS image, and the CLI refuses
-        //                         the subcommand on a cartridge.
-        //   * Generate emitters — psxrecomp builds psxrecomp-game and
-        //                         psxrecomp-bios as separate binaries to run.
-        //                         n64lle has one emitter, n64emit, and it is
-        //                         produced by the framework build below; there
-        //                         is no second one to keep in step.
-        if (build_btn("Build framework")) {
-            std::vector<std::string> args = {"build", "framework", "--root", root,
-                                             "--build-type", model.build_type};
-            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+        //   * Generate emitters — n64lle has one emitter, n64emit, built with
+        //                         the framework tools Build game brings up.
+        const bool debug = std::strcmp(model.build_type, "Debug") == 0;
+        auto component_btn = [&](const char* label, const char* which, const char* tip) {
+            if (build_btn(label)) {
+                std::vector<std::string> args = {"build", "component", "--which", which,
+                                                 "--root", root};
+                if (debug) args.push_back("--debug");
+                retcomm::studio::run_project_studio_async(
+                    model, std::move(args),
+                    [&model, root](RunResult) { refresh_n64_components(model, root); });
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+        };
+        component_btn("Build core", "core",
+                      "n64lle's tools/build_core.sh in the checkout this port builds\n"
+                      "against: the generic core n64lle_core + its .rcore.toml, into\n"
+                      "<checkout>/out/local/<platform>/. Launch can then use it (Dev).");
+        component_btn("Build runner", "runner",
+                      "Retro-Runtime's scripts/build-local.sh: retro-core-runner into\n"
+                      "<checkout>/out/local/<platform>/ ($RETRO_RUNTIME_ROOT, else the\n"
+                      "checkout beside n64lle).");
+        component_btn("Build hub", "hub",
+                      "Retro-Launcher's scripts/build-local.sh: a flat hub prefix with\n"
+                      "retro-hub (title_app 1) into <checkout>/out/local/<platform>/\n"
+                      "($RETRO_LAUNCHER_ROOT, else the checkout beside n64lle).");
+        if (build_btn("Build game")) {
+            std::vector<std::string> args = {"build", "game", "--root", root, "--build-dir",
+                                             model.build_dir, "--build-type", model.build_type};
+            if (model.build_generator[0]) {
+                args.push_back("--generator");
+                args.push_back(model.build_generator);
+            }
+            if (model.build_extra[0]) args.push_back(std::string("--extra=") + model.build_extra);
+            if (model.build_target[0]) {
+                args.push_back("--target");
+                args.push_back(model.build_target);
+            }
+            if (model.build_jobs[0]) {
+                args.push_back("--jobs");
+                args.push_back(model.build_jobs);
+            }
+            retcomm::studio::run_project_studio_async(
+                model, std::move(args),
+                [&model, root](RunResult) { refresh_n64_components(model, root); });
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The n64lle framework tools this port builds against (incremental),\n"
+                              "then configure, then cmake --build: the game package\n"
+                              "<slug>_game and its gates. Harvest + emit run inside it.");
         if (build_btn("Generate C from ROM")) {
             // n64lle harvests the real boot for a window of frames and then
             // emits; both are custom commands behind the port's own
@@ -3301,10 +3593,11 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
                 model, {"build", "ensure-bios", "--root", root}, nullptr);
         }
     }
-    if (build_btn("Build")) {
+    // On N64 Build game is both of these, with the framework step they skip.
+    if (!n64 && build_btn("Build")) {
         retcomm::studio::run_project_studio_async(model, base("compile"), nullptr);
     }
-    if (build_btn("Configure + Build")) {
+    if (!n64 && build_btn("Configure + Build")) {
         retcomm::studio::run_project_studio_async(
             model, base("configure"), [&model, root](RunResult r) {
                 if (!r.ok()) return;
@@ -3370,6 +3663,18 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             // such ambiguity.
             args.push_back("--args=" + extra);
         }
+        // Which core / runner / hub: the port's default, or the dev build.
+        // Only meaningful to the run_game.sh path (no Exe).
+        if (n64 && !model.build_exe[0]) {
+            const std::pair<const char*, int> picks[] = {
+                {"--core", model.build_n64_launch_core},
+                {"--runner", model.build_n64_launch_runner},
+                {"--hub", model.build_n64_launch_hub}};
+            for (const auto& [flag, sel] : picks) {
+                args.push_back(flag);
+                args.push_back(sel == 1 ? "dev" : "default");
+            }
+        }
         // A cartridge runner takes the ROM as a positional; without it the game
         // prints its usage and exits 1. This is the same path Migrate recorded
         // and Regenerate already uses, so a launch cannot run a different ROM
@@ -3380,7 +3685,19 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
         }
         retcomm::studio::run_project_studio_async(model, args, nullptr);
     }
-    if (build_btn("Bundle + Export##local_pkg")) {
+    // A game-package port's deliverable is the title app (the port's own
+    // tools/build_app.sh), not a zip of the build tree: the tree holds a
+    // package no one can run without the core, runner and hub beside it.
+    if (n64 && build_btn("Build app")) {
+        retcomm::studio::run_project_studio_async(
+            model, {"build", "app", "--root", root, "--build-dir", model.build_dir}, nullptr);
+    }
+    if (n64 && ImGui::IsItemHovered())
+        ImGui::SetTooltip("The port's tools/build_app.sh: an AppImage / .dmg / portable .exe\n"
+                          "holding the hub, runner, core and game package the build tree\n"
+                          "resolved (the Default column) — and no ROM. ROM-derived, so a\n"
+                          "local build, never published.");
+    if (!n64 && build_btn("Bundle + Export##local_pkg")) {
         std::vector<std::string> args = {"build", "package", "--root", root, "--build-dir",
                                          model.build_dir};
         if (model.build_exe[0]) {
@@ -3433,25 +3750,18 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
                 "scripts/package_release.sh, i.e. the setup pack a release ships.");
     } else if (n64) {
         wrapped(th.text_muted,
-                "Build framework runs n64lle/tools/build_framework.sh — the framework's "
-                "OWN script, shared by every port — never a Studio reimplementation of "
-                "it. On a port pinned to an n64lle from before that script existed it "
-                "falls back to the port's tools/build_framework.sh, which is otherwise "
-                "just a shim onto the shared one. Configure cannot succeed until it has "
-                "run: a port resolves already-built libraries and tools out of "
-                "build-n64lle/ rather than add_subdirectory()ing the framework.");
+                "A game-package port builds one thing, <slug>_game, and plays it on three "
+                "that are not its own: n64lle's generic core, Retro-Runtime's "
+                "retro-core-runner and Retro-Launcher's retro-hub. Build core / runner / hub "
+                "run each checkout's own local-build script; Build game brings up the n64lle "
+                "framework tools the port builds against (incrementally, with that "
+                "checkout's own tools/build_framework.sh), then configures and builds.");
         ImGui::Spacing();
         wrapped(th.text_muted,
-                "It used to run the port's own copy, on the reasoning that the copy "
-                "carries the flags the pinned n64lle revision needs. That holds for what "
-                "a port ADDS and fails for what the framework later REQUIRES: a private "
-                "copy cannot inherit a fix. -DN64LLE_RSP_CENSUS=1 reached one port's copy "
-                "and no other, so seven of nine N64 ports harvested no RSP microcode and "
-                "ran the RSP fully interpreted while every build reported success.");
-        ImGui::Spacing();
-        wrapped(th.text_muted,
-                "Bundle + Export zips the build dir as it stands (exe + assets, no ROM) "
-                "into dist/ and opens a save dialog. Build first — it does not rebuild.");
+                "Launch runs the port's tools/run_game.sh on what is built. Each of core, "
+                "runner and hub is either the port's Default (.n64lle/local.env — normally a "
+                "fetched release) or the Dev build from the button above; the choice lasts "
+                "for that launch and re-points nothing. Build app bundles the Defaults.");
     } else {
         ImGui::TextColored(th.text_muted,
                            "Bundle + Export zips the build dir as it stands (exe + assets + "
@@ -4034,6 +4344,7 @@ int main(int argc, char** argv) {
         draw_header(model, th, window);
         // Modal, so it belongs to the frame rather than to whichever tab is up.
         draw_git_settings_popup(model, th);
+        draw_repo_remove_popup(model, th);
         ImGui::Separator();
 
         const float spacing = ImGui::GetStyle().ItemSpacing.y;

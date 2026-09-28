@@ -47,6 +47,12 @@ tab has three panes:
 | Gates | `tools/n64_analysis/n64_gates.py` — n64lle's own command / pixel / frame / scanout differentials through ctest |
 | Rings | the always-on rings, over the same JSON protocol, on the runtime's port or the oracle's |
 
+The oracle is built from the n64lle the selected port builds against: its
+`n64lle/` submodule on a submodule port, else `$N64LLE_ROOT`, else the
+`N64LLE_ROOT` in a game-package port's `.n64lle/local.env`, else a sibling
+checkout. It boots the port's own staged dump (`<port>/roms/`) unless a path is
+typed.
+
 A third kind of oracle, and the manifest says which: PSX patches DuckStation to
 speak our protocol, SNES takes Mesen2 unpatched and reads what its Lua wrote,
 and N64 **builds** a first-party binary from a submodule pinned by
@@ -68,11 +74,13 @@ rather than at each of the ~90 call sites.
 
 ## Nintendo 64
 
-**New Project** drives n64lle's `tools/new_project/setup_project.sh`: probe the
-cartridge, lay out the repo, wire the `n64lle` + `recomp-ui` submodules, write
-`game.toml`, then generate / build / run the gates. Studio prefers a live
-n64lle checkout (`$N64LLE_ROOT`, the selected project's own submodule, or a
-sibling checkout) and ships no copy of its own — with no checkout, New Project
+**New Project** drives n64lle's `tools/new_project/setup_project.sh` (the
+game-package scaffold, 2026-09-26 on): probe the cartridge, lay out the repo,
+write `game.toml`, choose the core, then generate the game package and run its
+gates. The port has **no submodules** and no host: it builds one
+`<slug>_game` package, which n64lle's generic core runs inside `retro-hub`
+through `retro-core-runner`. Studio prefers a live
+n64lle checkout (`$N64LLE_ROOT`, or a sibling checkout) and ships no copy of its own — with no checkout, New Project
 refuses and says so, because a vendored copy cannot inherit n64lle's fixes (one
 kept scaffolding `hle_tier = false` after n64lle made HLE the default). The
 dump is probed where it lies and
@@ -80,12 +88,20 @@ dump is probed where it lies and
 media, and is off by default because the framework says a link "makes it
 impossible to do by accident" to commit ROM bytes.
 
-An n64lle port needs **three names**, which is why the page asks for three: the
-CMake project (`GloverRecomp`), the target prefix every target is built from
-(`glover-runtime`, `glover-cosim`, `glover-generate`) and the executable
-(`glover`). None of them can be derived from either of the others. Blank means
-"let the scaffolder derive it", and **Probe ROM** fills all three with the same
-values `--yes` would have taken.
+An n64lle port needs **two names**: the CMake project (`GloverRecomp`) and the
+target prefix every target is built from (`glover-game`, `glover-generate`,
+`glover-app`). Blank means "let the scaffolder derive it", and **Probe ROM**
+fills both with the same values `--yes` would have taken.
+
+Then one answer per binary the port runs on, written to its gitignored
+`.n64lle/local.env`: **Core** — Release (fetch `n64lle_core`, the default), Dev
+(`--core generate`: build it from the n64lle checkout) or a path; **Runner** and
+**Hub** — Release (fetched into `.n64lle/player/`), Dev (the runner is built
+first with Retro-Runtime's `scripts/build-local.sh`; the hub is built by the
+scaffolder from a Retro-Launcher checkout, `--hub-src`) or a path; or **Skip
+runner + hub**. **Title app** (on by default with Generate) builds the
+AppImage / `.dmg` / `.exe` into `build-release/`, and needs a hub that reports
+`title_app 1` — a dev hub does.
 
 The page also carries the **harvest window** (frames / step cap), because on
 this console that *is* the coverage decision: discovery is execution-derived —
@@ -95,22 +111,53 @@ a cartridge is **CIC-6105**, which walks into n64lle's KI-1 and renders black
 forever on today's framework; knowing that before scaffolding is the difference
 between a known issue and a lost day.
 
-There is deliberately **no n64lle ref** to choose: `setup_project.sh` pins the
-new project at the HEAD of the checkout it was run from — "the SHA this scaffold
-was cut against" — and has no flag to override it.
+There is deliberately **no module ref** to choose: the port pins no submodule.
+It is generated against the n64lle checkout the scaffolder runs from, which
+`.n64lle/local.env` records.
 
-**Build** knows two things this console needs that the others do not. n64lle is
-resolved as a **pre-built tree** rather than `add_subdirectory()`'d, so
-Configure first checks that `build-n64lle/` actually holds an `n64emit` and, if
-not, names `tools/build_framework.sh` instead of letting cmake die inside
-`n64lle_runtime_resolve_framework()`. And **Generate** is `cmake --build
---target <slug>-generate` — the harvest and emit live in the port's own CMake
-graph, not in a script or a framework CLI.
+**Build** has four build buttons on a game-package port, each running that
+component's **own** script: **Build core** (n64lle `tools/build_core.sh`, in the
+checkout the port builds against), **Build runner** (Retro-Runtime
+`scripts/build-local.sh`), **Build hub** (Retro-Launcher
+`scripts/build-local.sh`; checkouts are `$RETRO_RUNTIME_ROOT` /
+`$RETRO_LAUNCHER_ROOT`, else found beside n64lle, the one on `main` first) and
+**Build game**. There is no Build framework button: n64lle is resolved as a
+**pre-built tree**, so Build game brings up the framework tools first
+(incrementally), then configures and builds the package and its gates.
+**Generate** is `cmake --build --target <slug>-generate` — the harvest and emit
+live in the port's own CMake graph.
 
-**Migrate** audits an N64 port against that scaffold — submodules, untracked
-generated C *and* ROM bytes, the contract's `[MEASURED]` identity rows, the
-single `n64lle_add_runtime_target()` call and `framework_pins.txt` — and, for
-everything the scaffold templates own, defers to n64lle itself.
+The **Runs on** table shows, for core, runner and hub, the port's default (from
+`.n64lle/local.env`, normally a fetched release, with its provenance) and
+whether a dev build exists. **Launch** runs the port's `tools/run_game.sh` on
+what is built, with each of the three either **Default** or **Dev**: the runner
+and hub through `RETRO_CORE_RUNNER` / `RETRO_HUB`, the core as a trailing
+`--run-core` (retro-hub takes the last one). The choice lasts for that launch;
+nothing is reconfigured.
+
+**Migrate** audits an N64 port against that scaffold — untracked generated C
+*and* ROM bytes, the contract's `[MEASURED]` identity rows, the build graph —
+and, for everything the scaffold templates own, defers to n64lle itself. Which
+checks run depends on the port's model:
+
+* **Game package** (no submodules): `.n64lle/local.env` names an n64lle
+  checkout that exists, its framework tree is built, the core / runner / hub it
+  names are on disk, and the CMakeLists makes one `n64lle_add_game_shim()`
+  call. A missing or stale `local.env` is fixed by **Attach**, which re-runs that
+  checkout's `setup_project.sh --attach <port> --yes` and keeps the choices it
+  finds (the core keyword or path, a dev runner or hub); with no previous core
+  it asks for `generate`. Leftover `n64lle` / `recomp-ui` submodules are
+  reported, not removed. No submodule or pin op is ever offered — even by
+  name — because it would pull the port back into the old model.
+* **Submodule** (before 2026-09-26): the `n64lle/` and `recomp-ui/` checkouts,
+  one `n64lle_add_runtime_target()` call and `framework_pins.txt`, as before.
+  n64lle still supports these; moving one to a game package is, in n64lle's
+  words, "a migration to review, not an `--apply`", so the audit says so and
+  offers no op for it.
+
+Repo recognition follows the same split: a game-package port is recognised as
+N64 by its `local.env` or its `n64lle_add_game_shim()` call, and is kept out of
+the PSX list although it carries a `game.toml`.
 
 **Template drift is n64lle's measurement, not Studio's.** The scaffold is
 rendered once and nothing brought a port forward afterwards; on 2026-09-23 ten
@@ -128,10 +175,11 @@ port's own values and reports by class:
 | contract | `game.toml` sections and keys | per missing key, with the text to paste | **none** |
 | port | `CLAUDE.md`, `README.md`, `docs/STATUS.md`, `VERSION` | not compared | none |
 
-Which n64lle answers matters, and the row says which did. The port's **own
-pinned submodule** comes first — even ahead of `N64LLE_ROOT` — because that is
-the verdict the port's `<slug>_template_drift` ctest gives and the only one it
-is safe to apply. When the pin predates the tool (or its copy is too old to
+Which n64lle answers matters, and the row says which did. The port's **own**
+n64lle comes first — its pinned submodule (even ahead of `N64LLE_ROOT`), or on a
+game-package port the checkout it builds against — because that is the verdict
+the port's `<slug>_template_drift` ctest gives and the only one it is safe to
+apply. When the pin predates the tool (or its copy is too old to
 speak `--json`), a newer checkout answers as a **preview** of what a bump would
 bring: every row is shown, no row has a fix op, and the ops refuse. A newer
 template can name framework files an older pin lacks — the build shim execs
@@ -159,12 +207,11 @@ run loop come from one `n64lle_add_runtime_target()` call and reach every port
 on a submodule bump. Deleting a port's host is a decision with a measurement
 behind it, not a mechanical sweep.
 
-**Packaging** is a local zip only — n64lle ships no release workflow and no
-packager template, so `git release-setup` refuses rather than writing a
-psxrecomp workflow into an N64 port. The zip carries the executable, the staged
-launcher assets, `game.toml` and `VERSION`; never ROM bytes, never `generated/`
-(whose distribution posture n64lle has explicitly not settled), never the
-user's `settings.toml` or `input.cfg`.
+**Packaging** is the port's **title app** (Build app → `tools/build_app.sh`):
+a local AppImage / `.dmg` / portable `.exe` holding the hub, runner, core and
+package the build tree resolved — and no ROM. It is ROM-derived, so it is a
+local build, never published. `git release-setup` still refuses: n64lle ships
+no release workflow.
 
 ## Super Nintendo
 
@@ -299,6 +346,13 @@ these dumps get through today?". It is a test harness, not a way to make ports.
 | PlayStation | probe (`lookup-disc-meta`) → scaffold → generate → configure → compile |
 | Super Nintendo | probe (`probe-rom`) → scaffold → generate → configure → compile |
 | Nintendo 64 | probe (`probe-rom`) → scaffold → framework → generate → compile |
+
+On N64 each image is scaffolded as a game package on a **generated** core
+(`--n64-core generate`: n64lle publishes no release core yet), with no runner,
+hub or title app: the batch builds and runs gates, and nothing it runs needs
+them. Every port then builds against the same n64lle checkout's framework tree,
+so the stages that build that tree (scaffold, framework) run one item at a
+time even with `--parallel`.
 
 Each stage is the same CLI subcommand the New Project and Build tabs run for
 one project, so a batch tests what the buttons do. The orchestration lives in

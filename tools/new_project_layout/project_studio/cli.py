@@ -298,13 +298,51 @@ def cmd_repos_add(args: argparse.Namespace) -> int:
     return _print_index_json(idx)
 
 
+def _delete_repo_folder(root: Path) -> str:
+    """rmtree an indexed repo; returns an error message, or "" on success."""
+    import shutil
+    import stat
+
+    if root.is_symlink() or not root.is_dir():
+        return f"not a directory: {root}"
+    # A mis-resolved path must never take a home or drive root with it.
+    if root == root.parent or root == Path.home().resolve():
+        return f"refusing to delete {root}"
+
+    def _retry_writable(func, path, _exc):
+        # git marks pack/object files read-only; Windows rmtree trips on them.
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(root, onexc=_retry_writable)
+        else:
+            shutil.rmtree(root, onerror=_retry_writable)
+    except OSError as e:
+        return f"could not delete {root}: {e}"
+    return ""
+
+
 def cmd_repos_remove(args: argparse.Namespace) -> int:
     from project_studio.repo_index import load_index, remove_repo
 
     idx = load_index()
-    if not remove_repo(idx, args.path):
+    # Only a folder the index already names may be deleted, so a typo'd
+    # --path can never reach rmtree.
+    entry = idx.find(args.path)
+    if entry is None:
         print(f"error: not in index: {args.path}", file=sys.stderr)
         return 2
+    if args.delete_folder:
+        # Delete before unindexing: a failed delete leaves the entry in place
+        # so the user can see what survived and retry.
+        err = _delete_repo_folder(Path(entry.path))
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 1
+        print(f"deleted {entry.path}", file=sys.stderr)
+    remove_repo(idx, entry.path)
     return _print_index_json(idx)
 
 
@@ -578,14 +616,17 @@ def cmd_new_project(args: argparse.Namespace) -> int:
         recomp_ui_ref=(getattr(args, "recomp_ui_ref", None) or "master").strip(),
         recomp_net_ref=(getattr(args, "recomp_net_ref", None) or "").strip(),
         rbengine_ref=(getattr(args, "rbengine_ref", None) or "").strip(),
-        # --- N64: the names and the harvest window --------------------------
-        # An n64lle port has no single name that serves: project (GloverRecomp),
-        # target prefix (glover-runtime) and executable (glover) are three
-        # different strings. Blank lets the scaffolder derive each, which is
-        # what a terminal run would have offered as the default.
+        # --- N64: the names, the three binaries, the harvest window ---------
+        # Project (GloverRecomp) and target prefix (glover-game) are different
+        # strings; blank lets the scaffolder derive the prefix. Then one answer
+        # per binary a game package runs on.
         n64_slug=(getattr(args, "n64_slug", None) or "").strip(),
-        n64_exe=(getattr(args, "n64_exe", None) or "").strip(),
-        n64lle_ref=(getattr(args, "n64lle_ref", None) or "").strip(),
+        n64_core=(getattr(args, "n64_core", None) or "release").strip(),
+        n64_runner=(getattr(args, "n64_runner", None) or "release").strip(),
+        n64_hub=(getattr(args, "n64_hub", None) or "release").strip(),
+        n64_skip_player=bool(getattr(args, "n64_skip_player", False)),
+        n64_transfer_pak=bool(getattr(args, "n64_transfer_pak", False)),
+        n64_app=not bool(getattr(args, "n64_no_app", False)),
         harvest_frames=int(getattr(args, "frames", 0) or 0),
         harvest_step_cap_m=int(getattr(args, "step_cap", 0) or 0),
         dry_run=bool(getattr(args, "dry_run", False)),
@@ -2007,6 +2048,94 @@ def cmd_build_framework(args: argparse.Namespace) -> int:
     return 0 if r.ok else 1
 
 
+def _n64_only(what: str) -> bool:
+    profile = platforms.current()
+    if profile.key == "n64":
+        return True
+    print(f"error: build {what} is n64lle-only — {profile.framework} ports build one "
+          "executable, not a game package run by a core, runner and hub.",
+          file=sys.stderr)
+    return False
+
+
+def cmd_build_component(args: argparse.Namespace) -> int:
+    """Build a DEV core, runner or hub from its source checkout.
+
+    Each runs that checkout's own local-build script (n64lle tools/build_core.sh,
+    Retro-Runtime / Retro-Launcher scripts/build-local.sh), whose last line is
+    the built path. Launch can then pick the dev build over the port's default.
+    """
+    if not _n64_only("component"):
+        return 2
+    from project_studio.n64_components import build_component
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    r = build_component(args.which, root, debug=args.debug, dry_run=args.dry_run, log=print)
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    return 0 if r.ok else 1
+
+
+def cmd_build_components(args: argparse.Namespace) -> int:
+    """Core / runner / hub: checkout, dev build and the port's default (JSON)."""
+    import json
+
+    if not _n64_only("components"):
+        return 2
+    from project_studio.buildops import resolve_build_dir
+    from project_studio.n64_components import status
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    print(json.dumps(status(root, resolve_build_dir(root, args.build_dir)), indent=2))
+    return 0
+
+
+def cmd_build_game(args: argparse.Namespace) -> int:
+    """Framework tools, configure, build: the game package and its gates."""
+    import shlex
+
+    if not _n64_only("game"):
+        return 2
+    from project_studio.buildops import build_n64_game
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    extra = shlex.split(args.extra, posix=os.name != "nt") if args.extra else []
+    r = build_n64_game(
+        root,
+        build_dir=args.build_dir,
+        build_type=args.build_type,
+        generator=args.generator or "",
+        extra_args=extra,
+        target=args.target,
+        jobs=args.jobs or None,
+        dry_run=args.dry_run,
+        log=print,
+    )
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    if r.detail and not r.ok:
+        print(r.detail)
+    return 0 if r.ok else 1
+
+
+def cmd_build_app(args: argparse.Namespace) -> int:
+    """The port's tools/build_app.sh: a local title app (no ROM inside)."""
+    if not _n64_only("app"):
+        return 2
+    from project_studio.buildops import build_n64_app
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    r = build_n64_app(root, build_dir=args.build_dir, dry_run=args.dry_run, log=print)
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    return 0 if r.ok else 1
+
+
 def cmd_build_generate(args: argparse.Namespace) -> int:
     from project_studio.buildops import (
         generate_n64_c,
@@ -2157,6 +2286,31 @@ def cmd_build_run(args: argparse.Namespace) -> int:
     if root is None:
         return 2
     extra = shlex.split(args.args, posix=os.name != "nt") if args.args else []
+
+    # A game-package port is played through its own tools/run_game.sh, with
+    # the core / runner / hub each either the port's default or a dev build.
+    # An explicit --exe still launches that binary (a port's opt-in SDL
+    # runtime harness), exactly as on the other consoles.
+    if platforms.current().key == "n64" and not args.exe:
+        from project_studio.buildops import launch_n64_game
+
+        def _nlog(line: str) -> None:
+            print(line, flush=True)
+
+        r = launch_n64_game(
+            root,
+            build_dir=args.build_dir,
+            core=args.core,
+            runner=args.runner,
+            hub=args.hub,
+            env_text=args.env or "",
+            extra_args=extra,
+            dry_run=args.dry_run,
+            log=_nlog,
+            wait=True,
+        )
+        print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}", flush=True)
+        return 0 if r.ok else 1
 
     rom, whence = launch_rom_for(root, getattr(args, "rom", None) or "")
     if rom and whence != "explicit":
@@ -2554,6 +2708,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ra.set_defaults(func=cmd_repos_add)
     p_rr = repos_sub.add_parser("remove", help="Remove a game repo")
     p_rr.add_argument("--path", required=True)
+    p_rr.add_argument("--delete-folder", action="store_true",
+                      help="Also delete the repo folder from disk (irreversible)")
     p_rr.add_argument("--json", action="store_true", default=True)
     p_rr.set_defaults(func=cmd_repos_remove)
     p_rsc = repos_sub.add_parser(
@@ -2683,24 +2839,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_np.add_argument("--psxrecomp-ref", "--framework-ref", dest="psxrecomp_ref",
                       default="master")
     p_np.add_argument("--snesrecomp-ref", default="main")
-    # N64. Blank is not "main": it is "let the scaffolder decide", which means
-    # branch main pinned at the HEAD of the n64lle checkout the wizard was run
-    # from — "the SHA this scaffold was cut against". Naming a ref here
-    # overrides that, and is forwarded only to a wizard whose parser has the
-    # flag (newproject.script_supports).
-    p_np.add_argument(
-        "--n64lle-ref", dest="n64lle_ref", default="",
-        help="N64: branch, tag or SHA for the n64lle submodule "
-             "(default: the scaffolder's own pin)",
-    )
+    # N64 (game-package scaffold). Each of the three binaries is a keyword or
+    # a path, exactly as n64lle's setup_project.sh takes it.
     p_np.add_argument(
         "--n64-slug", dest="n64_slug", default="",
         help="N64: target prefix, lowercase [a-z0-9_] (default: from the name)",
     )
     p_np.add_argument(
-        "--n64-exe", dest="n64_exe", default="",
-        help="N64: executable name (default: the slug)",
+        "--n64-core", dest="n64_core", default="release",
+        help="N64: release (fetch; default) | generate (build it from the n64lle "
+             "checkout: the dev core) | <path to n64lle_core>",
     )
+    p_np.add_argument(
+        "--n64-runner", dest="n64_runner", default="release",
+        help="N64: release (fetch; default) | dev (build Retro-Runtime's "
+             "scripts/build-local.sh first) | <path to retro-core-runner>",
+    )
+    p_np.add_argument(
+        "--n64-hub", dest="n64_hub", default="release",
+        help="N64: release (fetch; default) | dev (--hub-src <Retro-Launcher "
+             "checkout>) | <path to retro-hub>",
+    )
+    p_np.add_argument("--n64-skip-player", dest="n64_skip_player", action="store_true",
+                      help="N64: configure neither runner nor hub")
+    p_np.add_argument("--n64-transfer-pak", dest="n64_transfer_pak", action="store_true",
+                      help="N64: the title reads a Game Boy cartridge (Transfer Pak)")
+    p_np.add_argument("--n64-no-app", dest="n64_no_app", action="store_true",
+                      help="N64: do not build the title app after --generate")
     p_np.add_argument(
         "--frames", type=int, default=0,
         help="N64: harvest window in frames (0 = the scaffolder's default, 900)",
@@ -3559,7 +3724,54 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="SNES: ROM to run (default: the one recorded for this repo)",
     )
+    for _which, _what in (("core", "n64lle core"), ("runner", "retro-core-runner"),
+                          ("hub", "retro-hub")):
+        p_br.add_argument(
+            f"--{_which}", choices=("default", "dev"), default="default",
+            help=f"N64: the {_what} to launch with — the port's default "
+                 "(.n64lle/local.env, normally a release) or the dev build "
+                 f"from `build component --which {_which}`",
+        )
     p_br.set_defaults(func=cmd_build_run)
+
+    p_bcomp = build_sub.add_parser(
+        "component",
+        help="N64: build a DEV core / runner / hub from its source checkout "
+             "(n64lle tools/build_core.sh; Retro-Runtime / Retro-Launcher "
+             "scripts/build-local.sh)",
+    )
+    add_build_root(p_bcomp)
+    p_bcomp.add_argument("--which", required=True, choices=("core", "runner", "hub"))
+    p_bcomp.add_argument("--debug", action="store_true", help="a Debug build")
+    p_bcomp.set_defaults(func=cmd_build_component)
+
+    p_bcomps = build_sub.add_parser(
+        "components",
+        help="N64: core / runner / hub — checkout, dev build, port default (JSON)",
+    )
+    add_build_root(p_bcomps)
+    p_bcomps.add_argument("--json", action="store_true", default=True)
+    p_bcomps.set_defaults(func=cmd_build_components)
+
+    p_bgame = build_sub.add_parser(
+        "game",
+        help="N64: build the game package — framework tools (incremental), "
+             "configure, cmake --build",
+    )
+    add_build_root(p_bgame)
+    p_bgame.add_argument("--build-type", default="Release")
+    p_bgame.add_argument("--generator", default="")
+    p_bgame.add_argument("--extra", default="", help="Extra cmake args (--extra=-D...)")
+    p_bgame.add_argument("--target", default="", help="default: all (package + gates)")
+    p_bgame.add_argument("--jobs", type=int, default=0)
+    p_bgame.set_defaults(func=cmd_build_game)
+
+    p_bapp = build_sub.add_parser(
+        "app",
+        help="N64: the port's tools/build_app.sh — a local title app, no ROM inside",
+    )
+    add_build_root(p_bapp)
+    p_bapp.set_defaults(func=cmd_build_app)
 
     p_bcp = build_sub.add_parser(
         "check-paths",

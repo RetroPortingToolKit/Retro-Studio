@@ -204,9 +204,11 @@ void pane_oracle(StudioModel& model, const Theme& th) {
     ImGui::EndDisabled();
 
     ImGui::Spacing();
-    const std::string root = n64lle_root_for(model);
+    // The selected port's own dump first -- the one its game package was
+    // harvested from -- then whatever the n64lle checkout stages.
     std::string rom = model.n64_rom_override[0] ? std::string(model.n64_rom_override)
-                                                : n64_rom_for(root);
+                                                : n64_rom_for(model.selected_root());
+    if (rom.empty()) rom = n64_rom_for(n64lle_root_for(model));
     ImGui::SetNextItemWidth(520.f);
     ImGui::InputTextWithHint("##n64rom", rom.empty() ? "no ROM staged in roms/" : rom.c_str(),
                              model.n64_rom_override, sizeof(model.n64_rom_override));

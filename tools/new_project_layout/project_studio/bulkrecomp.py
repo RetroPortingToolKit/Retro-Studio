@@ -54,6 +54,9 @@ CANCEL_FILE = ".cancel"
 # Ordered stage lists per console. `framework` is N64-only for the reason
 # cmd_build_framework gives: n64lle is resolved as a pre-built tree, not
 # add_subdirectory()'d, and its generate step configures the port itself.
+# A game-package port (n64lle 2026-09-26 on) builds against ONE shared
+# checkout's framework tree, so on N64 the stages that build that tree --
+# scaffold (--core generate) and framework -- run one item at a time.
 STAGES: dict[str, tuple[str, ...]] = {
     "psx": ("probe", "scaffold", "generate", "configure", "compile"),
     "snes": ("probe", "scaffold", "generate", "configure", "compile"),
@@ -78,6 +81,11 @@ class BulkRecompOptions:
     fetch_boxart: bool = False
     reuse_existing: bool = False
     add_to_index: bool = False
+    # N64: the core each port is scaffolded on -- release | generate | <path>.
+    # generate, not the scaffolder's own default: release is refused until
+    # n64lle publishes one. The runner and hub are never fetched (--skip-player):
+    # the batch builds and gates, and nothing it runs needs them.
+    n64_core: str = "generate"
 
 
 @dataclass
@@ -127,6 +135,8 @@ class BulkRun:
             for i, img in enumerate(opts.images)
         ]
         self._lock = threading.Lock()
+        # N64 stages that build the one shared n64lle framework tree (see STAGES).
+        self._shared_tree = threading.Lock()
         # Held across snapshot AND replace, so a slower writer can never land
         # an older snapshot over a newer one.
         self._write_lock = threading.Lock()
@@ -377,14 +387,23 @@ class BulkRun:
             return None if platforms.current().is_cartridge else {}
         return data if isinstance(data, dict) else {}
 
+    def _serial(self, stage: str):
+        """The shared-tree lock for an N64 stage that builds it, else a no-op."""
+        import contextlib
+
+        if self.platform == "n64" and stage in ("scaffold", "framework"):
+            return self._shared_tree
+        return contextlib.nullcontext()
+
     def _scaffold_args(self, it: Item, meta: dict) -> list[str]:
         key = self.platform
         args = ["new-project", "--name", it.name, "--dir", str(self.out), "--rom", it.image]
         if key == "n64":
-            for flag, k in (("--github-repo", "project"), ("--n64-slug", "slug"),
-                            ("--n64-exe", "exe")):
+            for flag, k in (("--github-repo", "project"), ("--n64-slug", "slug")):
                 if meta.get(k):
                     args += [flag, str(meta[k])]
+            args += ["--n64-core", self.opts.n64_core or "generate", "--n64-skip-player",
+                     "--n64-no-app"]
         elif key == "snes":
             for flag, k in (("--github-repo", "project_name"), ("--region", "region"),
                             ("--zip-prefix", "zip_prefix")):
@@ -420,7 +439,6 @@ class BulkRun:
             name=it.name, disc=it.image, parent_dir=str(self.out),
             github_repo=repo, platform=self.platform,
             n64_slug=str(meta.get("slug") or "") if self.platform == "n64" else "",
-            n64_exe=str(meta.get("exe") or "") if self.platform == "n64" else "",
         )
         return project_root_for(opts)
 
@@ -469,7 +487,9 @@ class BulkRun:
                        "or pick an empty output folder")
             return
         else:
-            code, _ = self._run_stage(it, "scaffold", self._cli(*self._scaffold_args(it, meta)))
+            with self._serial("scaffold"):
+                code, _ = self._run_stage(it, "scaffold",
+                                          self._cli(*self._scaffold_args(it, meta)))
             if code != 0:
                 self._fail(it, "scaffold", f"new-project exit {code}")
                 return
@@ -493,7 +513,8 @@ class BulkRun:
                 argv = self._cli("build", "compile", "--root", r)
                 if self.opts.build_jobs > 0:
                     argv += ["--jobs", str(self.opts.build_jobs)]
-            code, _ = self._run_stage(it, stage, argv)
+            with self._serial(stage):
+                code, _ = self._run_stage(it, stage, argv)
             if code != 0:
                 self._fail(it, stage, f"{stage} exit {code}")
                 return

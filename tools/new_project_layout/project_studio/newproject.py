@@ -76,20 +76,27 @@ class NewProjectOptions:
     enable_rollback: bool = False
 
     # --- N64 only ----------------------------------------------------------
-    # n64lle's scaffolder asks for four names where the other two ask for one,
-    # because an n64lle port has no single one that serves: the CMake project
-    # (GloverRecomp), the target prefix every target is built from
-    # (glover-runtime, glover-cosim, glover-generate), and the executable the
-    # player launches (glover) are three different strings. `name` and
-    # `github_repo` carry the first; these carry the rest. Blank means "let the
-    # scaffolder derive it", which is what a terminal run would have offered.
+    # A game-package port (n64lle, 2026-09-26 on) has no submodules and no
+    # executable: it builds <slug>_game.so, which n64lle's generic core runs
+    # inside retro-hub through retro-core-runner. So beside the CMake project
+    # (`name` / `github_repo`) it needs a target prefix, and then an answer for
+    # each of the three binaries it will run on.
     n64_slug: str = ""  # target prefix; lowercase [a-z0-9_]
-    n64_exe: str = ""   # executable name; defaults to the slug
-    # The framework revision to cut the port against. Blank = the scaffolder's
-    # own default, which is branch `main` pinned at the HEAD of the n64lle
-    # checkout it was run from. Sent only when the script on disk declares the
-    # flag; see build_n64_command.
-    n64lle_ref: str = ""
+    # The core: "release" (fetch n64lle's -- the scaffolder's default),
+    # "generate" (build it from the checkout Studio drives: the dev core), or a
+    # path to a core library.
+    n64_core: str = "release"
+    # The runner and the hub: "release" (fetched), "dev" (built from a source
+    # checkout on this machine -- n64_components), or a path. A dev hub is
+    # built by the scaffolder itself (--hub-src); a dev runner is built by
+    # Studio first, because the scaffolder has no --runner-src.
+    n64_runner: str = "release"
+    n64_hub: str = "release"
+    n64_skip_player: bool = False  # --skip-player: configure neither
+    n64_transfer_pak: bool = False
+    # After --generate, build the title app into build-release/. The
+    # scaffolder's own default is on; it needs a hub reporting `title_app 1`.
+    n64_app: bool = True
     # The execution-derived discovery window. n64lle harvests what actually ran
     # rather than following seeds, so these two ARE the coverage decision, and
     # the scaffolder writes them into game.toml [recompiler] and mirrors them
@@ -222,10 +229,6 @@ def n64_slug(opts: "NewProjectOptions") -> str:
     return (opts.n64_slug or "").strip() or _slugify(opts.name)
 
 
-def n64_exe(opts: "NewProjectOptions") -> str:
-    return (opts.n64_exe or "").strip() or n64_slug(opts)
-
-
 def project_folder_name(opts: NewProjectOptions) -> str:
     """Checkout folder = GitHub/catalog install_dir slug (not display name with spaces)."""
     # N64 is the exception, and it is the script's rule rather than a
@@ -278,6 +281,37 @@ def project_root_for(opts: NewProjectOptions) -> Path:
     if not folder:
         folder = (opts.name or "").strip() or "repo"
     return (parent / folder).resolve()
+
+
+def _validate_n64_components(opts: "NewProjectOptions") -> list[str]:
+    """The core / runner / hub answers, checked before the scaffolder runs."""
+    from . import n64_components
+
+    errs: list[str] = []
+    script = n64_paths.setup_script(None)
+    if script is not None and not script_supports(script, "--core"):
+        # Its argument parser has no --core: this is the submodule scaffold
+        # (before 2026-09-26), which would build a port with no core at all.
+        errs.append(
+            f"The n64lle wizard at {script} predates game packages (no --core). "
+            "Update that n64lle checkout."
+        )
+    kind, path = _n64_choice(opts.n64_core, N64_CORE_KEYWORDS)
+    if kind == "path" and not Path(path).is_file():
+        errs.append(f"Core not found: {path}")
+    if opts.n64_skip_player:
+        return errs
+    for which in ("runner", "hub"):
+        kind, path = _n64_choice(getattr(opts, f"n64_{which}"), N64_PLAYER_KEYWORDS)
+        comp = n64_components.COMPONENTS[which]
+        if kind == "path" and not Path(path).is_file():
+            errs.append(f"{comp.label} not found: {path}")
+        elif kind == "dev" and n64_components.checkout(which, None) is None:
+            errs.append(
+                f"Dev {comp.label}: no {comp.repo} checkout found to build it from "
+                f"— clone it beside n64lle, or set {comp.checkout_env}."
+            )
+    return errs
 
 
 def validate_options(opts: NewProjectOptions) -> list[str]:
@@ -350,6 +384,7 @@ def validate_options(opts: NewProjectOptions) -> list[str]:
             errs.append(
                 f"Target prefix must be lowercase letters/digits (got {slug!r})"
             )
+        errs.extend(_validate_n64_components(opts))
         for label, value in (
             ("Harvest frames", opts.harvest_frames),
             ("Harvest step cap", opts.harvest_step_cap_m),
@@ -462,23 +497,42 @@ def build_snes_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, st
     return cmd, env
 
 
+N64_CORE_KEYWORDS = ("release", "generate")
+N64_PLAYER_KEYWORDS = ("release", "dev")
+
+
+def _n64_choice(value: str, keywords: tuple[str, ...]) -> tuple[str, str]:
+    """``(keyword, "")`` or ``("path", <absolute path>)`` for a core/runner/hub answer."""
+    v = (value or "").strip()
+    if not v or v.lower() in keywords:
+        return (v.lower() or keywords[0]), ""
+    return "path", str(Path(v).expanduser().resolve())
+
+
+def n64_dev_runner(opts: "NewProjectOptions") -> Path | None:
+    """Where the dev runner is (or will be, once Studio builds it)."""
+    from . import n64_components
+
+    return n64_components.dev_output("runner", n64_components.checkout("runner", None))
+
+
 def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
     """argv + env for n64lle's ``tools/new_project/setup_project.sh``.
 
-    Only the flags that script actually has, and its flag set is the smallest
-    of the three: an unknown option is `exit 2` there, so a habitual
-    --description or --enable-ci from the PSX form would kill the run before it
-    probed the ROM. What it gains instead is the four names an n64lle port
-    needs (project / slug / exe) and the harvest window, none of which the
-    other two consoles have a concept of.
+    Only the flags that script actually has: an unknown option is `exit 2`
+    there, so a habitual --description or --enable-ci from the PSX form would
+    kill the run before it probed the ROM.
 
-    --n64lle-ref / --recomp-ui-ref are sent only when the script ON DISK
-    declares them. Studio drives whichever checkout it found — `$N64LLE_ROOT`,
-    the port's own submodule, or a sibling checkout — and an unknown option is
-    `exit 2` there, so an older wizard would die on the flag instead of
-    scaffolding. Without them the script does what it always did:
-    branch `main`, pinned at the HEAD of the checkout it was run from, "the SHA
-    this scaffold was cut against".
+    The game-package scaffold (2026-09-26) is what this speaks. It REFUSES the
+    flags of the submodule scaffold before it (--exe, --n64lle-ref,
+    --recomp-ui-ref, --source, --release), so none of them is ever sent; what
+    replaced them is one answer per binary the port runs on:
+
+      core    --core release | generate | <path>
+      runner  --runner <path>        (dev: Studio's build of Retro-Runtime)
+      hub     --hub <path> | --hub-src <Retro-Launcher checkout>   (dev)
+              release = neither flag: the scaffolder fetches both
+      neither --skip-player
     """
     script = n64_paths.setup_script(None)
     if script is None:
@@ -497,8 +551,6 @@ def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str
         n64_project_name(opts),
         "--slug",
         n64_slug(opts),
-        "--exe",
-        n64_exe(opts),
         "--players",
         str(int(opts.players)),
         "--dir",
@@ -513,15 +565,30 @@ def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str
         cmd.extend(["--step-cap", str(int(opts.harvest_step_cap_m))])
     if opts.github_owner:
         cmd.extend(["--gh-owner", opts.github_owner.strip()])
-    # The submodule revisions, when the wizard on disk can take them.
-    n64lle_ref = (opts.n64lle_ref or "").strip()
-    if n64lle_ref and script_supports(script, "--n64lle-ref"):
-        cmd.extend(["--n64lle-ref", n64lle_ref])
-    ui_ref = (opts.recomp_ui_ref or "").strip()
-    # "master" is recomp-ui's own default in the script; sending it back would
-    # be a second copy of the default to drift.
-    if ui_ref and ui_ref != "master" and script_supports(script, "--recomp-ui-ref"):
-        cmd.extend(["--recomp-ui-ref", ui_ref])
+    cmd.append("--transfer-pak" if opts.n64_transfer_pak else "--no-transfer-pak")
+
+    kind, path = _n64_choice(opts.n64_core, N64_CORE_KEYWORDS)
+    cmd.extend(["--core", path if kind == "path" else kind])
+
+    if opts.n64_skip_player:
+        cmd.append("--skip-player")
+    else:
+        kind, path = _n64_choice(opts.n64_runner, N64_PLAYER_KEYWORDS)
+        if kind == "dev":
+            dev = n64_dev_runner(opts)
+            if dev is not None:
+                cmd.extend(["--runner", str(dev)])
+        elif kind == "path":
+            cmd.extend(["--runner", path])
+        kind, path = _n64_choice(opts.n64_hub, N64_PLAYER_KEYWORDS)
+        if kind == "dev":
+            from . import n64_components
+
+            src = n64_components.checkout("hub", None)
+            if src is not None:
+                cmd.extend(["--hub-src", str(src)])
+        elif kind == "path":
+            cmd.extend(["--hub", path])
 
     # Stage image => --copy-rom. The scaffolder symlinks the dump into roms/ by
     # default, which is the better answer on this machine; --copy-rom is for a
@@ -530,9 +597,14 @@ def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str
     if opts.stage_disc:
         cmd.append("--copy-rom")
     # --generate on this scaffolder is the WHOLE pipeline: framework build,
-    # harvest, emit, compile, and ctest. There is no separate --build, so
-    # either switch asking for work maps onto it.
-    cmd.append("--generate" if (opts.do_generate or opts.do_build) else "--no-generate")
+    # harvest, emit, the game package, and its gates. There is no separate
+    # --build, so either switch asking for work maps onto it.
+    generate = opts.do_generate or opts.do_build
+    cmd.append("--generate" if generate else "--no-generate")
+    # The title app follows --generate; without one there is no package to put
+    # in it, so it is said off rather than left to the default.
+    cmd.append("--app" if (generate and opts.n64_app and not opts.n64_skip_player)
+               else "--no-app")
     cmd.append("--git")
     if opts.create_github:
         cmd.append("--gh")
@@ -565,11 +637,6 @@ def n64_ignored_fields(opts: NewProjectOptions) -> list[str]:
             ignored.append(label)
     if opts.enable_netplay or opts.enable_rollback:
         ignored.append("Netplay")
-    if not opts.enable_recomp_ui:
-        # recomp-ui is not optional in this scaffold: setup_project.sh always
-        # adds the submodule, and the CMake option that skips the launcher
-        # (<SLUG>_BUILD_UI) is a build-time choice in the created repo.
-        ignored.append("Disable recomp-ui")
     if opts.enable_ci:
         # n64lle ships no release workflow template, so there is nothing to
         # emit. Saying so beats a CI tick that quietly does nothing.
@@ -886,23 +953,23 @@ def run_new_project(
 
     if is_n64(opts):
         if on_line:
-            src = n64_paths.wizard_source(None)
-            on_line(f"Using n64lle wizard: {src}")
-            script = n64_paths.setup_script(None)
-            can_ref = script is not None and script_supports(script, "--n64lle-ref")
-            if (opts.n64lle_ref or "").strip() and not can_ref:
-                # Said here rather than swallowed in build_n64_command: the ref
-                # is on screen, and a scaffold that ignored it without a word
-                # would look like it honoured it.
-                on_line(
-                    f"note: this wizard has no --n64lle-ref, so "
-                    f"'{opts.n64lle_ref.strip()}' is NOT being used — the "
-                    "project will be pinned the way that checkout pins. Update "
-                    "the n64lle checkout Studio is reading."
-                )
+            on_line(f"Using n64lle wizard: {n64_paths.wizard_source(None)}")
             ignored = n64_ignored_fields(opts)
             if ignored:
                 on_line("note: not used by the N64 scaffolder — " + ", ".join(ignored))
+        # A dev runner is built HERE, before the scaffold: the scaffolder takes
+        # a hub's source (--hub-src) but only a runner's binary (--runner).
+        # Incremental, so an up-to-date one costs seconds.
+        runner_kind, _ = _n64_choice(opts.n64_runner, N64_PLAYER_KEYWORDS)
+        if runner_kind == "dev" and not opts.n64_skip_player and not opts.dry_run:
+            from . import n64_components
+
+            r = n64_components.build_component("runner", None, log=on_line)
+            if on_line:
+                on_line(f"  [{'OK' if r.ok else 'FAIL'}] {r.message}")
+            if not r.ok:
+                return CmdResult(False, "Building the dev runner failed; nothing was "
+                                        "scaffolded", r.detail)
     if is_snes(opts):
         if on_line:
             on_line(f"Using snesrecomp wizard: {snes_paths.wizard_source(None)}")

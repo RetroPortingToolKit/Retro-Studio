@@ -9,6 +9,8 @@
 #include "studio/studio_n64.hpp"
 
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 using namespace retcomm::studio;
@@ -156,10 +158,110 @@ static void test_catalogue() {
     }
 }
 
+// --------------------------------------------------------------------------
+// components (Build tab)
+// --------------------------------------------------------------------------
+
+// Verbatim `build components --json` against PokemonStadiumRecomp on
+// 2026-09-28: a generated core, fetched runner and hub, one dev hub built.
+static const char* kComponents = R"({
+  "platform": "linux-x86_64",
+  "package_port": true,
+  "core": {
+    "label": "n64lle core",
+    "checkout": "/home/alex/Documents/GitHub/n64lle",
+    "dev": "/home/alex/Documents/GitHub/n64lle/out/local/linux-x86_64/n64lle_core.so",
+    "dev_built": false,
+    "default": "/home/alex/Documents/GitHub/n64lle/build-n64lle/runtime/n64lle_core.so",
+    "default_from": "generate",
+    "default_exists": true
+  },
+  "runner": {
+    "label": "retro-core-runner",
+    "checkout": "/home/alex/Documents/GitHub/Retro-Runtime",
+    "dev": "/home/alex/Documents/GitHub/Retro-Runtime/out/local/linux-x86_64/retro-core-runner",
+    "dev_built": false,
+    "default": "/home/alex/Documents/GitHub/PokemonStadiumRecomp/.n64lle/player/retro-core-runner",
+    "default_from": "release",
+    "default_exists": true
+  },
+  "hub": {
+    "label": "retro-hub",
+    "checkout": "/home/alex/Documents/GitHub/retcomm-launcher",
+    "dev": "/home/alex/Documents/GitHub/retcomm-launcher/out/local/linux-x86_64/retro-hub",
+    "dev_built": true,
+    "default": "/home/alex/Documents/GitHub/PokemonStadiumRecomp/.n64lle/player/retro-hub",
+    "default_from": "release",
+    "default_exists": true
+  },
+  "game": {
+    "package": "/home/alex/Documents/GitHub/PokemonStadiumRecomp/build-release/package/pokemonstadium_game.so",
+    "built": true,
+    "configured": true,
+    "rom": "/home/alex/Documents/GitHub/PokemonStadiumRecomp/roms/pokemonstadium.z64"
+  }
+})";
+
+static void test_components() {
+    const N64Components c = parse_n64_components(kComponents);
+    check(c.probed && c.error.empty(), "components: parsed");
+    check(c.package_port, "components: a game-package port");
+    check(c.core.def_from == "generate" && !c.core.dev_built,
+          "components: core default kept, no dev core");
+    check(c.runner.def_from == "release", "components: runner default is the release");
+    check(c.hub.dev_built && !c.hub.dev.empty(), "components: dev hub found");
+    check(c.package_built && c.package.find("_game.so") != std::string::npos,
+          "components: package path");
+
+    const N64Components junk = parse_n64_components("nope");
+    check(junk.probed && !junk.error.empty(), "components: junk is an error");
+    check(!junk.hub.dev_built, "components: junk offers no dev build");
+    const N64Components empty = parse_n64_components("");
+    check(!empty.error.empty(), "components: no output is an error");
+}
+
+// --------------------------------------------------------------------------
+// a game-package port's .n64lle/local.env (Diagnostics finds n64lle through it)
+// --------------------------------------------------------------------------
+
+static void test_local_env() {
+    namespace fs = std::filesystem;
+    const fs::path port = fs::temp_directory_path() / "n64_load_test_port";
+    fs::remove_all(port);
+    fs::create_directories(port / ".n64lle");
+    fs::create_directories(port / "roms");
+    {
+        std::ofstream f(port / ".n64lle" / "local.env");
+        f << "# comment\n"
+             "N64LLE_ROOT='/src/n64lle'\n"
+             "N64LLE_BUILD='/src/n64lle/build-n64lle'\n"
+             "RETRO_HUB='it's quoted'\n"
+             "N64LLE_CORE_FROM=generate\n";
+    }
+    check(n64_local_env_value(port.string(), "N64LLE_ROOT") == "/src/n64lle",
+          "local.env: N64LLE_ROOT read");
+    check(n64_local_env_value(port.string(), "N64LLE_ROOT_X").empty(),
+          "local.env: a longer key is not a prefix match");
+    check(n64_local_env_value(port.string(), "RETRO_HUB").empty(),
+          "local.env: a line CMake's rule rejects is rejected here too");
+    check(n64_local_env_value(port.string(), "N64LLE_CORE_FROM").empty(),
+          "local.env: an unquoted value is not the format");
+    check(n64_local_env_value((port / "nope").string(), "N64LLE_ROOT").empty(),
+          "local.env: no file, no value");
+
+    check(n64_rom_for(port.string()).empty(), "rom: none staged");
+    { std::ofstream f(port / "roms" / "game.z64"); f << "x"; }
+    check(n64_rom_for(port.string()).find("game.z64") != std::string::npos,
+          "rom: the port's own staged dump");
+    fs::remove_all(port);
+}
+
 int main() {
+    test_local_env();
     test_oracle_status();
     test_gate_results();
     test_catalogue();
+    test_components();
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;
