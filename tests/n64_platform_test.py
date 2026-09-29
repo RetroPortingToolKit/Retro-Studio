@@ -495,7 +495,8 @@ def test_new_project_command(tmp: Path) -> None:
           "a runner path is passed through")
     from project_studio import n64_components
     if n64_components.checkout("hub", None) is not None:
-        check("--hub-src" in dev_cmd, "a dev hub is built by the scaffolder (--hub-src)")
+        check("--hub-src" not in dev_cmd and "--hub" in dev_cmd,
+              "a dev hub is Studio's build, passed as --hub (not built by the scaffolder)")
     check("--generate" in dev_cmd and "--app" in dev_cmd, "generate builds the title app")
     opts.n64_skip_player = True
     skip_cmd = npj.build_command(opts)[0]
@@ -594,6 +595,22 @@ def test_game_package_port(tmp: Path) -> None:
               "launch runs the port's run_game.sh on what is built")
         check("--run-core" not in r.message and "RETRO_HUB=" not in r.message,
               "default launch overrides nothing")
+        # A hub hands itself over to a newer one its Update page installed;
+        # Launch pins the hub it shows with --hub <itself>, where supported.
+        fake_hub = tmp / "fakehub" / "retro-hub"
+        fake_hub.parent.mkdir()
+        fake_hub.write_text("#!/bin/sh\necho 'version 0.8.0'\n"
+                            "echo 'direct_mode_flags --run-core --package --rom --hub'\n")
+        fake_hub.chmod(0o755)
+        (bdir / "run_game.env").write_text(
+            f"N64LLE_CORE_LIB='/c/n64lle_core.so'\nGAME_PACKAGE='{pkg}'\n"
+            f"RETRO_HUB='{fake_hub}'\n", encoding="utf-8")
+        r = buildops.launch_n64_game(port, dry_run=True)
+        check(r.ok and r.message.endswith(f"--hub {fake_hub}"),
+              "the default hub is pinned with --hub, so an installed update cannot take over")
+        fake_hub.write_text("#!/bin/sh\necho 'direct_mode_flags --run-core --package --rom'\n")
+        r = buildops.launch_n64_game(port, dry_run=True)
+        check(r.ok and "--hub" not in r.message, "a hub without --hub is not sent it")
         r = buildops.launch_n64_game(port, hub="dev", dry_run=True)
         dev_hub = n64_components.dev_path("hub", port)
         if dev_hub is None:
@@ -640,6 +657,63 @@ def test_game_package_port(tmp: Path) -> None:
     finally:
         if old_env is not None:
             os.environ["N64LLE_ROOT"] = old_env
+
+
+def test_component_host_env(tmp: Path) -> None:
+    """Dev core/runner/hub builds run with the HOST's toolchain, not the pack's.
+
+    Studio prepends its toolchain pack to PATH for everything it spawns. Under
+    it, Retro-Runtime's build-local.sh got the pack's clang, which cannot link
+    -static-libgcc (no libgcc_eh) -- the first try_compile failed.
+    """
+    print("component builds: host toolchain")
+    from project_studio import n64_components
+
+    pack = tmp / "pack"
+    (pack / "bin").mkdir(parents=True)
+    (pack / "retcomm-toolchain.json").write_text("{}", encoding="utf-8")
+    saved = {k: os.environ.get(k) for k in
+             ("RETCOMM_TOOLCHAIN_DIR", "PATH", "SDL3_DIR", "CMAKE_PREFIX_PATH", "CC")}
+    try:
+        os.environ["RETCOMM_TOOLCHAIN_DIR"] = str(pack)
+        os.environ["PATH"] = f"{pack / 'bin'}{os.pathsep}/usr/bin{os.pathsep}/bin"
+        os.environ["SDL3_DIR"] = str(pack / "deps" / "lib" / "cmake" / "SDL3")
+        os.environ["CMAKE_PREFIX_PATH"] = f"{pack / 'deps'}{os.pathsep}/opt/mine"
+        os.environ["CC"] = str(pack / "bin" / "cc")
+        env = n64_components.host_env()
+        check(str(pack / "bin") not in env.get("PATH", "") and "/usr/bin" in env["PATH"],
+              "the pack's bin/ is off PATH; the host's stays")
+        check("SDL3_DIR" not in env and "CC" not in env and "RETCOMM_TOOLCHAIN_DIR" not in env,
+              "the pack's SDL3_DIR / CC / marker are dropped")
+        check(env.get("CMAKE_PREFIX_PATH") == "/opt/mine",
+              "a user's own CMAKE_PREFIX_PATH entry survives")
+
+        # Studio builds the runner and hub in its own tree, never the scripts'
+        # default build-local/: a terminal build and a Studio build must not
+        # share a CMake cache, which keeps its first compiler for good.
+        runner_src = n64_components.checkout("runner", None)
+        if runner_src is not None:
+            d = n64_components.build_component("runner", None, dry_run=True)
+            check(d.ok and d.message.endswith(f"--build {runner_src / 'build-studio'}"),
+                  "the runner builds in <Retro-Runtime>/build-studio")
+            d = n64_components.build_component("runner", None, debug=True, dry_run=True)
+            check("build-studio-debug" in d.message, "a Debug build gets its own tree")
+        tree = tmp / "Retro-Runtime" / "build-studio"
+        tree.mkdir(parents=True)
+        (tree / "CMakeCache.txt").write_text(
+            f"CMAKE_C_COMPILER:FILEPATH={pack / 'bin' / 'cc'}\n", encoding="utf-8")
+        check(n64_components._stale_pack_cache(tree),
+              "a tree already configured with the pack's compiler is named")
+        (tree / "CMakeCache.txt").write_text(
+            "CMAKE_C_COMPILER:FILEPATH=/usr/bin/cc\n", encoding="utf-8")
+        check(not n64_components._stale_pack_cache(tree),
+              "a host-configured tree is left alone")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_bulk_recomp_n64(tmp: Path) -> None:
@@ -809,6 +883,7 @@ def main() -> int:
         test_framework_preflight(root)
         test_game_package_port(tmp)
         test_bulk_recomp_n64(tmp)
+        test_component_host_env(tmp)
         test_audit_plan_apply(root)
         test_template_drift(tmp)
         test_refuses_unresolved_tokens(tmp)

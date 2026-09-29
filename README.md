@@ -97,8 +97,9 @@ Then one answer per binary the port runs on, written to its gitignored
 `.n64lle/local.env`: **Core** — Release (fetch `n64lle_core`, the default), Dev
 (`--core generate`: build it from the n64lle checkout) or a path; **Runner** and
 **Hub** — Release (fetched into `.n64lle/player/`), Dev (the runner is built
-first with Retro-Runtime's `scripts/build-local.sh`; the hub is built by the
-scaffolder from a Retro-Launcher checkout, `--hub-src`) or a path; or **Skip
+first with Retro-Runtime's `scripts/build-local.sh`, the hub with
+Retro-Launcher's, both with the host's compiler rather than Studio's toolchain
+pack) or a path; or **Skip
 runner + hub**. **Title app** (on by default with Generate) builds the
 AppImage / `.dmg` / `.exe` into `build-release/`, and needs a hub that reports
 `title_app 1` — a dev hub does.

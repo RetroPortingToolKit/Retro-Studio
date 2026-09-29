@@ -2317,6 +2317,22 @@ def launch_n64_game(
         else:
             overlay[comp.env_key] = str(dev)
 
+    # Pin the hub. A retro-hub started in Direct mode hands itself over to any
+    # NEWER hub installed in its data dir by its own Update page
+    # (<data>/hub/<version>/, hub_main.cpp) -- and a local build reports the
+    # launcher's project version (0.1.1), so after one Update every dev hub,
+    # and every older bundled release, relaunched as the installed one while
+    # Studio said otherwise. `--hub <itself>` turns that off ("--hub ... is this
+    # hub; carrying on"), so the hub that runs is the one shown here. Sent only
+    # to a hub that lists --hub in its direct_mode_flags.
+    run_hub = overlay.get("RETRO_HUB") or os.environ.get("RETRO_HUB") or \
+        comps.default_for("hub", root, bdir)[0]
+    if run_hub and "--hub" not in (extra_args or []) and \
+            "--hub" in comps.hub_direct_flags(run_hub):
+        tail += ["--hub", run_hub]
+        _flush_log(log, "retro-hub pinned with --hub: an installed hub update does not "
+                        "take over this launch")
+
     bash = find_bash()
     if bash is None:
         return CmdResult(False, "No bash found to run tools/run_game.sh.")

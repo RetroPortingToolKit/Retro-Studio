@@ -2857,8 +2857,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_np.add_argument(
         "--n64-hub", dest="n64_hub", default="release",
-        help="N64: release (fetch; default) | dev (--hub-src <Retro-Launcher "
-             "checkout>) | <path to retro-hub>",
+        help="N64: release (fetch; default) | dev (build Retro-Launcher's "
+             "scripts/build-local.sh first) | <path to retro-hub>",
     )
     p_np.add_argument("--n64-skip-player", dest="n64_skip_player", action="store_true",
                       help="N64: configure neither runner nor hub")

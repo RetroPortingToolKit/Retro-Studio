@@ -530,8 +530,13 @@ def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str
 
       core    --core release | generate | <path>
       runner  --runner <path>        (dev: Studio's build of Retro-Runtime)
-      hub     --hub <path> | --hub-src <Retro-Launcher checkout>   (dev)
+      hub     --hub <path>           (dev: Studio's build of Retro-Launcher)
               release = neither flag: the scaffolder fetches both
+
+    Both dev builds are Studio's, made BEFORE the scaffold with the host's
+    toolchain (n64_components.host_env), not by the scaffolder: its --hub-src
+    would build the hub inside this process's environment, which carries
+    Studio's toolchain pack.
       neither --skip-player
     """
     script = n64_paths.setup_script(None)
@@ -584,9 +589,9 @@ def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str
         if kind == "dev":
             from . import n64_components
 
-            src = n64_components.checkout("hub", None)
-            if src is not None:
-                cmd.extend(["--hub-src", str(src)])
+            dev = n64_components.dev_output("hub", n64_components.checkout("hub", None))
+            if dev is not None:
+                cmd.extend(["--hub", str(dev)])
         elif kind == "path":
             cmd.extend(["--hub", path])
 
@@ -957,19 +962,22 @@ def run_new_project(
             ignored = n64_ignored_fields(opts)
             if ignored:
                 on_line("note: not used by the N64 scaffolder — " + ", ".join(ignored))
-        # A dev runner is built HERE, before the scaffold: the scaffolder takes
-        # a hub's source (--hub-src) but only a runner's binary (--runner).
-        # Incremental, so an up-to-date one costs seconds.
-        runner_kind, _ = _n64_choice(opts.n64_runner, N64_PLAYER_KEYWORDS)
-        if runner_kind == "dev" and not opts.n64_skip_player and not opts.dry_run:
+        # A dev runner / hub is built HERE, before the scaffold, with the host's
+        # toolchain (see build_n64_command). Incremental, so an up-to-date one
+        # costs seconds.
+        if not opts.n64_skip_player and not opts.dry_run:
             from . import n64_components
 
-            r = n64_components.build_component("runner", None, log=on_line)
-            if on_line:
-                on_line(f"  [{'OK' if r.ok else 'FAIL'}] {r.message}")
-            if not r.ok:
-                return CmdResult(False, "Building the dev runner failed; nothing was "
-                                        "scaffolded", r.detail)
+            for which in ("runner", "hub"):
+                kind, _ = _n64_choice(getattr(opts, f"n64_{which}"), N64_PLAYER_KEYWORDS)
+                if kind != "dev":
+                    continue
+                r = n64_components.build_component(which, None, log=on_line)
+                if on_line:
+                    on_line(f"  [{'OK' if r.ok else 'FAIL'}] {r.message}")
+                if not r.ok:
+                    return CmdResult(False, f"Building the dev {which} failed; nothing "
+                                            "was scaffolded", r.detail)
     if is_snes(opts):
         if on_line:
             on_line(f"Using snesrecomp wizard: {snes_paths.wizard_source(None)}")

@@ -189,6 +189,87 @@ def dev_path(which: str, port_root: Path | str | None) -> Path | None:
 # Building one
 # ---------------------------------------------------------------------------
 
+def host_env() -> dict[str, str]:
+    """This process's environment WITHOUT the retcomm toolchain pack.
+
+    Studio puts the pack's bin/ first on PATH (studio_runner.cpp) and overlays
+    its deps (buildops.toolchain_env) so PORTS build hermetically. These three
+    scripts are not ports: each is "build for THIS machine" and picks its own
+    compiler, exactly as it does from a terminal. Under the pack it gets the
+    pack's clang, whose sysroot has no libgcc_eh -- and Retro-Runtime's
+    build-local.sh links -static-libgcc on Linux, so its first try_compile
+    failed (measured 2026-09-28). The trees they share are host-configured too:
+    n64lle/build-n64lle and Retro-Launcher's build-local cache /usr/bin/cc.
+    """
+    from .buildops import toolchain_root
+
+    env = os.environ.copy()
+    pack = toolchain_root()
+    if pack is None:
+        return env
+    pack = pack.resolve()
+
+    def in_pack(raw: str) -> bool:
+        try:
+            p = Path(raw).expanduser().resolve()
+        except (OSError, ValueError):
+            return False
+        return p == pack or pack in p.parents
+
+    for key in ("PATH", "CMAKE_PREFIX_PATH"):
+        if key in env:
+            kept = [p for p in env[key].split(os.pathsep) if p and not in_pack(p)]
+            if kept:
+                env[key] = os.pathsep.join(kept)
+            else:
+                env.pop(key)
+    for key in ("SDL3_DIR", "ZLIB_ROOT", "CC", "CXX", "RETCOMM_TOOLCHAIN_DIR"):
+        if key in env and (key == "RETCOMM_TOOLCHAIN_DIR" or in_pack(env[key])):
+            env.pop(key)
+    return env
+
+
+# Studio's own build tree for the runner and hub, beside the scripts' default
+# build-local/. A terminal build and a Studio build then never share a CMake
+# cache -- CMake keeps a tree's first compiler for good, so one tree configured
+# under the wrong toolchain used to poison the other (2026-09-28: a Studio run
+# left Retro-Runtime/build-local on the pack's clang). Both repos gitignore
+# build*/. The output still goes to the scripts' default out/local/<platform>/,
+# which is where dev_output() and Launch look.
+#
+# NOT the core: build_core.sh builds in the framework tree the port's game
+# package LINKS (<checkout>/build-n64lle). A second tree would be a second full
+# framework build, and a core built beside a package it was not linked with.
+STUDIO_BUILD_DIR = "build-studio"
+
+
+def build_tree(which: str, src: Path, *, debug: bool = False) -> Path:
+    """The CMake tree Studio builds ``which`` in."""
+    if which == "core":
+        fw = n64_paths.FRAMEWORK_BUILD_DIR + ("-debug" if debug else "")
+        return src / fw
+    return src / (STUDIO_BUILD_DIR + ("-debug" if debug else ""))
+
+
+def _stale_pack_cache(tree: Path) -> bool:
+    """Is ``tree`` configured with the toolchain pack's compiler?
+
+    CMake keeps a tree's compiler for good, so such a tree fails the same way
+    even under the host's environment. Said by name instead.
+    """
+    from .buildops import toolchain_root
+
+    pack = toolchain_root()
+    if pack is None:
+        return False
+    try:
+        text = (tree / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(line.startswith(("CMAKE_C_COMPILER:", "CMAKE_CXX_COMPILER:"))
+               and str(pack.resolve()) in line for line in text.splitlines())
+
+
 def _script_argv(which: str, src: Path) -> list[str] | None:
     if which == "core":
         sh, ps1 = src / "tools" / "build_core.sh", src / "tools" / "build_core.ps1"
@@ -234,16 +315,27 @@ def build_component(
     if argv is None:
         return CmdResult(False, f"{src} has no local-build script for {comp.label} "
                                 "(or no bash to run it).")
+    ps1 = argv[-1].endswith(".ps1")
     if debug:
-        argv.append("-Debug" if argv[-1].endswith(".ps1") else "--debug")
+        argv.append("-Debug" if ps1 else "--debug")
+    tree = build_tree(which, src, debug=debug)
+    if which != "core":
+        argv += ["-Build" if ps1 else "--build", str(tree)]
     if dry_run:
         msg = "dry-run: " + " ".join(argv)
         if log:
             log(msg)
         return CmdResult(True, msg)
+    env = host_env()
+    if _stale_pack_cache(tree):
+        return CmdResult(
+            False,
+            f"{tree} was configured with Studio's toolchain pack compiler, and CMake "
+            "keeps a tree's compiler. Delete that folder -- a gitignored build tree -- "
+            f"and press Build {which} again.")
     if log:
-        log(f"--- Build {comp.label} (dev) from {src} ---")
-    r = _run_stream(argv, src, log=log)
+        log(f"--- Build {comp.label} (dev) from {src}, host toolchain ---")
+    r = _run_stream(argv, src, log=log, env=env)
     if not r.ok:
         return CmdResult(False, f"Building {comp.label} failed — {r.message}", r.detail)
     prefix = comp.env_key + "="
@@ -258,6 +350,19 @@ def build_component(
 # ---------------------------------------------------------------------------
 # What a launch would use
 # ---------------------------------------------------------------------------
+
+def hub_direct_flags(hub: Path | str) -> set[str]:
+    """The Direct-mode flags a retro-hub lists in ``--version``; empty if unknown."""
+    try:
+        proc = subprocess.run([str(hub), "--version"], capture_output=True, text=True,
+                              timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("direct_mode_flags "):
+            return set(line.split()[1:])
+    return set()
+
 
 def read_run_game_env(build_dir: Path) -> dict[str, str]:
     """``<build>/run_game.env``: what the port's configure resolved."""

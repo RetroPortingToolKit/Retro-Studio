@@ -1999,7 +1999,8 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                 sizeof(model.np_n64_hub_path), "np_n64_hub",
                 "Release — fetch retro-hub\0Dev — build from Retro-Launcher\0Path…\0",
                 "Release: fetched from Retro-Launcher's release into .n64lle/player/.\n"
-                "Dev: the scaffolder builds it from a Retro-Launcher checkout (--hub-src).\n"
+                "Dev: Studio runs Retro-Launcher's scripts/build-local.sh first, then\n"
+                "passes the result as --hub.\n"
                 "The title app needs a hub reporting `title_app 1` — a dev hub does.");
         ImGui::EndDisabled();
         left_label("", kLabelW);
