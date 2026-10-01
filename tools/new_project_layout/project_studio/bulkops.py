@@ -944,6 +944,114 @@ def bulk_release(
     return map_repos(repos, one, jobs=jobs, on_repo=on_repo)
 
 
+def _bump_submodule_to(root: Path, name: str, ref: str, *, dry_run: bool) -> tuple[bool, str, str]:
+    """Fetch and check out ``ref`` in submodule ``name``. Returns (ok, sha, note)."""
+    import subprocess
+
+    def run(cmd: list[str], cwd: Path) -> tuple[int, str]:
+        r = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", check=False)
+        return r.returncode, (r.stdout + r.stderr)
+
+    sub = root / name
+    if not (sub / ".git").exists():
+        code, out = run(["git", "submodule", "update", "--init", "--", name], root)
+        if code != 0:
+            return False, "", f"{name}: submodule init failed: {out.strip()[-300:]}"
+    code, out = run(["git", "fetch", "-q", "origin"], sub)
+    if code != 0:
+        return False, "", f"{name}: fetch failed: {out.strip()[-300:]}"
+    code, sha = run(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], sub)
+    if code != 0:
+        return False, "", f"{name}: ref {ref!r} not found after fetch"
+    sha = sha.strip()
+    _, cur = run(["git", "rev-parse", "HEAD"], sub)
+    cur = cur.strip()
+    if cur == sha:
+        return True, sha, f"{name}: already at {sha[:10]}"
+    if dry_run:
+        return True, sha, f"{name}: would move {cur[:10]} -> {sha[:10]}"
+    _, dirty = run(["git", "status", "--porcelain"], sub)
+    if dirty.strip():
+        return False, sha, f"{name}: working tree has local changes; commit or stash them first"
+    code, out = run(["git", "checkout", "-q", sha], sub)
+    if code != 0:
+        return False, sha, f"{name}: checkout failed: {out.strip()[-300:]}"
+    run(["git", "submodule", "update", "--init", "--recursive"], sub)
+    return True, sha, f"{name}: {cur[:10]} -> {sha[:10]}"
+
+
+def bulk_migrate_bundled(
+    repos: list[tuple[str, Path]],
+    *,
+    psxrecomp_ref: str = "origin/master",
+    recomp_ui_ref: str = "origin/master",
+    regenerate: bool = True,
+    push_remote: bool = False,
+    dry_run: bool = False,
+    jobs: int = 1,
+    on_repo: OnRepoResults | None = None,
+) -> list[CmdResult]:
+    """Move each selected PSX game repo onto bundled releases (committed
+    generated/ C, compiled-in BIOS backends, bundled release.yml + packager).
+
+    The work itself is psxrecomp's own ``tools/migrate_bundled_release.py``:
+    the title's psxrecomp submodule is first moved to ``psxrecomp_ref`` so the
+    script run is the one the title will pin, and this toolkit never carries a
+    second copy of the migration to drift. Regeneration builds the emitters per
+    repo, so keep ``jobs`` small."""
+    import subprocess
+    import sys
+
+    from . import platforms
+
+    if platforms.current().key != "psx":
+        return [CmdResult(False, "migrate-bundled: PSX titles only (psxrecomp bundled releases)")]
+
+    def one(label: str, root: Path) -> list[CmdResult]:
+        root = Path(root).expanduser().resolve()
+        if not (root / "CMakeLists.txt").is_file() or not (root / ".gitmodules").is_file():
+            return [CmdResult(False, f"{label}: not a psxrecomp game repo (no CMakeLists.txt/.gitmodules)")]
+        ok, sha, note = _bump_submodule_to(root, "psxrecomp", psxrecomp_ref, dry_run=dry_run)
+        if not ok:
+            return [CmdResult(False, f"{label}: {note}")]
+        r = subprocess.run(["git", "cat-file", "-e", f"{sha}:tools/migrate_bundled_release.py"],
+                           cwd=str(root / "psxrecomp"), capture_output=True, check=False)
+        if r.returncode != 0:
+            return [CmdResult(False, f"{label}: psxrecomp {sha[:10]} has no tools/migrate_bundled_release.py; pick a newer ref", note)]
+        script = root / "psxrecomp" / "tools" / "migrate_bundled_release.py"
+        if not script.is_file():
+            # Dry-run leaves the pin where it is, so borrow the script from a
+            # sibling psxrecomp checkout; it inspects the target ref through the
+            # object store and still reports the whole plan for this title.
+            from .paths import psxrecomp_root_from_toolkit
+
+            sibling = psxrecomp_root_from_toolkit()
+            alt = (sibling / "tools" / "migrate_bundled_release.py") if sibling else None
+            if alt is None or not alt.is_file():
+                return [CmdResult(True, f"{label}: dry-run: would bump psxrecomp to {sha[:10]} and run its migrate_bundled_release.py (no sibling psxrecomp checkout to borrow it from for a full report)", note)]
+            script = alt
+        cmd = [sys.executable, str(script), str(root),
+               "--psxrecomp-ref", psxrecomp_ref, "--recomp-ui-ref", recomp_ui_ref]
+        if not regenerate:
+            cmd.append("--skip-generate")
+        if push_remote:
+            cmd.append("--push")
+        if dry_run:
+            cmd.append("--dry-run")
+        r = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", check=False)
+        out = (r.stdout + r.stderr).strip()
+        lines = out.splitlines()
+        verdict = next((ln for ln in reversed(lines) if ln.startswith("[OK]") or ln.startswith("[FAIL]")), "")
+        detail = "\n".join([note] + [ln for ln in lines if ln is not verdict][-40:])
+        okk = r.returncode == 0 and verdict.startswith("[OK]")
+        msg = verdict[verdict.find("]") + 1:].strip() if verdict else (out[-200:] or f"exit {r.returncode}")
+        return [CmdResult(okk, f"{label}: {msg}", detail)]
+
+    return map_repos(repos, one, jobs=jobs, on_repo=on_repo)
+
+
 def bulk_install_ci(
     repos: list[tuple[str, Path]],
     *,

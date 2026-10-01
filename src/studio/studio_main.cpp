@@ -3086,6 +3086,128 @@ void draw_bulk(StudioModel& model, const Theme& th) {
     ImGui::EndDisabled();
 }
 
+// ---- Bulk migrate (PSX): titles onto bundled releases ----------------------
+// A title that predates bundled releases ships an uncompiled kit from a
+// release.yml that wipes generated/. This tab runs psxrecomp's own
+// tools/migrate_bundled_release.py on each ticked repo (the vendored toolkit
+// only bumps the pin and launches it, so the migration has one owner): bump
+// psxrecomp + recomp-ui, un-ignore generated/, new release.yml + packager,
+// regenerate the game C from the title's disc, run the CI gates, commit.
+void draw_bulk_migrate(StudioModel& model, const Theme& th) {
+    constexpr float kLabelW = 110.f;
+    ImGui::BeginDisabled(model.busy.load());
+
+    wrapped(th.text_muted,
+            "Updates ticked PSX titles to the bundled release workflow: the committed "
+            "generated/ game C and both BIOS backends are compiled in CI and the compiled "
+            "game is shipped. Each title's psxrecomp and recomp-ui pins move to the refs "
+            "below, release.yml and scripts/package_release.sh are rewritten from the "
+            "framework template, generated/ is un-ignored and regenerated from disc/*.cue, "
+            "and the result is committed. Titles need a clean working tree.");
+
+    field_row("##mig_psx_ref", "psxrecomp ref", model.migrate_psx_ref, sizeof(model.migrate_psx_ref), kLabelW);
+    field_row("##mig_ui_ref", "recomp-ui ref", model.migrate_ui_ref, sizeof(model.migrate_ui_ref), kLabelW);
+
+    left_label("Jobs", kLabelW);
+    if (jobs_combo("##mig_jobs", &model.bulk_jobs, 100.f)) {
+        retcomm::studio::run_project_studio_async(
+            model,
+            {"repos", "set-flags", "--bulk-jobs", std::to_string(model.bulk_jobs), "--json"},
+            nullptr, false);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Each title rebuilds the emitters and regenerates its game C,\n"
+                          "so more than 2 at once is rarely faster.");
+    ImGui::SameLine();
+    checkbox_wrapped("Skip regenerate", &model.migrate_skip_generate);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Only rewrite pins, workflow and packager. The release gate will\n"
+                          "refuse until generated/ is regenerated against the new pin.");
+    checkbox_wrapped("Push", &model.migrate_push);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Push the migration commit to origin. Off = commit locally; review, then Bulk push.");
+    end_wrapped_line();
+
+    auto bulk_btn = [](const char* label) -> bool {
+        const float need = widget_label_width(label) + ImGui::GetStyle().ItemSpacing.x;
+        if (ImGui::GetCursorPosX() > ImGui::GetCursorStartPos().x &&
+            ImGui::GetContentRegionAvail().x < need)
+            ImGui::NewLine();
+        const bool hit = ImGui::Button(label);
+        ImGui::SameLine();
+        return hit;
+    };
+    auto select_csv = [&]() {
+        std::string select;
+        for (const auto& e : model.repos) {
+            auto it = model.bulk_selected.find(e.path);
+            if (it == model.bulk_selected.end() || !it->second) continue;
+            if (!select.empty()) select += ",";
+            select += e.path;
+        }
+        return select;
+    };
+    auto run_migrate = [&](bool dry_run) {
+        const std::string csv = select_csv();
+        if (csv.empty()) {
+            model.append_log("[FAIL] No repos selected");
+            return;
+        }
+        std::vector<std::string> args = {"git", "bulk-migrate-bundled", "--select", csv,
+                                         "--jobs", std::to_string(model.bulk_jobs)};
+        if (model.migrate_psx_ref[0]) { args.push_back("--psxrecomp-ref"); args.push_back(model.migrate_psx_ref); }
+        if (model.migrate_ui_ref[0])  { args.push_back("--recomp-ui-ref");  args.push_back(model.migrate_ui_ref); }
+        if (model.migrate_skip_generate) args.push_back("--skip-generate");
+        if (model.migrate_push) args.push_back("--push");
+        if (dry_run) args.push_back("--dry-run");
+        model.append_log(dry_run ? "--- Bulk migrate to bundled releases (dry run) ---"
+                                 : "--- Bulk migrate to bundled releases ---");
+        retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+    };
+
+    if (bulk_btn("Select all")) {
+        for (auto& kv : model.bulk_selected) kv.second = true;
+        for (const auto& e : model.repos) model.bulk_selected[e.path] = true;
+    }
+    if (bulk_btn("Select none"))
+        for (auto& kv : model.bulk_selected) kv.second = false;
+    if (bulk_btn("Dry run")) run_migrate(true);
+    accent_button(th);
+    const bool go = bulk_btn("Migrate selected");
+    accent_button_pop();
+    if (go) run_migrate(false);
+    end_wrapped_line();
+    wrapped(th.text_muted,
+            "Per-title results stream into the Activity log as [OK] / [FAIL] lines with the "
+            "migration ledger under each. Nothing is pushed unless Push is ticked.");
+
+    ImGui::BeginChild("bulk_migrate_list", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    if (ImGui::BeginTable("bulk_migrate_tbl", 2,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                              ImGuiTableFlags_BordersInnerV |
+                              ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_WidthFixed, 36.f);
+        ImGui::TableSetupColumn("Repo", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(model.repos.size()));
+        while (clipper.Step()) {
+            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+                const auto& e = model.repos[static_cast<size_t>(i)];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                bool* sel = &model.bulk_selected[e.path];
+                ImGui::Checkbox(("##bm" + std::to_string(i)).c_str(), sel);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextWrapped("%s\n%s", e.label.c_str(), e.path.c_str());
+            }
+        }
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+    ImGui::EndDisabled();
+}
+
 // ---- N64: the core, runner and hub a game package runs on -----------------
 // Read, never decided, here: `build components --json` owns where each
 // checkout is, where its local build lands, and what the port defaults to.
@@ -4435,6 +4557,12 @@ int main(int argc, char** argv) {
             }
             if (ImGui::BeginTabItem("Bulk")) {
                 draw_bulk(model, th);
+                ImGui::EndTabItem();
+            }
+            // PSX only: bundled releases are a psxrecomp mechanism (the SNES
+            // and N64 frameworks never shipped a setup-host kit to migrate).
+            if (model.platform == Platform::PSX && ImGui::BeginTabItem("Bulk Migrate")) {
+                draw_bulk_migrate(model, th);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Build")) {

@@ -1048,6 +1048,12 @@ struct StudioModel {
     bool bulk_create_branch = false;
     bool bulk_set_tracking = true;
     bool bulk_reuse_emitters = true;
+
+    // Bulk migrate (PSX): move titles onto psxrecomp bundled releases.
+    char migrate_psx_ref[128] = "origin/master";
+    char migrate_ui_ref[128] = "origin/master";
+    bool migrate_skip_generate = false;
+    bool migrate_push = false;
     int bulk_pull_mode = 0; // 0=ff-only 1=rebase 2=merge 3=reset
 
     // Build
