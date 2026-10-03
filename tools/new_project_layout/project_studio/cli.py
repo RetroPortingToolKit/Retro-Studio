@@ -1854,6 +1854,34 @@ def cmd_git_bulk_migrate_bundled(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def cmd_git_bulk_update_cmake(args: argparse.Namespace) -> int:
+    from project_studio.bulkops import bulk_update_cmake
+    from project_studio.repo_index import load_index
+
+    repos = _bulk_repos_or_die(args)
+    if repos is None:
+        return 2
+    jobs = int(getattr(args, "jobs", 0) or 0) or int(getattr(load_index(), "bulk_jobs", 1) or 1)
+
+    def on_repo(label: str, results: list) -> None:
+        for r in results:
+            print(f"  [{'OK' if r.ok else 'FAIL'}] {r.message}", flush=True)
+            for ln in (r.detail or "").splitlines():
+                print(f"         {ln}", flush=True)
+
+    results = bulk_update_cmake(
+        repos,
+        commit=not bool(getattr(args, "no_commit", False)),
+        push_remote=bool(getattr(args, "push", False)),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        jobs=jobs,
+        on_repo=on_repo,
+    )
+    failed = sum(1 for r in results if not r.ok)
+    print(f"bulk update-cmake: {len(results) - failed} ok, {failed} failed", flush=True)
+    return 1 if failed else 0
+
+
 def cmd_git_release(args: argparse.Namespace) -> int:
     from project_studio.gitops import run_release_workflow
 
@@ -3507,6 +3535,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Commit locally only (do not push)",
     )
     p_gbci.set_defaults(func=cmd_git_bulk_install_ci)
+
+    p_gbuc = git_sub.add_parser(
+        "bulk-update-cmake",
+        help="PSX: sync selected repos' CMakeLists.txt with psxrecomp's scaffold template "
+             "via psxrecomp/tools/update_cmake.py (commits CMakeLists.txt only)",
+    )
+    add_bulk_select(p_gbuc)
+    p_gbuc.add_argument("--no-commit", action="store_true", help="Edit CMakeLists.txt but do not commit")
+    p_gbuc.add_argument("--push", action="store_true", help="Push after committing")
+    p_gbuc.add_argument("--jobs", type=int, default=0, help="Parallel repos (default: index setting)")
+    p_gbuc.set_defaults(func=cmd_git_bulk_update_cmake)
 
     p_gbmb = git_sub.add_parser(
         "bulk-migrate-bundled",
