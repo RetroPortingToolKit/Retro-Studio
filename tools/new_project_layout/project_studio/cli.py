@@ -1833,7 +1833,7 @@ def cmd_git_bulk_migrate_bundled(args: argparse.Namespace) -> int:
         return 2
     jobs = int(getattr(args, "jobs", 0) or 0) or int(getattr(load_index(), "bulk_jobs", 1) or 1)
 
-    def on_repo(label: str, results: list) -> None:
+    def on_repo(results: list) -> None:
         for r in results:
             print(f"  [{'OK' if r.ok else 'FAIL'}] {r.message}", flush=True)
             for ln in (r.detail or "").splitlines():
