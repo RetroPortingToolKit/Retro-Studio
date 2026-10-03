@@ -1052,6 +1052,75 @@ def bulk_migrate_bundled(
     return map_repos(repos, one, jobs=jobs, on_repo=on_repo)
 
 
+def bulk_update_cmake(
+    repos: list[tuple[str, Path]],
+    *,
+    commit: bool = True,
+    push_remote: bool = False,
+    dry_run: bool = False,
+    jobs: int = 1,
+    on_repo: OnRepoResults | None = None,
+) -> list[CmdResult]:
+    """PSX: sync each repo's CMakeLists.txt with psxrecomp's scaffold template.
+
+    The work is psxrecomp's own ``tools/update_cmake.py`` (one owner, no copy
+    here): the sibling psxrecomp checkout's if there is one -- it carries the
+    newest managed blocks -- else the title's pinned ``psxrecomp/`` submodule.
+    Only CMakeLists.txt is committed."""
+    import subprocess
+    import sys
+
+    from . import platforms
+    from .paths import psxrecomp_root_from_toolkit
+
+    if platforms.current().key != "psx":
+        return [CmdResult(False, "update-cmake: PSX titles only (psxrecomp scaffold)")]
+
+    def one(label: str, root: Path) -> list[CmdResult]:
+        root = Path(root).expanduser().resolve()
+        if not (root / "CMakeLists.txt").is_file():
+            return [CmdResult(False, f"{label}: no CMakeLists.txt")]
+        sibling = psxrecomp_root_from_toolkit()
+        script = next(
+            (c for c in ((sibling / "tools" / "update_cmake.py") if sibling else None,
+                         root / "psxrecomp" / "tools" / "update_cmake.py")
+             if c is not None and c.is_file()),
+            None,
+        )
+        if script is None:
+            return [CmdResult(False, f"{label}: no psxrecomp tools/update_cmake.py (sibling checkout or pinned submodule); update psxrecomp")]
+
+        def run(*cmd: str) -> subprocess.CompletedProcess:
+            return subprocess.run(list(cmd), cwd=str(root), capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", check=False)
+
+        r = run(sys.executable, str(script), "--project", str(root), "--check")
+        if r.returncode == 0:
+            return [CmdResult(True, f"{label}: CMakeLists.txt up to date")]
+        if r.returncode != 1:
+            return [CmdResult(False, f"{label}: update_cmake failed", (r.stdout + r.stderr).strip())]
+        if dry_run:
+            return [CmdResult(True, f"{label}: would update CMakeLists.txt", r.stdout.strip())]
+        r = run(sys.executable, str(script), "--project", str(root))
+        if r.returncode != 0:
+            return [CmdResult(False, f"{label}: update_cmake failed", (r.stdout + r.stderr).strip())]
+        if not commit:
+            return [CmdResult(True, f"{label}: updated CMakeLists.txt (uncommitted)")]
+        r = run("git", "add", "--", "CMakeLists.txt")
+        if r.returncode == 0:
+            r = run("git", "commit", "-m", "CMake: sync managed blocks (update_cmake)", "--", "CMakeLists.txt")
+        if r.returncode != 0:
+            return [CmdResult(False, f"{label}: updated but commit failed", (r.stdout + r.stderr).strip())]
+        if push_remote:
+            pr = push(root)
+            if not pr.ok:
+                return [CmdResult(False, f"{label}: committed, push failed", pr.detail)]
+            return [CmdResult(True, f"{label}: updated, committed, pushed")]
+        return [CmdResult(True, f"{label}: updated + committed")]
+
+    return map_repos(repos, one, jobs=jobs, on_repo=on_repo)
+
+
 def bulk_install_ci(
     repos: list[tuple[str, Path]],
     *,

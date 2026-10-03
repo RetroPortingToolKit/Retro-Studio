@@ -3165,6 +3165,21 @@ void draw_bulk_migrate(StudioModel& model, const Theme& th) {
         retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
     };
 
+    auto run_update_cmake = [&](bool dry_run) {
+        const std::string csv = select_csv();
+        if (csv.empty()) {
+            model.append_log("[FAIL] No repos selected");
+            return;
+        }
+        std::vector<std::string> args = {"git", "bulk-update-cmake", "--select", csv,
+                                         "--jobs", std::to_string(model.bulk_jobs)};
+        if (model.migrate_push) args.push_back("--push");
+        if (dry_run) args.push_back("--dry-run");
+        model.append_log(dry_run ? "--- Bulk update CMake (dry run) ---"
+                                 : "--- Bulk update CMake ---");
+        retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+    };
+
     if (bulk_btn("Select all")) {
         for (auto& kv : model.bulk_selected) kv.second = true;
         for (const auto& e : model.repos) model.bulk_selected[e.path] = true;
@@ -3176,6 +3191,14 @@ void draw_bulk_migrate(StudioModel& model, const Theme& th) {
     const bool go = bulk_btn("Migrate selected");
     accent_button_pop();
     if (go) run_migrate(false);
+    if (bulk_btn("Update CMake")) run_update_cmake(false);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Sync ticked titles' CMakeLists.txt with psxrecomp's scaffold template\n"
+                          "(tools/update_cmake.py) and commit CMakeLists.txt only.\n"
+                          "Honours Push.");
+    if (bulk_btn("Dry run CMake")) run_update_cmake(true);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Report which ticked titles' CMakeLists.txt would change; writes nothing.");
     end_wrapped_line();
     wrapped(th.text_muted,
             "Per-title results stream into the Activity log as [OK] / [FAIL] lines with the "
